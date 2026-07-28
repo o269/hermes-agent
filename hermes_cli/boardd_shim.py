@@ -116,17 +116,32 @@ def _cov(op):
         pass
 
 
+def _require_original(op, original):
+    """Return a captured local implementation or fail closed on bad wiring."""
+    if original is None:
+        raise RuntimeError(
+            f"boardd_shim.{op} pass-through: original function was not captured "
+            "(install_rebind / end-block rebind did not run)."
+        )
+    return original
+
+
 def noop_flen(conn):
-    """No-op replacement for kanban_db._check_file_length_invariant under the
-    flag. The original runs at the END of write_txn and reads the raw db FILE
-    (os.path.getsize + header) — but on a client-via-broker connection that file
-    read is DECOUPLED from the broker's connection view: under WAL the main file
-    legitimately lags the (WAL-aware) header page_count, yielding a FALSE
-    "torn-extend" that would abort a perfectly-committed transaction. The
-    authoritative torn-extend check runs on the BROKER's own connection
-    (boardd._broker_flen_check), which owns the file. So client-side it is a
-    no-op."""
-    return None
+    """Connection-gated replacement for ``_check_file_length_invariant``.
+
+    The original runs at the END of write_txn and reads the raw db FILE
+    (os.path.getsize + header). On a client-via-broker connection that file read
+    is DECOUPLED from the broker's connection view: under WAL the main file can
+    legitimately lag the (WAL-aware) header page_count, yielding a false
+    "torn-extend". The authoritative check therefore runs on the broker's own
+    connection. A pass-through sqlite connection still owns its local file and
+    MUST retain the original invariant check.
+    """
+    if isinstance(conn, BrokerConnection):
+        return None
+    return _require_original(
+        "noop_flen", _ORIG_CHECK_FILE_LENGTH_INVARIANT
+    )(conn)
 
 
 def _c():
@@ -160,25 +175,39 @@ def _c():
 #     file still routes correctly.
 # --------------------------------------------------------------------------- #
 
-# Captured BEFORE kanban_db's public names are pointed at this shim, so
-# pass-through uses the GENUINE connect(), never a reimplementation. Set by
-# install_rebind() (tests/tools) and the end-of-module rebind block in
-# kanban_db.py (production). _KDB is the exact module whose connect was captured
-# (guards against two live copies of kanban_db resolving differently).
+# Captured BEFORE kanban_db's public names are pointed at this shim, so every
+# non-fleet pass-through uses the GENUINE implementation, never a
+# reimplementation. Set by install_rebind() (tests/tools) and the end-of-module
+# rebind block in kanban_db.py (production). _KDB is the exact module whose
+# functions were captured (guards against two live copies of kanban_db resolving
+# differently).
 _KDB = None
 _ORIG_CONNECT = None
 _ORIG_CONNECT_CLOSING = None
+_ORIG_ADD_COMMENT = None
+_ORIG_HEARTBEAT_WORKER = None
+_ORIG_SET_WORKSPACE_PATH = None
+_ORIG_SET_BRANCH_NAME = None
+_ORIG_CHECK_FILE_LENGTH_INVARIANT = None
 
 _route_log = logging.getLogger("boardd_shim")
 
 
 def _capture_original(kdb):
-    """Record the resolver module + its REAL connect/connect_closing before the
-    rebind repoints them at this shim. MUST run before install_rebind rebinds."""
+    """Record the resolver module + its REAL rebound functions before the shim
+    repoints them. MUST run before install_rebind/end-block rebinds."""
     global _KDB, _ORIG_CONNECT, _ORIG_CONNECT_CLOSING
+    global _ORIG_ADD_COMMENT, _ORIG_HEARTBEAT_WORKER
+    global _ORIG_SET_WORKSPACE_PATH, _ORIG_SET_BRANCH_NAME
+    global _ORIG_CHECK_FILE_LENGTH_INVARIANT
     _KDB = kdb
     _ORIG_CONNECT = kdb.connect
     _ORIG_CONNECT_CLOSING = kdb.connect_closing
+    _ORIG_ADD_COMMENT = kdb.add_comment
+    _ORIG_HEARTBEAT_WORKER = kdb.heartbeat_worker
+    _ORIG_SET_WORKSPACE_PATH = kdb.set_workspace_path
+    _ORIG_SET_BRANCH_NAME = kdb.set_branch_name
+    _ORIG_CHECK_FILE_LENGTH_INVARIANT = kdb._check_file_length_invariant
 
 
 def _resolver():
@@ -405,23 +434,44 @@ def connect_closing(db_path=None, *, board=None):
 
 
 def add_comment(conn, task_id, author, body):
+    if not isinstance(conn, BrokerConnection):
+        return _require_original("add_comment", _ORIG_ADD_COMMENT)(
+            conn, task_id, author, body
+        )
     _cov("add_comment")
     return _c().add_comment(task_id, author, body)["comment_id"]
 
 
 def set_workspace_path(conn, task_id, path):
+    if not isinstance(conn, BrokerConnection):
+        return _require_original(
+            "set_workspace_path", _ORIG_SET_WORKSPACE_PATH
+        )(conn, task_id, path)
     _cov("set_workspace_path")
     _c().set_workspace_path(task_id, str(path))
     return None
 
 
 def set_branch_name(conn, task_id, branch_name):
+    if not isinstance(conn, BrokerConnection):
+        return _require_original(
+            "set_branch_name", _ORIG_SET_BRANCH_NAME
+        )(conn, task_id, branch_name)
     _cov("set_branch_name")
     _c().set_branch_name(task_id, str(branch_name))
     return None
 
 
 def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
+    if not isinstance(conn, BrokerConnection):
+        return _require_original(
+            "heartbeat_worker", _ORIG_HEARTBEAT_WORKER
+        )(
+            conn,
+            task_id,
+            note=note,
+            expected_run_id=expected_run_id,
+        )
     _cov("heartbeat_worker")
     return bool(_c().heartbeat(task_id, note=note).get("ok", False))
 
@@ -496,7 +546,7 @@ def install_rebind(kdb):
     the identical production surface — including
     `_check_file_length_invariant = noop_flen` (whose omission caused a WAL-lag
     torn-extend FALSE POSITIVE under concurrent load in an earlier harness)."""
-    # Capture the GENUINE connect/connect_closing BEFORE repointing them, so the
+    # Capture every GENUINE rebound function BEFORE repointing it, so the
     # fleet-gate's non-fleet pass-through uses the real implementation.
     _capture_original(kdb)
     kdb.connect = connect

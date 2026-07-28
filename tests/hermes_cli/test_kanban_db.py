@@ -2426,6 +2426,51 @@ def test_broker_rebind_preserves_real_claim_policy_surface(kanban_home):
     assert completed.stdout.strip() == "hermes_cli.kanban_db"
 
 
+def test_broker_rebind_passthrough_mutators_stay_local(kanban_home):
+    """Broker mode must not redirect a non-fleet connection's writes to fleet."""
+    local_db = kanban_home / "scratch.db"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(kanban_home)
+    env["HERMES_KANBAN_HOME"] = str(kanban_home)
+    env["HERMES_KANBAN_BROKER"] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "import sys\n"
+                "from hermes_cli import kanban_db as kb\n"
+                "db = Path(sys.argv[1])\n"
+                "kb.init_db(db_path=db)\n"
+                "with kb.connect(db_path=db) as conn:\n"
+                " tid = kb.create_task(conn, title='local', assignee='worker')\n"
+                " cid = kb.add_comment(conn, tid, 'worker', 'local-only')\n"
+                " kb.set_workspace_path(conn, tid, '/tmp/local-workspace')\n"
+                " kb.set_branch_name(conn, tid, 'fix/local-only')\n"
+                " conn.execute(\"UPDATE tasks SET status = 'running' WHERE id = ?\", (tid,))\n"
+                " assert kb.heartbeat_worker(conn, tid, note='local heartbeat')\n"
+                " row = conn.execute(\"SELECT workspace_path, branch_name, last_heartbeat_at FROM tasks WHERE id = ?\", (tid,)).fetchone()\n"
+                " assert row['workspace_path'] == '/tmp/local-workspace'\n"
+                " assert row['branch_name'] == 'fix/local-only'\n"
+                " assert row['last_heartbeat_at'] is not None\n"
+                " assert kb.list_comments(conn, tid)[0].id == cid\n"
+                " assert kb.list_comments(conn, tid)[0].body == 'local-only'\n"
+                " assert any(e.kind == 'heartbeat' and e.payload == {'note': 'local heartbeat'} for e in kb.list_events(conn, tid))\n"
+                "print('passthrough-local-ok')"
+            ),
+            str(local_db),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    assert completed.stdout.strip() == "passthrough-local-ok"
+
+
 def test_continuation_changed_head_fails_closed_with_audit_event(
     kanban_home, all_assignees_spawnable, monkeypatch
 ):

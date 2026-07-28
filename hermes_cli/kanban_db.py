@@ -13025,7 +13025,7 @@ if os.environ.get("HERMES_KANBAN_BROKER") == "1":
     try:
         import sys as _sys
         from hermes_cli import boardd_shim as _boardd_shim
-        # Capture the GENUINE connect/connect_closing (+ this module, for route
+        # Capture every GENUINE rebound function (+ this module, for route
         # resolution) BEFORE repointing the public names, so the fleet-gate's
         # non-fleet pass-through calls the real implementation.
         _boardd_shim._capture_original(_sys.modules[__name__])
