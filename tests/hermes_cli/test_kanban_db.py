@@ -2004,7 +2004,11 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in a recent comment triggers active_pr.
+
+    Nobody else declared this PR, so the conservative default stands: a
+    comment-only announcement is still treated as custody.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
@@ -2013,6 +2017,209 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+# ---------------------------------------------------------------------------
+# active_pr ownership (the t_45e612bd cross-repo citation false positive)
+# ---------------------------------------------------------------------------
+
+_COMPANION_PR = "https://github.com/o269/omnia-v2/pull/222"
+_ENGINE_PR = "https://github.com/o269/omnia/pull/431"
+
+
+def _declare_pr_in_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    url: str,
+    *,
+    column: str = "summary",
+) -> None:
+    """Record a finished run whose own work product names ``url``.
+
+    Deliberately ``blocked`` rather than ``completed``: a worker that opened a
+    PR and stopped for review is the real shape here, and it keeps the
+    unrelated ``recent_success`` guard out of these assertions.
+    """
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, "
+        f"{column}) VALUES (?, 'blocked', 'blocked', ?, ?, ?)",
+        (task_id, now - 600, now - 540, f"AUTHOR COMPLETE: {url}"),
+    )
+
+
+def test_respawn_guard_cross_repo_citation_does_not_suppress(kanban_home):
+    """The exact production false positive must not freeze the citing card.
+
+    t_45e612bd (engine work) quoted the URL of the *companion frontend* PR in
+    a coordination comment. A different card had actually opened that PR. The
+    citation is a reference, not custody, so the engine card must dispatch.
+    """
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="frontend companion", assignee="bob")
+        _declare_pr_in_run(conn, owner, _COMPANION_PR)
+        kb.add_comment(conn, owner, "worker", f"Opened {_COMPANION_PR}")
+
+        citer = kb.create_task(conn, title="engine signing URL", assignee="alice")
+        kb.add_comment(
+            conn,
+            citer,
+            "cursor2",
+            "FRONTEND COMPANION AUTHOR-COMPLETE: o269/omnia-v2 PR #222 is "
+            f"OPEN/CLEAN/MERGEABLE at exact head — {_COMPANION_PR}",
+        )
+
+        # The card that actually owns the PR keeps its guard...
+        assert kb.check_respawn_guard(conn, owner) == "active_pr"
+        # ...and the card that merely cited it is free to run.
+        decision = kb.evaluate_respawn_guard(conn, citer)
+
+    assert decision.reason is None
+    assert [c.canonical_url for c in decision.released_prs] == [_COMPANION_PR]
+    released = decision.released_prs[0]
+    assert released.ownership == "referenced"
+    assert released.declared_by == owner
+
+
+def test_respawn_guard_own_declared_pr_still_suppresses(kanban_home):
+    """Genuine same-card custody keeps working — this is the point of the guard."""
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="engine work", assignee="alice")
+        _declare_pr_in_run(conn, owner, _ENGINE_PR)
+        kb.add_comment(conn, owner, "worker", f"HANDOFF: PR opened {_ENGINE_PR}")
+        # A second card citing the same PR must not steal custody from the owner.
+        other = kb.create_task(conn, title="tracking card", assignee="bob")
+        kb.add_comment(conn, other, "fable", f"tracking {_ENGINE_PR}")
+
+        decision = kb.evaluate_respawn_guard(conn, owner)
+        assert kb.evaluate_respawn_guard(conn, other).reason is None
+
+    assert decision.reason == "active_pr"
+    assert [c.canonical_url for c in decision.active_prs] == [_ENGINE_PR]
+    assert decision.active_prs[0].ownership == "declared"
+
+
+def test_respawn_guard_declaration_via_task_result_suppresses(kanban_home):
+    """``tasks.result`` is work product too, not a citation."""
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="result-declared", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?",
+            (f"opened {_ENGINE_PR}", owner),
+        )
+        kb.add_comment(conn, owner, "worker", f"see {_ENGINE_PR}")
+        citer = kb.create_task(conn, title="citer", assignee="bob")
+        kb.add_comment(conn, citer, "worker", f"companion: {_ENGINE_PR}")
+
+        assert kb.check_respawn_guard(conn, owner) == "active_pr"
+        assert kb.check_respawn_guard(conn, citer) is None
+
+
+def test_respawn_guard_ownership_match_is_exact_not_prefix(kanban_home):
+    """``/pull/22`` must never be read as an owner of ``/pull/222``.
+
+    Ownership narrows with SQL ``LIKE`` and then re-canonicalizes; without the
+    second step a low-numbered PR would silently disown every PR whose number
+    it prefixes.
+    """
+    with kb.connect() as conn:
+        decoy = kb.create_task(conn, title="decoy", assignee="bob")
+        _declare_pr_in_run(conn, decoy, "https://github.com/o269/omnia-v2/pull/22")
+
+        citer = kb.create_task(conn, title="cites 222", assignee="alice")
+        kb.add_comment(conn, citer, "worker", f"opened {_COMPANION_PR}")
+
+        decision = kb.evaluate_respawn_guard(conn, citer)
+
+    assert decision.reason == "active_pr"
+    assert decision.released_prs == ()
+
+
+def test_respawn_guard_mixed_ownership_guards_on_the_owned_pr(kanban_home):
+    """One owned PR plus one cited PR still guards, and says so for both."""
+    with kb.connect() as conn:
+        other = kb.create_task(conn, title="frontend", assignee="bob")
+        _declare_pr_in_run(conn, other, _COMPANION_PR)
+
+        card = kb.create_task(conn, title="engine", assignee="alice")
+        _declare_pr_in_run(conn, card, _ENGINE_PR)
+        kb.add_comment(conn, card, "worker", f"opened {_ENGINE_PR}")
+        kb.add_comment(conn, card, "worker", f"companion is {_COMPANION_PR}")
+
+        decision = kb.evaluate_respawn_guard(conn, card)
+
+    assert decision.reason == "active_pr"
+    assert [c.canonical_url for c in decision.active_prs] == [_ENGINE_PR]
+    assert [c.canonical_url for c in decision.released_prs] == [_COMPANION_PR]
+
+
+def test_respawn_guarded_event_names_pr_source_comment_and_expiry(kanban_home):
+    """A suppressed respawn must be diagnosable without reading the source.
+
+    The original defect cost an hour precisely because the dispatcher logged
+    STARVED and nothing else.
+    """
+    with kb.connect() as conn:
+        card = kb.create_task(conn, title="has-own-pr", assignee="alice")
+        _declare_pr_in_run(conn, card, _ENGINE_PR)
+        comment_id = kb.add_comment(
+            conn, card, "worker", f"HANDOFF: PR opened {_ENGINE_PR}"
+        )
+        decision = kb.evaluate_respawn_guard(conn, card)
+        kb.record_respawn_guard_decision(conn, card, decision)
+        guarded = [
+            event
+            for event in kb.list_events(conn, card)
+            if event.kind == "respawn_guarded"
+        ][-1]
+
+    payload = guarded.payload
+    assert payload is not None
+    assert payload["reason"] == "active_pr"
+    entry = payload["active_prs"][0]
+    assert entry["pr_url"] == _ENGINE_PR
+    assert entry["ownership"] == "declared"
+    assert entry["declared_by"] is None
+    if isinstance(comment_id, int):
+        assert entry["source_comment_id"] == comment_id
+    assert entry["expires_at"] == entry["last_seen_at"] + kb._RESPAWN_GUARD_PR_WINDOW
+    assert payload["expires_at"] == entry["expires_at"]
+
+
+def test_dispatch_emits_release_event_and_spawns_the_citing_card(
+    kanban_home, all_assignees_spawnable
+):
+    """End-to-end: the citing card spawns, and the release is auditable."""
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="frontend companion", assignee="bob")
+        _declare_pr_in_run(conn, owner, _COMPANION_PR)
+        # Retire the owner so the citing card is the only dispatch candidate;
+        # custody is about who produced the URL, not who is currently ready.
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (owner,))
+
+        citer = kb.create_task(conn, title="engine signing URL", assignee="alice")
+        kb.add_comment(conn, citer, "cursor2", f"companion PR: {_COMPANION_PR}")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        events = kb.list_events(conn, citer)
+
+    assert citer in spawned
+    assert not [
+        entry for entry in result.respawn_guarded if entry[0] == citer
+    ]
+    released = [
+        event for event in events if event.kind == "respawn_guard_released"
+    ]
+    assert len(released) == 1
+    payload = released[0].payload
+    assert payload is not None
+    assert payload["reason"] == "active_pr_not_owned"
+    assert payload["released_prs"][0]["pr_url"] == _COMPANION_PR
+    assert payload["released_prs"][0]["declared_by"] == owner
 
 
 def test_continuation_exact_authorization_consumes_atomically_and_passes_once(
@@ -3016,9 +3223,11 @@ def test_claim_rechecks_late_active_pr_under_writer_lock(kanban_home, monkeypatc
                 return ()
             return ("https://github.com/o269/omnia/pull/568",)
 
+        # The "does this card own an active PR?" seam is now ownership-aware;
+        # the raw comment scan alone no longer decides the claim.
         monkeypatch.setattr(
             kb,
-            "_canonical_pr_urls_from_comments",
+            "_guarding_pr_urls",
             active_after_precheck,
         )
         assert kb.claim_task(conn, task_id) is None
@@ -7000,3 +7209,4 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+

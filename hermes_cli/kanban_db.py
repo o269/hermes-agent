@@ -86,7 +86,7 @@ import logging
 import time
 import unicodedata
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn, Optional, Sequence
@@ -1200,6 +1200,39 @@ class ContinuationAuthorization:
 
 
 @dataclass(frozen=True)
+class ActivePRCandidate:
+    """One PR URL seen on a card, with the custody evidence behind it.
+
+    ``ownership`` is ``"declared"`` when the card itself named the PR in its own
+    work product (run summary/metadata/error or ``tasks.result``), and
+    ``"referenced"`` when the URL only ever appeared in a comment. A referenced
+    URL that some *other* card declared is a citation, not custody: it carries
+    ``declared_by`` and stops guarding this card.
+    """
+
+    canonical_url: str
+    ownership: str
+    source_comment_id: Optional[int] = None
+    last_seen_at: int = 0
+    expires_at: int = 0
+    declared_by: Optional[str] = None
+
+    @property
+    def guards(self) -> bool:
+        return self.declared_by is None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "pr_url": self.canonical_url,
+            "ownership": self.ownership,
+            "source_comment_id": self.source_comment_id,
+            "last_seen_at": self.last_seen_at,
+            "expires_at": self.expires_at,
+            "declared_by": self.declared_by,
+        }
+
+
+@dataclass(frozen=True)
 class RespawnGuardDecision:
     """Detailed guard result used to carry a validated grant into claim."""
 
@@ -1208,6 +1241,11 @@ class RespawnGuardDecision:
     continuation_denial: Optional[str] = None
     authorized_profile: Optional[str] = None
     authorized_provider: Optional[str] = None
+    # Every PR URL that held the guard, and every one the ownership check
+    # disowned. Both are surfaced as events so a suppressed (or released)
+    # respawn is never silent.
+    active_prs: tuple[ActivePRCandidate, ...] = ()
+    released_prs: tuple[ActivePRCandidate, ...] = ()
 
 
 @dataclass
@@ -3852,7 +3890,7 @@ def claim_task(
     # that same transaction after the run row is created. Never replace an
     # explicitly selected grant with a newer authorization minted meanwhile.
     has_active_pr = bool(
-        _canonical_pr_urls_from_comments(
+        _guarding_pr_urls(
             conn,
             task_id,
             cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
@@ -3940,7 +3978,7 @@ def claim_task(
             # inserted between the unlocked guard precheck and this point must
             # force a fresh guarded tick, never slip through as an ordinary
             # claim.
-            active_urls = _canonical_pr_urls_from_comments(
+            active_urls = _guarding_pr_urls(
                 conn,
                 task_id,
                 cutoff=authorization_now - _RESPAWN_GUARD_PR_WINDOW,
@@ -6850,6 +6888,195 @@ def _canonical_pr_urls_from_comments(
     return tuple(urls)
 
 
+def _pr_declaring_tasks(
+    conn: sqlite3.Connection,
+    canonical_url: str,
+    *,
+    exclude_task_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> tuple[str, ...]:
+    """Return tasks that declared ``canonical_url`` in their own work product.
+
+    A *declaration* is the PR URL appearing in the card's own run summary,
+    metadata or error, or in ``tasks.result`` — output the card itself
+    produced. That is custody. A URL merely quoted in a comment is a
+    reference and never reaches this function.
+
+    ``LIKE`` only narrows the scan (it cannot distinguish ``/pull/22`` from
+    ``/pull/222``); every candidate row is re-canonicalized before it counts.
+    """
+    like = f"%{canonical_url}%"
+    declarers: list[str] = []
+    seen: set[str] = set()
+
+    def _consider(task_id: str, *fields: Any) -> None:
+        if task_id in seen or task_id == exclude_task_id:
+            return
+        for field_value in fields:
+            if not field_value:
+                continue
+            if canonical_url in _canonical_pr_urls_from_text(str(field_value)):
+                seen.add(task_id)
+                declarers.append(task_id)
+                return
+
+    for row in conn.execute(
+        "SELECT task_id, summary, metadata, error FROM task_runs "
+        "WHERE summary LIKE ?1 OR metadata LIKE ?1 OR error LIKE ?1 "
+        "ORDER BY id ASC",
+        (like,),
+    ).fetchall():
+        _consider(
+            str(row["task_id"]),
+            row["summary"],
+            row["metadata"],
+            row["error"],
+        )
+        if limit is not None and len(declarers) >= limit:
+            return tuple(declarers)
+
+    for row in conn.execute(
+        "SELECT id, result FROM tasks WHERE result LIKE ?1 ORDER BY id ASC",
+        (like,),
+    ).fetchall():
+        _consider(str(row["id"]), row["result"])
+        if limit is not None and len(declarers) >= limit:
+            return tuple(declarers)
+    return tuple(declarers)
+
+
+def _active_pr_candidates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[ActivePRCandidate, ...]:
+    """Classify every in-window PR URL on ``task_id`` by custody.
+
+    Ownership rules, in order:
+
+    1. The card declared the URL in its own work product -> ``declared``,
+       always guards. This is the case the guard was built for: one card, one
+       open PR, never two writers.
+    2. The URL only appears in a comment, and some *other* card declared it ->
+       ``referenced`` with ``declared_by`` set. The mention is a
+       cross-reference (a companion PR in another repo, a coordination note),
+       not custody, so it must not freeze this card.
+    3. The URL only appears in a comment and nobody declared it anywhere ->
+       ``referenced`` with no owner, and it still guards. Plenty of genuine
+       handoffs only ever announce their PR in a comment; absent contrary
+       evidence the conservative default is preserved.
+    """
+    rows = conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
+        (task_id, int(cutoff)),
+    ).fetchall()
+
+    ordered: list[str] = []
+    latest: dict[str, tuple[int, Optional[int]]] = {}
+    for row in rows:
+        for url in _canonical_pr_urls_from_text(row["body"] or ""):
+            if url not in latest:
+                ordered.append(url)
+            latest[url] = (int(row["created_at"]), int(row["id"]))
+    if not ordered:
+        return ()
+
+    declared_here = set(
+        _task_declared_pr_urls(conn, task_id, candidates=tuple(ordered))
+    )
+
+    candidates: list[ActivePRCandidate] = []
+    for url in ordered:
+        last_seen_at, source_comment_id = latest[url]
+        expires_at = last_seen_at + _RESPAWN_GUARD_PR_WINDOW
+        if url in declared_here:
+            candidates.append(
+                ActivePRCandidate(
+                    canonical_url=url,
+                    ownership="declared",
+                    source_comment_id=source_comment_id,
+                    last_seen_at=last_seen_at,
+                    expires_at=expires_at,
+                )
+            )
+            continue
+        owners = _pr_declaring_tasks(
+            conn,
+            url,
+            exclude_task_id=task_id,
+            limit=1,
+        )
+        candidates.append(
+            ActivePRCandidate(
+                canonical_url=url,
+                ownership="referenced",
+                source_comment_id=source_comment_id,
+                last_seen_at=last_seen_at,
+                expires_at=expires_at,
+                declared_by=owners[0] if owners else None,
+            )
+        )
+    return tuple(candidates)
+
+
+def _guarding_pr_urls(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[str, ...]:
+    """The in-window PR URLs this card actually holds custody of.
+
+    This is the ownership-aware replacement for
+    :func:`_canonical_pr_urls_from_comments` everywhere "does this card have an
+    active PR?" is being asked. Using the raw comment set anywhere in the claim
+    path would re-introduce the freeze one layer down: the guard would release
+    the card and ``claim_task`` would then deny it for ``missing_authorization``.
+    """
+    return tuple(
+        candidate.canonical_url
+        for candidate in _active_pr_candidates(conn, task_id, cutoff=cutoff)
+        if candidate.guards
+    )
+
+
+def _task_declared_pr_urls(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    candidates: Sequence[str],
+) -> tuple[str, ...]:
+    """Return which of ``candidates`` this task declared in its own output."""
+    if not candidates:
+        return ()
+    wanted = set(candidates)
+    found: set[str] = set()
+    rows = list(
+        conn.execute(
+            "SELECT summary, metadata, error FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    )
+    result_row = conn.execute(
+        "SELECT result FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    texts: list[Any] = []
+    for row in rows:
+        texts.extend((row["summary"], row["metadata"], row["error"]))
+    if result_row is not None:
+        texts.append(result_row["result"])
+    for text in texts:
+        if not text or found == wanted:
+            continue
+        for url in _canonical_pr_urls_from_text(str(text)):
+            if url in wanted:
+                found.add(url)
+    return tuple(url for url in candidates if url in found)
+
+
 def _continuation_evidence(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7128,7 +7355,10 @@ def _continuation_local_denial(
     if not prs or any(not pr.head_sha for pr in prs):
         return "missing_exact_head"
     expected_urls = tuple(pr.canonical_url for pr in prs)
-    active_urls = _canonical_pr_urls_from_comments(
+    # Match the grant against the PRs the guard actually holds. A cross-repo
+    # citation is not part of this card's active set and must not have to be
+    # named in the authorization.
+    active_urls = _guarding_pr_urls(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
@@ -10435,25 +10665,39 @@ def evaluate_respawn_guard(
         if not requeued_after:
             return RespawnGuardDecision(reason="recent_success")
 
-    active_urls = _canonical_pr_urls_from_comments(
+    candidates = _active_pr_candidates(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
     )
-    if not active_urls:
-        return RespawnGuardDecision()
+    guarding = tuple(candidate for candidate in candidates if candidate.guards)
+    released = tuple(
+        candidate for candidate in candidates if not candidate.guards
+    )
+    if not guarding:
+        # Either no PR was cited at all, or every citation belongs to another
+        # card. Releasing is the whole point of the ownership check, but it must
+        # be auditable, so the disowned candidates ride along on the decision.
+        return RespawnGuardDecision(released_prs=released)
 
     authorization = _latest_continuation_authorization(conn, task_id)
     if authorization is None:
         return RespawnGuardDecision(
             reason="active_pr",
             continuation_denial="missing_authorization",
+            active_prs=guarding,
+            released_prs=released,
         )
-    return _evaluate_continuation_authorization(
+    decision = _evaluate_continuation_authorization(
         conn,
         task_id,
         authorization,
         now=now,
+    )
+    return replace(
+        decision,
+        active_prs=guarding if decision.reason is not None else (),
+        released_prs=released,
     )
 
 
@@ -10480,13 +10724,29 @@ def record_respawn_guard_decision(
 ) -> None:
     """Append explicit guard/continuation denial audit events in one txn."""
     if decision.reason is None:
+        record_respawn_guard_release(conn, task_id, decision, phase=phase)
         return
+    payload: dict[str, Any] = {"reason": decision.reason}
+    if decision.active_prs:
+        # A guard nobody can read is worse than no guard: name the exact PR,
+        # the comment it came from, why it counted as custody, and when the
+        # window lapses, so "STARVED" is never the only visible symptom.
+        payload["active_prs"] = [
+            candidate.to_payload() for candidate in decision.active_prs
+        ]
+        payload["expires_at"] = max(
+            candidate.expires_at for candidate in decision.active_prs
+        )
+    if decision.released_prs:
+        payload["released_prs"] = [
+            candidate.to_payload() for candidate in decision.released_prs
+        ]
     with write_txn(conn):
         _append_event(
             conn,
             task_id,
             "respawn_guarded",
-            {"reason": decision.reason},
+            payload,
         )
         if decision.continuation_denial is not None:
             _record_continuation_denial(
@@ -10496,6 +10756,37 @@ def record_respawn_guard_decision(
                 phase=phase,
                 authorization_id=decision.continuation_authorization_id,
             )
+
+
+def record_respawn_guard_release(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision: RespawnGuardDecision,
+    *,
+    phase: str = "dispatch",
+) -> None:
+    """Audit PR citations the ownership check refused to guard on.
+
+    Without this the ownership check is just as invisible as the bug it fixes,
+    only in the opposite direction — an operator could not tell "no PR was
+    cited" apart from "a PR was cited and we decided it belonged elsewhere".
+    """
+    if not decision.released_prs:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "respawn_guard_released",
+            {
+                "reason": "active_pr_not_owned",
+                "phase": phase,
+                "released_prs": [
+                    candidate.to_payload()
+                    for candidate in decision.released_prs
+                ],
+            },
+        )
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10889,13 +11180,17 @@ def _dispatch_once_locked(
             row["id"],
             process_snapshot=ready_process_snapshot,
         )
-        if guard_decision.reason is not None:
-            result.respawn_guarded.append((row["id"], guard_decision.reason))
+        if not dry_run and (
+            guard_decision.reason is not None or guard_decision.released_prs
+        ):
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
-                record_respawn_guard_decision(conn, row["id"], guard_decision)
+            # The released branch is equally loud: it records that the
+            # guard inspected a cited PR and handed custody elsewhere.
+            record_respawn_guard_decision(conn, row["id"], guard_decision)
+        if guard_decision.reason is not None:
+            result.respawn_guarded.append((row["id"], guard_decision.reason))
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
