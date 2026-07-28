@@ -2015,6 +2015,162 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+# ---------------------------------------------------------------------------
+# active_pr ownership. Regression cover for the defect where ANY GitHub PR URL
+# in ANY comment inside the 24h window silently froze a card for a full day,
+# even when the PR provably belonged to a different card in a different repo.
+# Cross-referencing a companion PR is behaviour the fleet asks workers for, so
+# the guard has to tell custody apart from citation.
+# ---------------------------------------------------------------------------
+
+_COMPANION_PR = "https://github.com/o269/omnia-v2/pull/222"
+_OWN_PR = "https://github.com/o269/omnia/pull/681"
+
+
+def _card_declaring_pr(conn, url: str, *, title: str = "companion") -> str:
+    """A card whose OWN completed run named ``url`` — i.e. real custody."""
+    owner = kb.create_task(conn, title=title, assignee="cursor2")
+    kb.complete_task(
+        conn,
+        owner,
+        result=f"Opened {url}",
+        summary=f"AUTHOR COMPLETE: {url} is OPEN/MERGEABLE",
+    )
+    return owner
+
+
+def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
+    """The live repro: a companion PR quoted in a comment must not freeze us.
+
+    ``t_45e612bd`` (engine work) sat Ready for hours because an unrelated
+    comment quoted the full URL of the *frontend* companion PR — different
+    repo, different card, different work item.
+    """
+    with kb.connect() as conn:
+        owner = _card_declaring_pr(conn, _COMPANION_PR)
+        cited = kb.create_task(conn, title="engine signing URLs", assignee="alice")
+        kb.add_comment(
+            conn,
+            cited,
+            "cursor2",
+            "FRONTEND COMPANION AUTHOR-COMPLETE: o269/omnia-v2 PR #222 is "
+            f"OPEN/CLEAN/MERGEABLE: {_COMPANION_PR}. It depends on this engine "
+            "card's bounded resolver; please coordinate land order.",
+        )
+
+        assert kb.check_respawn_guard(conn, cited) is None
+        # Custody is not laundered away — the PR is still attributed to the
+        # card whose own work product opened it, and only to that card.
+        declared_by = [
+            row["task_id"]
+            for row in conn.execute(
+                "SELECT task_id FROM task_pr_ownership "
+                "WHERE canonical_url = ? AND declared = 1",
+                (_COMPANION_PR,),
+            ).fetchall()
+        ]
+        assert declared_by == [owner]
+
+
+def test_respawn_guard_keeps_active_pr_for_own_declared_pr(kanban_home):
+    """Custody the guard was built for: this card's own run opened the PR."""
+    with kb.connect() as conn:
+        # Another card also cites the PR — that must not launder away custody.
+        mine = kb.create_task(conn, title="engine work", assignee="alice")
+        kb.claim_task(conn, mine)
+        kb.block_task(
+            conn,
+            mine,
+            reason=f"review-required: opened {_OWN_PR}",
+            kind="needs_input",
+        )
+        kb.add_comment(conn, mine, "worker", f"PR opened: {_OWN_PR}")
+        kb.unblock_task(conn, mine)
+
+        assert kb.check_respawn_guard(conn, mine) == "active_pr"
+
+
+def test_respawn_guard_keeps_active_pr_when_nobody_declared_it(kanban_home):
+    """Comment-only handoffs stay guarded — no card declared the PR anywhere.
+
+    This is the common legacy shape ("PR opened: <url>" posted as a comment and
+    never mirrored into a run summary). Dropping the guard here would have
+    reintroduced duplicate PRs, so the conservative default is preserved.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="comment-only handoff", assignee="alice")
+        kb.add_comment(conn, t, "worker", f"PR opened: {_OWN_PR}")
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):
+    """A suppressed respawn must be diagnosable without reading the DB."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="comment-only handoff", assignee="alice")
+        comment_id = kb.add_comment(conn, t, "worker", f"PR opened: {_OWN_PR}")
+        decision = kb.evaluate_respawn_guard(conn, t)
+        assert decision.reason == "active_pr"
+        kb.record_respawn_guard_decision(conn, t, decision)
+
+        guarded = [
+            event for event in kb.list_events(conn, t)
+            if event.kind == "respawn_guarded"
+        ][-1]
+
+    payload = guarded.payload
+    assert payload["reason"] == "active_pr"
+    assert payload["pr_url"] == _OWN_PR
+    assert payload["ownership"] == "referenced"
+    assert payload["source_comment_id"] == comment_id
+    assert payload["expires_at"] > int(time.time())
+    assert payload["window_seconds"] == kb._RESPAWN_GUARD_PR_WINDOW
+
+
+def test_disowned_pr_mention_is_audited_not_silent(kanban_home):
+    """Letting a citation through is recorded too — silence hid the old bug."""
+    with kb.connect() as conn:
+        owner = _card_declaring_pr(conn, _COMPANION_PR)
+        cited = kb.create_task(conn, title="engine work", assignee="alice")
+        kb.add_comment(conn, cited, "cursor2", f"companion FE PR: {_COMPANION_PR}")
+
+        decision = kb.evaluate_respawn_guard(conn, cited)
+        assert decision.reason is None
+        kb.record_respawn_guard_decision(conn, cited, decision)
+        # Rate-limited: a 2-minute dispatcher tick must not flood the ledger.
+        kb.record_respawn_guard_decision(conn, cited, decision)
+
+        ignored = [
+            event for event in kb.list_events(conn, cited)
+            if event.kind == "respawn_guard_pr_ignored"
+        ]
+
+    assert len(ignored) == 1
+    assert ignored[0].payload["ignored_pr_urls"] == [
+        {"pr_url": _COMPANION_PR, "declared_by": owner}
+    ]
+
+
+def test_dispatch_spawns_card_that_only_cites_another_cards_pr(
+    kanban_home, all_assignees_spawnable
+):
+    """End-to-end: the card the old guard starved now actually spawns."""
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        _card_declaring_pr(conn, _COMPANION_PR)
+        cited = kb.create_task(conn, title="engine work", assignee="alice")
+        kb.add_comment(conn, cited, "cursor2", f"companion FE PR: {_COMPANION_PR}")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    assert spawned == [cited]
+    assert not [
+        entry for entry in result.respawn_guarded if entry[0] == cited
+    ]
+
+
 def test_continuation_exact_authorization_consumes_atomically_and_passes_once(
     kanban_home, all_assignees_spawnable
 ):
