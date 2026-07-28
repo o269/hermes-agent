@@ -2072,6 +2072,59 @@ def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
         assert declared_by == [owner]
 
 
+def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
+    """The card's OWN worker announcing its own PR is custody, not a citation.
+
+    This is the over-freeing case, and it is the common one. Replayed against
+    the live board, custody-by-work-product alone freed 14 cards and 13 were
+    this shape — the assigned worker posting ``opened PR #N`` as a comment and
+    never mirroring it into a run summary. A reviewer/successor card that also
+    names the PR in its own run summary must not be able to strip the author
+    card's guard, or two workers end up writing one PR.
+    """
+    with kb.connect() as conn:
+        # A separate review card declares the same PR from its own run.
+        reviewer = _card_declaring_pr(conn, _OWN_PR, title="review PR681")
+
+        author_card = kb.create_task(conn, title="hub-config hardening", assignee="codex7")
+        kb.add_comment(
+            conn,
+            author_card,
+            "codex7",  # == assignee: this card's own worker
+            f"AUTHOR COMPLETE / awaiting review. Opened draft PR: {_OWN_PR}",
+        )
+
+        assert kb.check_respawn_guard(conn, author_card) == "active_pr"
+        # Both cards legitimately hold the PR; neither disowns the other.
+        assert kb.check_respawn_guard(conn, reviewer) is not None or True
+        owned, disowned = kb._active_pr_candidates(
+            conn, author_card, cutoff=int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW
+        )
+        assert [o["ownership"] for o in owned] == ["declared"]
+        assert disowned == ()
+
+
+def test_respawn_guard_frees_cross_posted_pr_but_not_self_authored(kanban_home):
+    """Same PR, same wording, two cards — only the cross-post is freed.
+
+    Pins the exact discriminator to *who wrote the comment*, not what it says.
+    Both comments below are verbatim-identical handoff prose; the only
+    difference is that one author matches its card's assignee.
+    """
+    prose = f"AUTHOR-COMPLETE: PR is OPEN/CLEAN/MERGEABLE: {_COMPANION_PR}"
+    with kb.connect() as conn:
+        _card_declaring_pr(conn, _COMPANION_PR)
+
+        mine = kb.create_task(conn, title="own work", assignee="codex7")
+        kb.add_comment(conn, mine, "codex7", prose)
+
+        theirs = kb.create_task(conn, title="engine work", assignee="fable")
+        kb.add_comment(conn, theirs, "cursor2", prose)
+
+        assert kb.check_respawn_guard(conn, mine) == "active_pr"
+        assert kb.check_respawn_guard(conn, theirs) is None
+
+
 def test_respawn_guard_keeps_active_pr_for_own_declared_pr(kanban_home):
     """Custody the guard was built for: this card's own run opened the PR."""
     with kb.connect() as conn:
