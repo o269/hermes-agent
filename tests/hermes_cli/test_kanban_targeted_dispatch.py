@@ -47,6 +47,13 @@ def _task(conn, task_id: str) -> kb.Task:
     return task
 
 
+def _database_file_bytes() -> dict[str, bytes | None]:
+    """Snapshot the database and WAL/SHM sidecars without creating them."""
+    db_path = kb.kanban_db_path(board="default")
+    paths = (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+    return {path.name: path.read_bytes() if path.exists() else None for path in paths}
+
+
 def test_exact_target_does_not_spawn_higher_priority_unrequested_ready_task(
     exact_dispatch_board,
 ):
@@ -200,11 +207,13 @@ def test_targeted_dispatch_lock_contention_fails_closed_without_writes(
 
     with kb._dispatch_tick_lock(kb.kanban_db_path(board="default")) as held:
         assert held is True
+        files_before = _database_file_bytes()
         result = kb.dispatch_once(
             conn,
             task_ids=[target, "BAD"],
             spawn_fn=_spawn_recorder(calls),
         )
+        files_after = _database_file_bytes()
 
     assert result.skipped_locked is True
     assert result.targeted is True
@@ -213,6 +222,7 @@ def test_targeted_dispatch_lock_contention_fails_closed_without_writes(
         ("BAD", "malformed"),
     ]
     assert calls == []
+    assert files_after == files_before
     assert conn.total_changes == total_changes_before
     assert "\n".join(conn.iterdump()) == dump_before
 
@@ -236,11 +246,13 @@ def test_targeted_dispatch_lock_open_failure_fails_closed_without_writes(
 
     monkeypatch.setattr(Path, "open", deny_dispatch_lock_open)
     with caplog.at_level(logging.ERROR, logger=kb.__name__):
+        files_before = _database_file_bytes()
         result = kb.dispatch_once(
             conn,
             task_ids=[target, "BAD"],
             spawn_fn=_spawn_recorder(calls),
         )
+        files_after = _database_file_bytes()
 
     assert result.skipped_locked is True
     assert result.targeted is True
@@ -257,9 +269,20 @@ def test_targeted_dispatch_lock_open_failure_fails_closed_without_writes(
         ).fetchone()[0]
         == 0
     )
+    assert files_after == files_before
     assert conn.total_changes == total_changes_before
     assert "\n".join(conn.iterdump()) == dump_before
     assert "dispatch lock unavailable" in caplog.text
+    assert "check permissions for the board data directory" in caplog.text
+    lock_path = kb.kanban_db_path(board="default").with_name(
+        kb.kanban_db_path(board="default").name + ".dispatch.lock"
+    )
+    assert str(lock_path) not in caplog.text
+    assert lock_path.name not in caplog.text
+    assert "adversarial dispatch-lock open denial" not in caplog.text
+    assert "PermissionError" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.parametrize(

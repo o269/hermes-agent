@@ -1697,10 +1697,8 @@ def _dispatch_tick_lock(db_path: Path):
         # Return a distinct state so exact-target callers can fail closed, and
         # make the broken locking mechanism operator-visible.
         _log.error(
-            "kanban dispatch lock unavailable: could not open %s; "
-            "exclusive ownership cannot be established",
-            lock_path,
-            exc_info=True,
+            "kanban dispatch lock unavailable: exclusive ownership cannot be "
+            "established; check permissions for the board data directory"
         )
         acquired = None
         handle = None
