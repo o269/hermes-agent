@@ -1636,9 +1636,11 @@ def _cross_process_init_lock(path: Path):
 def _dispatch_tick_lock(db_path: Path):
     """Non-blocking single-writer guard around one dispatcher tick.
 
-    Yields ``True`` when this process holds the board's dispatch lock and
-    may proceed with the tick, or ``False`` when another process already
-    holds it (the caller should skip the tick this round).
+    Yields ``True`` when this process holds the board's dispatch lock,
+    ``False`` when another process already holds it, or ``None`` when the
+    lock file cannot be opened. The tri-state result lets exact-target
+    callers fail closed on both contention and lock-mechanism failure while
+    preserving the legacy generic-dispatch fallback for unavailable locks.
 
     Motivation (issue #35240): a ``hermes gateway run --replace`` /
     ``gateway restart`` invoked from a shell on a systemd/launchd host can
@@ -1665,7 +1667,7 @@ def _dispatch_tick_lock(db_path: Path):
     """
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
-    acquired = False
+    acquired: Optional[bool] = False
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
@@ -1690,9 +1692,17 @@ def _dispatch_tick_lock(db_path: Path):
             except (BlockingIOError, OSError):
                 acquired = False
     except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Lock unavailability is strictly less safe than contention: without
+        # a file handle we cannot know whether another dispatcher is active.
+        # Return a distinct state so exact-target callers can fail closed, and
+        # make the broken locking mechanism operator-visible.
+        _log.error(
+            "kanban dispatch lock unavailable: could not open %s; "
+            "exclusive ownership cannot be established",
+            lock_path,
+            exc_info=True,
+        )
+        acquired = None
         handle = None
     try:
         yield acquired
@@ -8272,10 +8282,10 @@ class DispatchResult:
     window just makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
-    the board's dispatch lock (issue #35240). A losing dispatcher does no
-    DB writes this tick — the lock holder is making progress on the same
-    board. This is the steady-state signal that a single-writer guard is
-    actively preventing two dispatchers from racing on ``kanban.db``."""
+    the board's dispatch lock, or because an exact-target tick found the lock
+    mechanism unavailable (issue #35240). A skipped dispatcher does no DB writes
+    this tick. Lock-file open failures are logged as errors because no dispatcher
+    can safely prove exclusive ownership in that state."""
     targeted: bool = False
     """True when an explicit exact-task filter was supplied.
 
@@ -11106,9 +11116,11 @@ def dispatch_once(
     dispatchers pointed at the same ``kanban.db`` — e.g. the service-
     managed gateway and a shell-spawned orphan that escaped the service
     cgroup — can never run a reclaim/spawn/write tick concurrently and
-    race on WAL frames. The losing dispatcher returns an empty
-    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board.
+    race on WAL frames. A contender returns an empty ``DispatchResult`` with
+    ``skipped_locked=True`` and does no DB writes. Exact-target dispatch also
+    fails closed this way when the lock file cannot be opened; generic dispatch
+    retains its legacy degraded fallback. Lock-file open failures are logged as
+    errors because exclusive ownership cannot be established.
 
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
@@ -11142,10 +11154,14 @@ def dispatch_once(
             task_ids=task_ids,
         )
     with _dispatch_tick_lock(db_path) as held:
-        if not held:
+        if held is not True:
             if task_ids is not None:
                 return _unavailable_targeted_dispatch_result(task_ids)
-            return DispatchResult(skipped_locked=True)
+            if held is False:
+                return DispatchResult(skipped_locked=True)
+            # ``None`` means the lock mechanism itself is unavailable. Keep
+            # the pre-existing generic-dispatch fallback, but exact-target
+            # dispatch above must never enter this unguarded path.
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,

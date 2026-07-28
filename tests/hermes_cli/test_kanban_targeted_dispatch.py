@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -214,6 +215,51 @@ def test_targeted_dispatch_lock_contention_fails_closed_without_writes(
     assert calls == []
     assert conn.total_changes == total_changes_before
     assert "\n".join(conn.iterdump()) == dump_before
+
+
+def test_targeted_dispatch_lock_open_failure_fails_closed_without_writes(
+    exact_dispatch_board,
+    monkeypatch,
+    caplog,
+):
+    conn = exact_dispatch_board
+    target = kb.create_task(conn, title="target", assignee="alpha")
+    total_changes_before = conn.total_changes
+    dump_before = "\n".join(conn.iterdump())
+    calls: list[str] = []
+    original_open = Path.open
+
+    def deny_dispatch_lock_open(path, *args, **kwargs):
+        if path.name.endswith(".dispatch.lock"):
+            raise PermissionError("adversarial dispatch-lock open denial")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_dispatch_lock_open)
+    with caplog.at_level(logging.ERROR, logger=kb.__name__):
+        result = kb.dispatch_once(
+            conn,
+            task_ids=[target, "BAD"],
+            spawn_fn=_spawn_recorder(calls),
+        )
+
+    assert result.skipped_locked is True
+    assert result.targeted is True
+    assert [(item.task_id, item.outcome) for item in result.requested_outcomes] == [
+        (target, "locked"),
+        ("BAD", "malformed"),
+    ]
+    assert result.spawned == []
+    assert calls == []
+    assert _task(conn, target).status == "ready"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (target,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert conn.total_changes == total_changes_before
+    assert "\n".join(conn.iterdump()) == dump_before
+    assert "dispatch lock unavailable" in caplog.text
 
 
 @pytest.mark.parametrize(
