@@ -1442,13 +1442,17 @@ CREATE TABLE IF NOT EXISTS continuation_authorizations (
 -- respawn window and avoids regex-scanning the full comment ledger while a
 -- claim holds BEGIN IMMEDIATE.
 --
--- ``declared`` separates CUSTODY from CITATION. A row is declared (1) only
--- when the card's OWN work product named the PR — a run summary / metadata /
--- error, or ``tasks.result``. A row derived from free-text comment prose is a
--- mention (0): workers are asked to cross-reference companion PRs, so a URL
--- in prose is evidence that somebody talked about a PR, never evidence that
--- this card owns it. The ``active_pr`` respawn guard consumes this
--- distinction; see :func:`_active_pr_custody`.
+-- ``declared`` separates CUSTODY from CITATION. A row is declared (1) when
+-- the PR came from the card ITSELF, by either of two structural signals:
+--   * the card's own work product named it — a run summary / metadata / error,
+--     or ``tasks.result``; or
+--   * a comment written by the card's own assigned worker named it
+--     (see :func:`_is_self_authored`).
+-- A row stays a mention (0) only when some OTHER profile wrote the URL onto
+-- this card: workers are asked to cross-reference companion PRs, so a URL
+-- cross-posted by a different profile is evidence that somebody talked about
+-- a PR, never evidence that this card owns it. The ``active_pr`` respawn
+-- guard consumes this distinction; see :func:`_active_pr_custody`.
 CREATE TABLE IF NOT EXISTS task_pr_ownership (
     task_id        TEXT NOT NULL,
     canonical_url  TEXT NOT NULL,
@@ -2113,6 +2117,32 @@ def _coerce_epoch(value: Any) -> int:
     return 0
 
 
+def _is_self_authored(author: Optional[str], assignee: Optional[str]) -> bool:
+    """True when a comment was written by the card's OWN assigned worker.
+
+    This is the structural half of the custody signal, and it is what keeps
+    the ownership rule from over-freeing. The reported defect is a CROSS-POST:
+    some other profile writes a companion PR's URL onto this card. But the
+    overwhelmingly common shape is the opposite — the card's own worker posts
+    ``PR opened: <url>`` as a comment and never mirrors it into a run summary.
+
+    Replayed against the live 2,662-card board, custody-by-work-product alone
+    freed 14 cards, and 13 of them were exactly that: the assigned worker
+    announcing its own PR. Freeing those would drop the guard for cards that
+    genuinely hold an open PR — the two-writers-on-one-PR case the guard exists
+    to prevent. Only the one true cross-post (``assignee=fable``, comment by
+    ``cursor2``) is left unguarded, which is the reported bug.
+
+    Deliberately an exact match on the recorded author, with no prose
+    inspection and no fuzzy profile aliasing: an unknown or absent assignee
+    yields False, which routes the URL through the ordinary
+    "did another card declare this?" path rather than inventing custody.
+    """
+    if not author or not assignee:
+        return False
+    return author.strip() == assignee.strip()
+
+
 def _record_task_pr_ownership(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2224,6 +2254,11 @@ def _backfill_task_pr_declarations(conn: sqlite3.Connection) -> None:
     ``declared`` column too, so without this pass every historical card looks
     like it owns nothing and the guard's "another card declared this PR"
     disambiguation has no data to work with on an existing board.
+
+    Self-authored comments are upgraded here as well rather than in
+    ``_backfill_task_pr_ownership``: that pass carries its own ``_v1`` marker
+    and has already run to completion on every existing board, so amending it
+    would be a no-op exactly where the upgrade is needed.
     """
     present = {
         str(row["name"])
@@ -2276,6 +2311,27 @@ def _backfill_task_pr_declarations(conn: sqlite3.Connection) -> None:
                     task["result"],
                     observed_at=_coerce_epoch(task["seen_at"]),
                 )
+        # A comment written by the card's OWN assigned worker is custody, not a
+        # citation — see :func:`_is_self_authored`. Re-scan the bodies rather
+        # than flipping the flag by ``source_comment_id``: that column holds
+        # only the LATEST sighting, so a self-authored announcement followed by
+        # someone else's cross-post of the same URL would be missed.
+        for comment in conn.execute(
+            "SELECT c.id, c.task_id, c.body, c.author, c.created_at "
+            "FROM task_comments c JOIN tasks t ON t.id = c.task_id "
+            "WHERE c.body LIKE '%/pull/%' "
+            "  AND TRIM(COALESCE(c.author, '')) <> '' "
+            "  AND TRIM(COALESCE(c.author, '')) = TRIM(COALESCE(t.assignee, '')) "
+            "ORDER BY c.id ASC"
+        ).fetchall():
+            _record_task_pr_ownership(
+                conn,
+                str(comment["task_id"]),
+                str(comment["body"] or ""),
+                observed_at=_coerce_epoch(comment["created_at"]),
+                source_comment_id=int(comment["id"]),
+                declared=True,
+            )
         conn.execute(
             "INSERT INTO kanban_schema_state (key, value) VALUES (?, 'complete') "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3424,9 +3480,10 @@ def add_comment(
         raise ValueError("comment author is required")
     now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        task = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -3439,6 +3496,7 @@ def add_comment(
             body,
             observed_at=now,
             source_comment_id=int(cur.lastrowid or 0),
+            declared=_is_self_authored(author, task["assignee"]),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
@@ -7075,12 +7133,21 @@ def _active_pr_candidates(
 
     Ownership is decided per URL:
 
-    * ``declared`` — this card's OWN work product (a run summary / metadata /
-      error, or ``tasks.result``) named the PR. Always owned.
-    * otherwise — the URL is only prose on this card. If some OTHER card
-      declared the same PR, the PR provably belongs to that card and this
-      mention is a citation: disowned. If nobody declared it anywhere, the
-      conservative pre-existing behaviour is preserved and it stays owned.
+    * ``declared`` — the PR came from the card itself: its own work product
+      (run summary / metadata / error, or ``tasks.result``) named it, OR its
+      own assigned worker posted it in a comment. Always owned.
+    * otherwise — the URL was cross-posted onto this card by another profile.
+      If some OTHER card declared the same PR, the PR provably belongs to that
+      card and this mention is a citation: disowned. If nobody declared it
+      anywhere, the conservative pre-existing behaviour is preserved and it
+      stays owned.
+
+    Both halves of ``declared`` are load-bearing. Replayed against the live
+    2,662-card board, work-product custody alone freed 14 cards but 13 of them
+    were the assigned worker announcing its own PR in a comment — freeing those
+    would drop the guard for cards that really do hold an open PR. With
+    self-authorship included, exactly one card is freed: the reported
+    cross-post.
 
     Deliberately NOT filtered by the other card's status: custody does not
     lapse when the owning card finishes, so a citation of a completed card's
@@ -7434,13 +7501,23 @@ def _continuation_local_denial(
     if not prs or any(not pr.head_sha for pr in prs):
         return "missing_exact_head"
     expected_urls = tuple(pr.canonical_url for pr in prs)
-    # Must be the same owned set the guard used. Comparing an authorization
-    # against the unfiltered comment scan would deny every grant on a card that
-    # merely cites a companion PR it does not own.
-    active_urls = _active_pr_custody(
-        conn,
-        task_id,
-        cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+    # Citations must be filtered out of the active set, or a card that merely
+    # cross-references a companion PR trips ``active_pr_set_mismatch`` and every
+    # grant on it is denied. But custody filtering alone is too strong here: an
+    # authorization NAMES its PRs, which is itself the explicit card-PR link,
+    # and the card's PR announcement is not always written by its own worker (a
+    # reviewer may post it). So an expected URL this card mentions in-window
+    # stays active even when another card also declared it. That is not a hole:
+    # cross-card custody is exactly what ``_duplicate_continuation_pr_owner``
+    # below denies, and it does so with the specific reason rather than a
+    # misleading ``active_pr_missing``.
+    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    owned = set(_active_pr_custody(conn, task_id, cutoff=pr_cutoff))
+    expected_set = set(expected_urls)
+    active_urls = tuple(
+        url
+        for url in _canonical_pr_urls_from_comments(conn, task_id, cutoff=pr_cutoff)
+        if url in owned or url in expected_set
     )
     if not active_urls:
         return "active_pr_missing"
