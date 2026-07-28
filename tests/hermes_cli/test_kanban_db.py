@@ -2471,6 +2471,96 @@ def test_broker_rebind_passthrough_mutators_stay_local(kanban_home):
     assert completed.stdout.strip() == "passthrough-local-ok"
 
 
+def _run_local_rebind_probe(
+    kanban_home: Path,
+    local_db: Path,
+    *,
+    shim_first: bool,
+    install_count: int,
+) -> subprocess.CompletedProcess[str]:
+    imports = (
+        "from hermes_cli import boardd_shim as shim\n"
+        "from hermes_cli import kanban_db as kb\n"
+        if shim_first
+        else
+        "from hermes_cli import kanban_db as kb\n"
+        "from hermes_cli import boardd_shim as shim\n"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(kanban_home)
+    env["HERMES_KANBAN_HOME"] = str(kanban_home)
+    env.pop("HERMES_KANBAN_BROKER", None)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            imports
+            + (
+                "from pathlib import Path\n"
+                "import sys\n"
+                "db = Path(sys.argv[1])\n"
+                "native_add_comment = kb.add_comment\n"
+                "native_heartbeat = kb.heartbeat_worker\n"
+                "native_set_workspace = kb.set_workspace_path\n"
+                "native_set_branch = kb.set_branch_name\n"
+                "native_flen = kb._check_file_length_invariant\n"
+                "kb.init_db(db_path=db)\n"
+                "with kb.connect(db_path=db) as conn:\n"
+                " tid = kb.create_task(conn, title='local', assignee='worker')\n"
+                " for _ in range(int(sys.argv[2])):\n"
+                "  shim.install_rebind(kb)\n"
+                " assert shim._ORIG_ADD_COMMENT is native_add_comment\n"
+                " assert shim._ORIG_HEARTBEAT_WORKER is native_heartbeat\n"
+                " assert shim._ORIG_SET_WORKSPACE_PATH is native_set_workspace\n"
+                " assert shim._ORIG_SET_BRANCH_NAME is native_set_branch\n"
+                " assert shim._ORIG_CHECK_FILE_LENGTH_INVARIANT is native_flen\n"
+                " cid = kb.add_comment(conn, tid, 'worker', 'local-only')\n"
+                " kb.set_workspace_path(conn, tid, '/tmp/local-workspace')\n"
+                " kb.set_branch_name(conn, tid, 'fix/local-only')\n"
+                " conn.execute(\"UPDATE tasks SET status = 'running' WHERE id = ?\", (tid,))\n"
+                " assert kb.heartbeat_worker(conn, tid, note='local heartbeat')\n"
+                " kb._check_file_length_invariant(conn)\n"
+                " row = conn.execute(\"SELECT workspace_path, branch_name, last_heartbeat_at FROM tasks WHERE id = ?\", (tid,)).fetchone()\n"
+                " assert row['workspace_path'] == '/tmp/local-workspace'\n"
+                " assert row['branch_name'] == 'fix/local-only'\n"
+                " assert row['last_heartbeat_at'] is not None\n"
+                " assert kb.list_comments(conn, tid)[0].id == cid\n"
+                "print('local-rebind-ok')"
+            ),
+            str(local_db),
+            str(install_count),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+
+
+def test_install_rebind_twice_preserves_native_delegates(kanban_home):
+    """A second install must retain genuine local mutators and file checks."""
+    completed = _run_local_rebind_probe(
+        kanban_home,
+        kanban_home / "duplicate-install.db",
+        shim_first=False,
+        install_count=2,
+    )
+    assert completed.stdout.strip() == "local-rebind-ok"
+
+
+def test_boardd_shim_import_before_install_preserves_native_delegates(kanban_home):
+    """Importing the broker path first must not poison a later install."""
+    completed = _run_local_rebind_probe(
+        kanban_home,
+        kanban_home / "shim-import-first.db",
+        shim_first=True,
+        install_count=1,
+    )
+    assert completed.stdout.strip() == "local-rebind-ok"
+
+
 def test_continuation_changed_head_fails_closed_with_audit_event(
     kanban_home, all_assignees_spawnable, monkeypatch
 ):

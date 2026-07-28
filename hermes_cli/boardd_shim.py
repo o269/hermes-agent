@@ -194,20 +194,46 @@ _route_log = logging.getLogger("boardd_shim")
 
 
 def _capture_original(kdb):
-    """Record the resolver module + its REAL rebound functions before the shim
-    repoints them. MUST run before install_rebind/end-block rebinds."""
+    """Capture one module's genuine functions exactly once.
+
+    Re-installing the shim on the same module is intentionally idempotent: its
+    public names already point at this module, so capturing them again would
+    make each pass-through delegate recurse into itself. A different module is
+    rejected rather than replacing the originals used by the active resolver.
+    """
     global _KDB, _ORIG_CONNECT, _ORIG_CONNECT_CLOSING
     global _ORIG_ADD_COMMENT, _ORIG_HEARTBEAT_WORKER
     global _ORIG_SET_WORKSPACE_PATH, _ORIG_SET_BRANCH_NAME
     global _ORIG_CHECK_FILE_LENGTH_INVARIANT
+    if _KDB is kdb:
+        return
+    if _KDB is not None:
+        raise RuntimeError(
+            "boardd_shim originals are already captured from a different "
+            "kanban_db module"
+        )
+
+    # Resolve every attribute before publishing _KDB so a malformed module
+    # cannot leave a partially initialized capture that later looks complete.
+    originals = (
+        kdb.connect,
+        kdb.connect_closing,
+        kdb.add_comment,
+        kdb.heartbeat_worker,
+        kdb.set_workspace_path,
+        kdb.set_branch_name,
+        kdb._check_file_length_invariant,
+    )
+    (
+        _ORIG_CONNECT,
+        _ORIG_CONNECT_CLOSING,
+        _ORIG_ADD_COMMENT,
+        _ORIG_HEARTBEAT_WORKER,
+        _ORIG_SET_WORKSPACE_PATH,
+        _ORIG_SET_BRANCH_NAME,
+        _ORIG_CHECK_FILE_LENGTH_INVARIANT,
+    ) = originals
     _KDB = kdb
-    _ORIG_CONNECT = kdb.connect
-    _ORIG_CONNECT_CLOSING = kdb.connect_closing
-    _ORIG_ADD_COMMENT = kdb.add_comment
-    _ORIG_HEARTBEAT_WORKER = kdb.heartbeat_worker
-    _ORIG_SET_WORKSPACE_PATH = kdb.set_workspace_path
-    _ORIG_SET_BRANCH_NAME = kdb.set_branch_name
-    _ORIG_CHECK_FILE_LENGTH_INVARIANT = kdb._check_file_length_invariant
 
 
 def _resolver():
