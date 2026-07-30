@@ -1764,7 +1764,97 @@ class TestCmdUpdateForkRemoteFence:
         assert exc_info.value.code == 1
         assert not any("reset" in command and "--hard" in command for command in commands)
 
-    def _prepare_post_pull_failure(self, tmp_path, monkeypatch, failure):
+    @pytest.mark.parametrize("failure_stage", ["status", "stash", "stash-ref"])
+    def test_windows_pre_switch_git_failures_never_run_zip(
+        self, tmp_path, monkeypatch, capsys, failure_stage
+    ):
+        """Pre-switch Git failures preserve feature work instead of ZIP-overlaying it."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/hermes-agent.git",
+        )
+        self._git(repo, "checkout", "-b", "feature/review")
+        (repo / "base.txt").write_text("feature work")
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(hm.sys, "platform", "win32")
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+
+        real_run = subprocess.run
+        commands = []
+
+        def fail_before_switch(cmd, **kwargs):
+            commands.append([str(part) for part in cmd])
+            if "fetch" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            stage = None
+            if cmd[-2:] == ["status", "--porcelain"]:
+                stage = "status"
+            elif "stash" in cmd and "push" in cmd:
+                stage = "stash"
+            elif cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
+                stage = "stash-ref"
+            if stage == failure_stage:
+                raise subprocess.CalledProcessError(
+                    1, cmd, stderr=f"injected {failure_stage} failure"
+                )
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(hm.subprocess, "run", fail_before_switch)
+        zip_calls = []
+        monkeypatch.setattr(hm, "_update_via_zip", lambda _args: zip_calls.append(1))
+
+        args = SimpleNamespace(branch=None, force=True, force_venv=True, yes=True)
+        with pytest.raises(SystemExit) as exc_info:
+            hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert exc_info.value.code == 1
+        assert zip_calls == []
+        assert not any(" checkout main" in f" {' '.join(command)}" for command in commands)
+        branch = real_run(
+            ["git", "branch", "--show-current"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert branch == "feature/review"
+
+        if failure_stage == "stash-ref":
+            preserved = real_run(
+                ["git", "show", "refs/stash:base.txt"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert preserved == "feature work"
+        else:
+            assert (repo / "base.txt").read_text() == "feature work"
+            status = real_run(
+                ["git", "status", "--porcelain", "--", "base.txt"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert status.strip() == "M base.txt"
+
+        assert "Refusing ZIP fallback to preserve the original checkout" in capsys.readouterr().out
+
+    def _prepare_post_pull_failure(
+        self, tmp_path, monkeypatch, failure, current_branch="main"
+    ):
         """Wire a Windows update that fails after pulling on the target checkout."""
         from hermes_cli import main as hm
 
@@ -1808,7 +1898,7 @@ class TestCmdUpdateForkRemoteFence:
         monkeypatch.setattr(
             hm.subprocess,
             "run",
-            _make_run_side_effect(branch="main", commit_count="3"),
+            _make_run_side_effect(branch=current_branch, commit_count="3"),
         )
 
         args = SimpleNamespace(
@@ -1834,6 +1924,32 @@ class TestCmdUpdateForkRemoteFence:
         hm._cmd_update_impl(args, gateway_mode=False)
 
         assert events == ["zip", "restore"]
+        assert stash_restore_calls == []
+
+    def test_windows_git_failure_after_branch_switch_can_run_zip(
+        self, tmp_path, monkeypatch
+    ):
+        """A successful target switch establishes custody for later ZIP fallback."""
+        failure = subprocess.CalledProcessError(1, ["git", "status"])
+        hm, args, events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure, current_branch="feature/review"
+        )
+        monkeypatch.setattr(
+            hm,
+            "_checkout_update_branch",
+            lambda *_args: (
+                events.append("checkout")
+                or subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                True,
+            ),
+        )
+        monkeypatch.setattr(
+            hm, "_update_via_zip", lambda _args: events.append("zip")
+        )
+
+        hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert events == ["checkout", "zip", "restore"]
         assert stash_restore_calls == []
 
     def test_windows_non_git_subprocess_failure_never_runs_zip(
@@ -1900,4 +2016,3 @@ class TestCmdUpdateForkRemoteFence:
         output = capsys.readouterr().out
         assert output.count("preserved in stash") == 1
         assert "Could not restore the pre-update checkout" in output
-

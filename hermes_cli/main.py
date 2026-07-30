@@ -10445,6 +10445,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     current_branch = branch
     original_head: Optional[str] = None
     auto_stash_ref: Optional[str] = None
+    # ZIP replacement is destructive to whichever checkout currently owns
+    # PROJECT_ROOT. It is safe only after we have positively established that
+    # the update target owns that path. In particular, failures while inspecting
+    # or stashing a feature/detached checkout must never fall through to ZIP.
+    target_checkout_established = False
     checkout_restore_attempted = False
     checkout_restore_succeeded = False
     stash_preservation_reported = False
@@ -10452,6 +10457,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     def restore_checkout_once() -> bool:
         """Attempt exact-checkout restoration at most once for this update."""
         nonlocal checkout_restore_attempted, checkout_restore_succeeded
+        nonlocal target_checkout_established
         if not checkout_restore_attempted:
             checkout_restore_attempted = True
             try:
@@ -10468,6 +10474,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 checkout_restore_succeeded = False
                 logger.warning("Could not restore the pre-update checkout: %s", exc)
                 print("✗ Could not restore the pre-update checkout after update failure.")
+            if checkout_restore_succeeded and current_branch != branch:
+                target_checkout_established = False
         return checkout_restore_succeeded
 
     def report_preserved_stash_once() -> None:
@@ -10521,6 +10529,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        target_checkout_established = current_branch == branch
         original_head = _capture_head_sha(git_cmd, PROJECT_ROOT)
         local_git_config = _local_git_config_path(PROJECT_ROOT)
         synthetic_checkout = (
@@ -10600,6 +10609,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if checkout_result.stderr.strip():
                     print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
                 sys.exit(1)
+            target_checkout_established = True
         else:
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
@@ -12065,7 +12075,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("  hermes model              # Select provider and model")
 
     except subprocess.CalledProcessError as e:
-        if sys.platform == "win32" and _called_process_error_is_git(e):
+        is_windows_git_failure = (
+            sys.platform == "win32" and _called_process_error_is_git(e)
+        )
+        if is_windows_git_failure and target_checkout_established:
             # ZIP replacement must happen while the update target is still
             # checked out. The single finalizer below restores the user's exact
             # branch/detached HEAD only after ZIP work has finished.
@@ -12074,7 +12087,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print()
             _update_via_zip(args)
         else:
-            print(f"✗ Update failed: {e}")
+            if is_windows_git_failure:
+                print(f"✗ Git update failed before switching to '{branch}': {e}")
+                print(
+                    "  Refusing ZIP fallback to preserve the original checkout and local work."
+                )
+            else:
+                print(f"✗ Update failed: {e}")
             raise SystemExit(1) from None
 
     except (Exception, KeyboardInterrupt, SystemExit):
