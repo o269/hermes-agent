@@ -102,6 +102,9 @@ from typing import (
 
 import yaml
 
+from hermes_cli.kanban_assignment_policy import (
+    assignment_guard_reason as _pure_assignment_guard_reason,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -1576,6 +1579,183 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+_ASSIGNMENT_POLICY_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_insert
+BEFORE INSERT ON tasks
+WHEN kanban_assignment_guard(
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_update
+BEFORE UPDATE OF title, body, assignee, status ON tasks
+WHEN kanban_assignment_guard(
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+"""
+
+
+def _configured_board_profiles(
+    conn: sqlite3.Connection,
+    key: str,
+    default: object,
+) -> tuple[str, ...]:
+    """Read a profile allowlist from the config bound to ``conn``'s board.
+
+    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
+    policy.  The opened SQLite path resolves the canonical root, matching the
+    continuation-authority model.
+    """
+
+    raw = default
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        return ()
+    config_path = authority_root / "config.yaml"
+    try:
+        if config_path.exists():
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(payload, dict):
+                return ()
+            kanban_config = payload.get("kanban") or {}
+            if not isinstance(kanban_config, dict):
+                return ()
+            configured = kanban_config.get(key)
+            if configured is not None:
+                raw = configured
+    except (OSError, yaml.YAMLError):
+        return ()
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        )
+    )
+
+
+def _authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    kanban_defaults = DEFAULT_CONFIG.get("kanban")
+    default = (
+        kanban_defaults.get("authority_profiles", "")
+        if isinstance(kanban_defaults, dict)
+        else ""
+    )
+    return _configured_board_profiles(conn, "authority_profiles", default)
+
+
+def _assignment_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+    status: Optional[str],
+    has_open_parent: bool,
+) -> Optional[str]:
+    return _pure_assignment_guard_reason(
+        title=title,
+        body=body,
+        assignee=assignee,
+        status=status,
+        authority_profiles=_authority_profiles(conn),
+        has_open_parent=has_open_parent,
+    )
+
+
+def _task_has_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    )
+
+
+def _parents_have_open_task(
+    conn: sqlite3.Connection, parents: Sequence[str]
+) -> bool:
+    if not parents:
+        return False
+    placeholders = ",".join("?" * len(parents))
+    return bool(
+        conn.execute(
+            f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+            "AND status NOT IN ('done', 'archived') LIMIT 1",
+            tuple(parents),
+        ).fetchone()
+    )
+
+
+def _register_assignment_policy_guard(conn: sqlite3.Connection) -> None:
+    """Install the per-connection UDF used by persistent SQLite triggers."""
+
+    def guard(
+        title: Optional[str],
+        body: Optional[str],
+        assignee: Optional[str],
+        status: Optional[str],
+        has_open_parent: object,
+    ) -> str:
+        return _assignment_guard_reason(
+            conn,
+            title=title,
+            body=body,
+            assignee=assignee,
+            status=status,
+            has_open_parent=bool(has_open_parent),
+        ) or ""
+
+    conn.create_function("kanban_assignment_guard", 5, guard)
+
+
+def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
+    if _authority_profiles(conn):
+        conn.executescript(_ASSIGNMENT_POLICY_TRIGGERS_SQL)
+        return
+    # Preserve legacy raw-SQL compatibility for installations that have not
+    # opted in. If an installation later disables the policy, its next cold
+    # board initialization removes the persistent guards.
+    conn.executescript(
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+    )
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -1971,6 +2151,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
@@ -1996,6 +2177,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
@@ -2026,6 +2208,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _install_assignment_policy_triggers(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -3208,6 +3391,30 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Stage parent links before the task insert (inside this same
+                # transaction) so the INSERT trigger can distinguish a real
+                # dependency-held authority parking state from an orphaned
+                # executor card. ``task_links`` intentionally has no FK; a
+                # failed task insert rolls these rows back atomically.
+                for pid in parents:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (pid, task_id),
+                    )
+
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=title.strip(),
+                    body=body,
+                    assignee=assignee,
+                    status=task_status,
+                    has_open_parent=_parents_have_open_task(conn, parents),
+                )
+                if assignment_denial is not None:
+                    raise ValueError(
+                        f"kanban assignment policy: {assignment_denial}"
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3241,11 +3448,6 @@ def create_task(
                         session_id,
                     ),
                 )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
-                    )
                 _append_event(
                     conn,
                     task_id,
@@ -3362,7 +3564,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT title, body, status, claim_lock, assignee "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3371,6 +3575,16 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=row["title"],
+            body=row["body"],
+            assignee=profile,
+            status=row["status"],
+            has_open_parent=_task_has_open_parent(conn, task_id),
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -4035,7 +4249,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, title, body, assignee, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4054,6 +4268,19 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=row["title"],
+                    body=row["body"],
+                    assignee=row["assignee"],
+                    status="ready",
+                    has_open_parent=False,
+                )
+                if assignment_denial is not None:
+                    # Keep dependency-held authority work safely parked. The
+                    # operator/bridge must first route executor work to a
+                    # spawnable lane (or leave authority work non-dispatching).
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4166,6 +4393,25 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "ready":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+        )
+        if assignment_denial is not None:
+            # Fail closed for legacy rows that predate trigger installation or
+            # were imported with the policy disabled. The dispatcher sees an
+            # ordinary non-claim and cannot spawn the protected row.
+            return None
+
     override_reason: Optional[str] = None
     operator_authorizer: Optional[str] = None
     if operator_override_reason is not None:
@@ -4548,6 +4794,22 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "review":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+        )
+        if assignment_denial is not None:
+            return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -6158,7 +6420,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6186,6 +6449,17 @@ def promote_task(
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
+
+    assignment_denial = _assignment_guard_reason(
+        conn,
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+        status="ready",
+        has_open_parent=_task_has_open_parent(conn, task_id),
+    )
+    if assignment_denial is not None:
+        return False, f"kanban assignment policy: {assignment_denial}"
 
     if dry_run:
         return True, None
@@ -6221,10 +6495,36 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT title, body, assignee, current_run_id FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
+        if stale is None:
+            return False
+        # Re-gate on parent completion before flipping 'blocked' back to
+        # 'ready'. Unconditionally setting status='ready' here bypasses the
+        # parent-completion invariant (the dispatcher trusts that column);
+        # if parents are still in progress the task must wait in 'todo'
+        # until recompute_ready picks it up. RCA: Bug 2 at
+        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=stale["title"],
+            body=stale["body"],
+            assignee=stale["assignee"],
+            status=new_status,
+            has_open_parent=bool(undone_parents),
+        )
+        if assignment_denial is not None:
+            return False
+        if stale["current_run_id"]:
             conn.execute(
                 """
                 UPDATE task_runs
@@ -6236,19 +6536,6 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -6326,6 +6613,7 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        # --- decomposition_guard logic (backward compat from main) ---
         if decomposition_guard and decomposition_hold_reason(conn, task_id) is not None:
             return False
         existing_assignee = _canonical_assignee(existing["assignee"])
@@ -6349,6 +6637,22 @@ def specify_triage_task(
             raise ValueError(
                 f"assignee {assignee!r} has no resolvable profile on any known host"
             )
+        # --- assignment policy enforcement (from PR branch) ---
+        effective_title = title.strip() if title is not None else existing["title"]
+        effective_body = body if body is not None else existing["body"]
+        effective_assignee = (
+            assignee if assignee is not None else existing["assignee"]
+        )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=effective_title,
+            body=effective_body,
+            assignee=effective_assignee,
+            status="todo",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
         sets: list[str] = [] if preserve_status else ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -8312,38 +8616,13 @@ def _continuation_operator_profiles(
     """
     from hermes_cli.config import DEFAULT_CONFIG
 
-    raw = DEFAULT_CONFIG.get("kanban", {}).get(
+    default = DEFAULT_CONFIG.get("kanban", {}).get(
         "continuation_operator_profiles", "default"
     )
-    authority_root = _continuation_authority_root(conn)
-    if authority_root is None:
-        return ()
-    config_path = authority_root / "config.yaml"
-    try:
-        if config_path.exists():
-            payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            if not isinstance(payload, dict):
-                return ()
-            kanban_config = payload.get("kanban") or {}
-            if not isinstance(kanban_config, dict):
-                return ()
-            configured = kanban_config.get(
-                "continuation_operator_profiles"
-            )
-            if configured is not None:
-                raw = configured
-    except (OSError, yaml.YAMLError):
-        return ()
-    if isinstance(raw, str):
-        raw = raw.split(",")
-    if not isinstance(raw, (list, tuple)):
-        return ()
-    return tuple(
-        dict.fromkeys(
-            str(item).strip().casefold()
-            for item in raw
-            if str(item).strip()
-        )
+    return _configured_board_profiles(
+        conn,
+        "continuation_operator_profiles",
+        default,
     )
 
 

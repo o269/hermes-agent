@@ -2941,6 +2941,15 @@ DEFAULT_CONFIG = {
         # remains a supported, typed config mutation (the reader also accepts
         # YAML lists for hand-authored config files).
         "continuation_operator_profiles": "default",
+        # Non-spawnable decision / live-action profiles (for example an operator
+        # or sole lander). When non-empty, the Kanban kernel enforces the same
+        # assignment+state contract for typed APIs and broker-backed custom SQL:
+        # protected authority cards cannot enter ready/review/running or sit on an
+        # executor profile, while executor cards may only wait on an authority
+        # profile behind a parent/explicit parking contract. Empty preserves
+        # legacy behavior. Comma-delimited for `hermes config set` parity; YAML
+        # lists are accepted by the reader too.
+        "authority_profiles": "",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

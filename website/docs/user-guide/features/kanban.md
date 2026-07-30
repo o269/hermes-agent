@@ -242,6 +242,58 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Non-spawnable authority profiles
+
+Some installations have a decision/live-action seat (for example an operator,
+sole lander, or store approver) that owns gates but must never be spawned as an
+ordinary worker. Opt in by naming those profiles in the root config bound to the
+board:
+
+```yaml
+kanban:
+  authority_profiles: fable          # comma string or YAML list
+```
+
+Restart long-lived gateway/dispatcher processes after changing this setting; a
+cold board initialization installs or removes the persistent SQLite triggers.
+
+When this list is non-empty, the DB/API layer enforces a state-aware,
+bidirectional contract:
+
+- authority, operator, live-apply/install/restart/destructive, post-launch, and
+  recurring tracker/watchdog cards cannot enter `ready`/`review`/`running` and cannot be
+  assigned to a non-authority profile;
+- executor-shaped cards (`[AUTHOR]`, `[FIX]`, `[REVIEW]`, `[VERIFY]`, etc.) may
+  wait on an authority profile only in `todo`, `scheduled`, or `blocked`, with
+  either an open parent or an explicit parking contract such as
+  `on-promote: assign to reviewer`;
+- when the parent closes, automatic promotion leaves that executor card parked
+  until automation atomically routes it to a spawnable profile;
+- terminal rows remain editable/archiveable, so enabling the policy does not
+  strand historical work.
+
+The policy is enforced by typed Kanban APIs, the final `ready -> running` claim,
+and SQLite triggers. Broker-backed custom SQL therefore cannot bypass it. A
+repair of an old invalid row must update custody and state atomically, for
+example `SET assignee='fable', status='scheduled'`; two individually invalid
+updates are rejected. Connections that bypass Hermes do not register the trigger
+function and fail closed, so custom bridges should continue to use the board
+broker rather than opening SQLite directly.
+
+External reconcilers must use the same classifier before any age-based action:
+
+```python
+from hermes_cli.kanban_assignment_policy import is_nonspawnable_contract
+
+if is_nonspawnable_contract(card.title, card.body):
+    # Preserve named gates, recurring trackers, and post-launch custody.
+    return
+```
+
+This check is semantic and must run regardless of card age. Age can prioritize
+ordinary executor work; it cannot erase a named gate or recurring contract.
+Leave `authority_profiles` empty (the default) to preserve legacy behavior.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
