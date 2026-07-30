@@ -1583,10 +1583,15 @@ _ASSIGNMENT_POLICY_TRIGGERS_SQL = """
 CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_insert
 BEFORE INSERT ON tasks
 WHEN kanban_assignment_guard(
+    NEW.id,
     NEW.title,
     NEW.body,
     NEW.assignee,
     NEW.status,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
     EXISTS (
         SELECT 1
           FROM task_links l
@@ -1602,10 +1607,15 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_update
 BEFORE UPDATE OF title, body, assignee, status ON tasks
 WHEN kanban_assignment_guard(
+    NEW.id,
     NEW.title,
     NEW.body,
     NEW.assignee,
     NEW.status,
+    OLD.title,
+    OLD.body,
+    OLD.assignee,
+    OLD.status,
     EXISTS (
         SELECT 1
           FROM task_links l
@@ -1620,6 +1630,10 @@ END;
 """
 
 
+class AssignmentPolicyConfigError(RuntimeError):
+    """Authority-profile config could not be resolved safely for this board."""
+
+
 def _configured_board_profiles(
     conn: sqlite3.Connection,
     key: str,
@@ -1629,31 +1643,45 @@ def _configured_board_profiles(
 
     Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
     policy.  The opened SQLite path resolves the canonical root, matching the
-    continuation-authority model.
+    continuation-authority model. A present but unreadable/malformed config is
+    an enforcement error, never an empty allowlist that disables the fence.
     """
 
     raw = default
     authority_root = _continuation_authority_root(conn)
     if authority_root is None:
-        return ()
+        raise AssignmentPolicyConfigError("assignment authority root is unresolved")
     config_path = authority_root / "config.yaml"
     try:
-        if config_path.exists():
-            payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            if not isinstance(payload, dict):
-                return ()
-            kanban_config = payload.get("kanban") or {}
-            if not isinstance(kanban_config, dict):
-                return ()
-            configured = kanban_config.get(key)
-            if configured is not None:
-                raw = configured
-    except (OSError, yaml.YAMLError):
-        return ()
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = {}
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise AssignmentPolicyConfigError(
+            f"cannot read assignment authority config at {config_path}"
+        ) from exc
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: root must be a mapping"
+        )
+    kanban_config = payload.get("kanban")
+    if kanban_config is None:
+        kanban_config = {}
+    if not isinstance(kanban_config, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: kanban must be a mapping"
+        )
+    configured = kanban_config.get(key)
+    if configured is not None:
+        raw = configured
     if isinstance(raw, str):
         raw = raw.split(",")
     if not isinstance(raw, (list, tuple)):
-        return ()
+        raise AssignmentPolicyConfigError(
+            f"invalid {key}: expected comma string or list"
+        )
     return tuple(
         dict.fromkeys(
             str(item).strip().casefold()
@@ -1683,6 +1711,11 @@ def _assignment_guard_reason(
     assignee: Optional[str],
     status: Optional[str],
     has_open_parent: bool,
+    task_id: Optional[str] = None,
+    old_title: Optional[str] = None,
+    old_body: Optional[str] = None,
+    old_assignee: Optional[str] = None,
+    old_status: Optional[str] = None,
 ) -> Optional[str]:
     return _pure_assignment_guard_reason(
         title=title,
@@ -1691,6 +1724,11 @@ def _assignment_guard_reason(
         status=status,
         authority_profiles=_authority_profiles(conn),
         has_open_parent=has_open_parent,
+        task_id=task_id,
+        old_title=old_title,
+        old_body=old_body,
+        old_assignee=old_assignee,
+        old_status=old_status,
     )
 
 
@@ -1725,10 +1763,15 @@ def _register_assignment_policy_guard(conn: sqlite3.Connection) -> None:
     """Install the per-connection UDF used by persistent SQLite triggers."""
 
     def guard(
+        task_id: Optional[str],
         title: Optional[str],
         body: Optional[str],
         assignee: Optional[str],
         status: Optional[str],
+        old_title: Optional[str],
+        old_body: Optional[str],
+        old_assignee: Optional[str],
+        old_status: Optional[str],
         has_open_parent: object,
     ) -> str:
         return _assignment_guard_reason(
@@ -1738,22 +1781,54 @@ def _register_assignment_policy_guard(conn: sqlite3.Connection) -> None:
             assignee=assignee,
             status=status,
             has_open_parent=bool(has_open_parent),
+            task_id=task_id,
+            old_title=old_title,
+            old_body=old_body,
+            old_assignee=old_assignee,
+            old_status=old_status,
         ) or ""
 
-    conn.create_function("kanban_assignment_guard", 5, guard)
+    conn.create_function("kanban_assignment_guard", 10, guard)
 
 
 def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
-    if _authority_profiles(conn):
-        conn.executescript(_ASSIGNMENT_POLICY_TRIGGERS_SQL)
-        return
-    # Preserve legacy raw-SQL compatibility for installations that have not
-    # opted in. If an installation later disables the policy, its next cold
-    # board initialization removes the persistent guards.
-    conn.executescript(
+    # Trigger definitions evolve with the policy. Replace them in one SQLite
+    # write transaction: other connections see either the prior complete fence
+    # or the new complete fence, never the DROP/CREATE gap. Install first so a
+    # malformed/unreadable config on first initialization leaves a durable
+    # fail-closed fence; raw connections do not register the UDF and therefore
+    # cannot write through these triggers.
+    replace_sql = (
+        "BEGIN IMMEDIATE;"
         "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
         "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+        + _ASSIGNMENT_POLICY_TRIGGERS_SQL
+        + "COMMIT;"
     )
+    try:
+        conn.executescript(replace_sql)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+    if _authority_profiles(conn):
+        return
+
+    # A valid empty authority allowlist intentionally disables the fence. Drop
+    # both triggers atomically only after configuration parsed successfully,
+    # preserving legacy raw-SQL compatibility for installations not opted in.
+    try:
+        conn.executescript(
+            "BEGIN IMMEDIATE;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+            "COMMIT;"
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 @contextlib.contextmanager
@@ -3409,6 +3484,7 @@ def create_task(
                     assignee=assignee,
                     status=task_status,
                     has_open_parent=_parents_have_open_task(conn, parents),
+                    task_id=task_id,
                 )
                 if assignment_denial is not None:
                     raise ValueError(
@@ -3582,6 +3658,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             assignee=profile,
             status=row["status"],
             has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
         )
         if assignment_denial is not None:
             raise ValueError(f"kanban assignment policy: {assignment_denial}")
@@ -4275,6 +4352,7 @@ def recompute_ready(
                     assignee=row["assignee"],
                     status="ready",
                     has_open_parent=False,
+                    task_id=task_id,
                 )
                 if assignment_denial is not None:
                     # Keep dependency-held authority work safely parked. The
@@ -4405,6 +4483,7 @@ def claim_task(
             assignee=policy_row["assignee"],
             status="running",
             has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
         )
         if assignment_denial is not None:
             # Fail closed for legacy rows that predate trigger installation or
@@ -4806,6 +4885,7 @@ def claim_review_task(
             assignee=policy_row["assignee"],
             status="running",
             has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
         )
         if assignment_denial is not None:
             return None
@@ -6457,6 +6537,7 @@ def promote_task(
         assignee=row["assignee"],
         status="ready",
         has_open_parent=_task_has_open_parent(conn, task_id),
+        task_id=task_id,
     )
     if assignment_denial is not None:
         return False, f"kanban assignment policy: {assignment_denial}"
@@ -6521,6 +6602,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             assignee=stale["assignee"],
             status=new_status,
             has_open_parent=bool(undone_parents),
+            task_id=task_id,
         )
         if assignment_denial is not None:
             return False
@@ -6650,6 +6732,7 @@ def specify_triage_task(
             assignee=effective_assignee,
             status="todo",
             has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
         )
         if assignment_denial is not None:
             raise ValueError(f"kanban assignment policy: {assignment_denial}")
@@ -7010,15 +7093,15 @@ def decompose_triage_task(
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
-    _seen = 0
+    _topological_order: list[int] = []
     while _queue:
         _node = _queue.pop()
-        _seen += 1
+        _topological_order.append(_node)
         for _nb in _adj[_node]:
             _in_deg[_nb] -= 1
             if _in_deg[_nb] == 0:
                 _queue.append(_nb)
-    if _seen != len(children):
+    if len(_topological_order) != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
     # We do the full decomposition in a SINGLE write_txn so it's
@@ -7074,12 +7157,24 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Allocate every id and stage sibling dependency intents before any
+        # child INSERT. ``task_links`` intentionally has no FK, and this entire
+        # block is one IMMEDIATE transaction, so no external reader can observe
+        # an intent or a partial child set. Children are then inserted in
+        # topological order: when the assignment trigger checks a dependency-
+        # held Fable executor, every referenced parent row already exists.
+        child_ids = [_new_task_id() for _child in children]
         for idx, child in enumerate(children):
-            new_id = _new_task_id()
+            for p_idx in child.get("parents") or []:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (child_ids[p_idx], child_ids[idx]),
+                )
+
+        for idx in _topological_order:
+            child = children[idx]
+            new_id = child_ids[idx]
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee")) or root_assignee
@@ -7121,18 +7216,13 @@ def decompose_triage_task(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
-            child_ids.append(new_id)
 
-        # Link children to their sibling parents (within the decomposed graph).
+        # Emit link events only after every child row exists. The dependency
+        # edges themselves were already staged above for the INSERT trigger.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
-                conn.execute(
-                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                    "VALUES (?, ?)",
-                    (parent_id, child_id),
-                )
                 _append_event(
                     conn, child_id, "linked",
                     {"parent": parent_id, "child": child_id},
@@ -8559,8 +8649,6 @@ def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
         if not raw_path:
             return None
         db_path = Path(raw_path).resolve()
-        if db_path.name != "kanban.db":
-            return None
         if (
             db_path.parent.parent.name == "boards"
             and db_path.parent.parent.parent.name == "kanban"
@@ -8619,11 +8707,18 @@ def _continuation_operator_profiles(
     default = DEFAULT_CONFIG.get("kanban", {}).get(
         "continuation_operator_profiles", "default"
     )
-    return _configured_board_profiles(
-        conn,
-        "continuation_operator_profiles",
-        default,
-    )
+    try:
+        return _configured_board_profiles(
+            conn,
+            "continuation_operator_profiles",
+            default,
+        )
+    except AssignmentPolicyConfigError:
+        # Continuation authorization already treats an empty allowlist as deny
+        # all. Preserve that public fail-closed contract while assignment-policy
+        # trigger setup/UDF evaluation raises instead of silently disabling its
+        # configured authority fence.
+        return ()
 
 
 def _continuation_operator_context(

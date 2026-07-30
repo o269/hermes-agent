@@ -265,27 +265,42 @@ bidirectional contract:
   assigned to a non-authority profile;
 - executor-shaped cards (`[AUTHOR]`, `[FIX]`, `[REVIEW]`, `[VERIFY]`, etc.) may
   wait on an authority profile only in `todo`, `scheduled`, or `blocked`, with
-  either an open parent or an explicit parking contract such as
-  `on-promote: assign to reviewer`;
+  either an open parent or an explicit routing contract such as
+  `on-promote: assign to reviewer`; generic words such as `PARKED` or `DEFERRED`
+  are not sufficient;
+- approval gates (including `[FABLE][APPROVAL]` and `Fable approval required`)
+  and unbracketed operator/destructive/live-apply/install/restart/release/tracker
+  actions receive the same non-spawnable treatment as bracketed gate titles;
 - when the parent closes, automatic promotion leaves that executor card parked
   until automation atomically routes it to a spawnable profile;
 - terminal rows remain editable/archiveable, so enabling the policy does not
   strand historical work.
 
 The policy is enforced by typed Kanban APIs, the final `ready -> running` claim,
-and SQLite triggers. Broker-backed custom SQL therefore cannot bypass it. A
-repair of an old invalid row must update custody and state atomically, for
-example `SET assignee='fable', status='scheduled'`; two individually invalid
-updates are rejected. Connections that bypass Hermes do not register the trigger
-function and fail closed, so custom bridges should continue to use the board
-broker rather than opening SQLite directly.
+and SQLite triggers. Broker-backed custom SQL therefore cannot bypass it. Raw
+updates are checked against both the old and new row, so a writer cannot erase
+an authority title/body while atomically moving the row to an executor or active
+state, or erase a parked executor's semantics while leaving authority custody. A
+repair of an old invalid row must update custody and state atomically, for example
+`SET assignee='fable', status='scheduled'`; two individually invalid updates are
+rejected. Dependency graphs are linked and created in one transaction, so no
+partial child set can be observed or claimed. Trigger definitions are replaced
+in one SQLite write transaction, and a malformed config on first initialization
+leaves a durable fail-closed trigger rather than a drop/create gap. Connections
+that bypass Hermes do not register the trigger function and fail closed, so
+custom bridges should continue to use the board broker rather than opening
+SQLite directly.
+
+Authority profiles are resolved from the opened database's root even when the
+SQLite file uses a custom name. A present but malformed or unreadable root
+config is an enforcement error; it never degrades to an empty profile set.
 
 External reconcilers must use the same classifier before any age-based action:
 
 ```python
 from hermes_cli.kanban_assignment_policy import is_nonspawnable_contract
 
-if is_nonspawnable_contract(card.title, card.body):
+if is_nonspawnable_contract(card.title, card.body, task_id=card.id):
     # Preserve named gates, recurring trackers, and post-launch custody.
     return
 ```
