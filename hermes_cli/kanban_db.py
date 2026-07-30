@@ -890,9 +890,11 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
-    # --skills). Stored as a JSON array of skill names. None = use only
-    # the defaults; empty list = explicitly no extra skills.
-    skills: Optional[list] = None
+    # --skills). Canonical rows decode to a list, while malformed/legacy
+    # stored values remain raw until the final pre-Popen validator can reject
+    # or normalize them. None = use only the defaults; empty list = explicitly
+    # no extra skills.
+    skills: object = None
     model_override: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
@@ -932,15 +934,23 @@ class Task:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
-        # Parse skills JSON blob if present
-        skills_value: Optional[list] = None
-        if "skills" in keys and row["skills"]:
-            try:
-                parsed = json.loads(row["skills"])
-                if isinstance(parsed, list):
-                    skills_value = [str(s) for s in parsed if s]
-            except Exception:
-                skills_value = None
+        # Preserve the stored value until the final pre-Popen validation
+        # boundary. Canonical JSON arrays still decode to lists for the public
+        # Task API, but malformed JSON, non-array JSON, and unsupported SQLite
+        # values must not be swallowed, stringified, or filtered here: doing so
+        # would let a corrupt legacy row spawn with altered or missing skills.
+        skills_value: object = None
+        if "skills" in keys:
+            stored_skills = row["skills"]
+            skills_value = stored_skills
+            if isinstance(stored_skills, str):
+                try:
+                    parsed = json.loads(stored_skills)
+                except (json.JSONDecodeError, RecursionError):
+                    pass
+                else:
+                    if isinstance(parsed, list):
+                        skills_value = parsed
         return cls(
             id=row["id"],
             title=row["title"],
@@ -11939,7 +11949,7 @@ def _normalize_spawn_skills(value: object, *, task_id: object) -> list[str]:
             return []
         try:
             decoded = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             if stripped[0] in '[{"':
                 raise _invalid_spawn_skills(
                     task_id, "malformed JSON-looking value"

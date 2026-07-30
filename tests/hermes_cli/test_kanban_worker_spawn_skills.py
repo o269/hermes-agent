@@ -11,12 +11,21 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+_NO_DB_OVERRIDE = object()
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Keep the real worker-argv builder deterministic without stubbing its
+    # toolset resolver: the explicit list limits it to mandatory lifecycle
+    # additions instead of inheriting a platform composite.
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli: []\n", encoding="utf-8"
+    )
     for name in (
         "HERMES_KANBAN_BROKER",
         "BOARDD_SOCK",
@@ -263,61 +272,189 @@ def test_default_spawn_rejects_invalid_input_before_popen(
     assert popen_called is False
 
 
-def test_dispatch_records_malformed_legacy_skills_as_spawn_failure(
+@pytest.mark.parametrize(
+    ("created_skills", "stored_skills", "expected"),
+    [
+        (["alpha", "beta"], _NO_DB_OVERRIDE, ["alpha", "beta"]),
+        (("alpha", "beta"), _NO_DB_OVERRIDE, ["alpha", "beta"]),
+        (["seed"], "alpha", ["alpha"]),
+        (["seed"], " alpha, beta ", ["alpha", "beta"]),
+        (
+            ["seed"],
+            '[" alpha ", "beta", "alpha", "beta "]',
+            ["alpha", "beta"],
+        ),
+    ],
+    ids=(
+        "typed-list",
+        "typed-tuple",
+        "plain-single",
+        "comma-delimited",
+        "stored-json-stable-dedupe",
+    ),
+)
+def test_real_db_claim_dispatch_emits_exact_normalized_argv(
     kanban_home: Path,
-    all_assignees_spawnable: None,
     monkeypatch: pytest.MonkeyPatch,
+    created_skills: object,
+    stored_skills: object,
+    expected: list[str],
 ) -> None:
-    malformed = '["github-workflows"'
+    popen_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class FakeProc:
+        pid = 2_000_000_000
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> FakeProc:
+        popen_calls.append((list(cmd), dict(kwargs)))
+        return FakeProc()
+
+    # This is the sole production-boundary stub: task creation, row decoding,
+    # claim_task, workspace resolution, dispatch, argv construction, and spawn
+    # bookkeeping all run through their real implementations.
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
-            title="malformed legacy skills",
-            assignee="worker",
-            skills=["github-workflows"],
+            title="real DB skills dispatch",
+            assignee="default",
+            skills=cast(Any, created_skills),
         )
-        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?", (malformed, task_id))
-        conn.commit()
-
-        original_claim = kb.claim_task
-
-        def claim_with_raw_legacy_skills(*args: Any, **kwargs: Any) -> kb.Task | None:
-            task = original_claim(*args, **kwargs)
-            if task is not None:
-                raw = conn.execute(
-                    "SELECT skills FROM tasks WHERE id = ?", (task.id,)
-                ).fetchone()["skills"]
-                task.skills = cast(Any, raw)
-            return task
-
-        def fail_popen(*_args: object, **_kwargs: object) -> None:
-            raise AssertionError("Popen must not run for malformed legacy skills")
-
-        monkeypatch.setattr(kb, "claim_task", claim_with_raw_legacy_skills)
-        monkeypatch.setattr(subprocess, "Popen", fail_popen)
+        if stored_skills is not _NO_DB_OVERRIDE:
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (stored_skills, task_id),
+            )
+            conn.commit()
 
         result = kb.dispatch_once(conn, failure_limit=2)
 
-        assert result.spawned == []
+        assert result.spawned == [(task_id, "default", result.spawned[0][2])]
         assert result.auto_blocked == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+
+    assert len(popen_calls) == 1
+    cmd, kwargs = popen_calls[0]
+    expected_cmd = [
+        *kb._resolve_hermes_argv(),
+        "-p",
+        "default",
+        "--cli",
+        "--accept-hooks",
+    ]
+    for skill in expected:
+        expected_cmd.extend(["--skills", skill])
+    spawn_env = cast(dict[str, str], kwargs["env"])
+    worker_toolsets = kb._resolve_worker_cli_toolsets(spawn_env.get("HERMES_HOME"))
+    if worker_toolsets:
+        expected_cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    expected_cmd.extend(["chat", "-q", f"work kanban task {task_id}"])
+    assert cmd == expected_cmd
+    assert kwargs["cwd"] == result.spawned[0][2]
+
+
+@pytest.mark.parametrize(
+    ("stored_skills", "reason"),
+    [
+        ('["alpha"', "malformed JSON-looking value"),
+        ('{"skill": "alpha"}', "JSON value must be an array"),
+        ('"alpha"', "JSON value must be an array"),
+        ('["alpha", 1]', "members must be strings"),
+        ('["alpha", ""]', "members must be non-empty"),
+        ("alpha,,beta", "members must be non-empty"),
+        ('["bad skill"]', "member is not a valid identifier"),
+        (b'["alpha"]', "unsupported value type"),
+        (
+            '["bad skill' + ("x" * 10_000) + '"]',
+            "member is not a valid identifier",
+        ),
+    ],
+    ids=(
+        "malformed-json-looking",
+        "json-object",
+        "json-scalar",
+        "mixed-non-string-array",
+        "empty-json-member",
+        "empty-delimited-member",
+        "invalid-identifier",
+        "unsupported-db-blob",
+        "bounded-large-invalid-member",
+    ),
+)
+def test_real_db_claim_dispatch_rejects_invalid_skills_before_popen(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stored_skills: object,
+    reason: str,
+) -> None:
+    popen_calls: list[object] = []
+
+    def fail_popen(*args: object, **_kwargs: object) -> None:
+        popen_calls.append(args)
+        raise AssertionError("Popen must not run for invalid stored skills")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="invalid legacy DB skills",
+            assignee="default",
+            skills=["seed"],
+        )
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (stored_skills, task_id),
+        )
+        conn.commit()
+
+        first = kb.dispatch_once(conn, failure_limit=2)
+
+        assert first.spawned == []
+        assert first.auto_blocked == []
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "ready"
         assert task.consecutive_failures == 1
-        assert task.last_failure_error is not None
-        assert f"task {task_id} has invalid skills" in task.last_failure_error
-        assert "malformed JSON-looking value" in task.last_failure_error
-        assert "pid " not in task.last_failure_error.lower()
+        error = task.last_failure_error
+        assert error is not None
+        assert error.startswith(f"task {task_id} has invalid skills ({reason})")
+        assert len(error) < 400
+        assert "\n" not in error
+        assert "x" * 100 not in error
 
-        run = conn.execute(
+        first_run = conn.execute(
             "SELECT status, outcome, error FROM task_runs "
             "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        assert run is not None
-        assert run["status"] == "spawn_failed"
-        assert run["outcome"] == "spawn_failed"
-        assert f"task {task_id} has invalid skills" in run["error"]
-        assert "malformed JSON-looking value" in run["error"]
-        assert "pid " not in run["error"].lower()
+        assert first_run is not None
+        assert first_run["status"] == "spawn_failed"
+        assert first_run["outcome"] == "spawn_failed"
+        assert first_run["error"] == error
+
+        second = kb.dispatch_once(conn, failure_limit=2)
+
+        assert second.spawned == []
+        assert second.auto_blocked == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.last_failure_error == error
+        latest_run = conn.execute(
+            "SELECT status, outcome, error FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert latest_run is not None
+        assert latest_run["status"] == "gave_up"
+        assert latest_run["outcome"] == "gave_up"
+        assert latest_run["error"] == error
+
+    assert popen_calls == []
