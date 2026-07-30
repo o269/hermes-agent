@@ -295,7 +295,7 @@ def _pid_alive(pid) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — boardd is a POSIX UDS daemon
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -411,7 +411,8 @@ class Broker:
             if not ("malformed" in msg or "corrupt" in msg or "integrity" in msg
                     or "not a database" in msg):
                 raise
-            _log.error("boardd: board damaged at open (%s) — attempting in-place "
+            _log.error("boardd: board damaged during connection setup (%s) — "
+                       "attempting in-place "
                        "REINDEX recovery on a raw handle", exc)
             raw = sqlite3.connect(self.db_realpath, isolation_level=None,
                                   timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0)
@@ -509,9 +510,10 @@ class Broker:
         _log.error("boardd: INTEGRITY ALERT %s: %s", kind, detail)
         self._integrity_alarm = {"kind": kind, "detail": detail, "ts": _now()}
         try:
-            with open(os.path.join(os.path.dirname(self.db_realpath),
-                                   "boardd-INTEGRITY-ALERT"), "a",
-                      encoding="utf-8") as fh:
+            alert_path = os.path.join(
+                os.path.dirname(self.db_realpath), "boardd-INTEGRITY-ALERT"
+            )
+            with open(alert_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(self._integrity_alarm) + "\n")
         except Exception:
             pass
