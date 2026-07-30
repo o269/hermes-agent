@@ -32,19 +32,18 @@ def _session(agent=None, **extra):
 
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
-def test_enqueue_pins_text_and_transport():
+def test_enqueue_keeps_text_without_stale_transport_handle():
     session = _session()
-    server._enqueue_prompt(session, "hello", "ws-1")
-    assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
+    server._enqueue_prompt(session, "hello")
+    assert session["queued_prompt"] == {"text": "hello"}
 
 
 def test_enqueue_merges_second_arrival_losslessly():
     session = _session()
-    server._enqueue_prompt(session, "first", "ws-1")
-    server._enqueue_prompt(session, "second", "ws-2")
+    server._enqueue_prompt(session, "first")
+    server._enqueue_prompt(session, "second")
     assert session["queued_prompt"]["text"] == "first\n\nsecond"
-    # Latest transport wins so the drain streams to the most recent client.
-    assert session["queued_prompt"]["transport"] == "ws-2"
+    assert "transport" not in session["queued_prompt"]
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
@@ -55,7 +54,7 @@ def test_busy_interrupt_mode_interrupts_and_queues(monkeypatch):
     agent = types.SimpleNamespace(interrupt=lambda *a, **k: calls.__setitem__("interrupt", calls["interrupt"] + 1))
     session = _session(agent=agent, running=True)
 
-    resp = server._handle_busy_submit("r1", "sid", session, "redirect", "ws-1")
+    resp = server._handle_busy_submit("r1", "sid", session, "redirect")
 
     assert resp["result"]["status"] == "queued"
     deadline = time.monotonic() + 1
@@ -71,7 +70,7 @@ def test_busy_queue_mode_queues_without_interrupting(monkeypatch):
     agent = types.SimpleNamespace(interrupt=lambda *a, **k: calls.__setitem__("interrupt", calls["interrupt"] + 1))
     session = _session(agent=agent, running=True)
 
-    resp = server._handle_busy_submit("r1", "sid", session, "later", "ws-1")
+    resp = server._handle_busy_submit("r1", "sid", session, "later")
 
     assert resp["result"]["status"] == "queued"
     assert calls["interrupt"] == 0
@@ -83,7 +82,7 @@ def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     agent = types.SimpleNamespace(steer=lambda text: True, interrupt=lambda *a, **k: None)
     session = _session(agent=agent, running=True)
 
-    resp = server._handle_busy_submit("r1", "sid", session, "nudge", "ws-1")
+    resp = server._handle_busy_submit("r1", "sid", session, "nudge")
 
     assert resp["result"]["status"] == "steered"
     assert session.get("queued_prompt") is None
@@ -94,7 +93,7 @@ def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
     agent = types.SimpleNamespace(steer=lambda text: False, interrupt=lambda *a, **k: None)
     session = _session(agent=agent, running=True)
 
-    resp = server._handle_busy_submit("r1", "sid", session, "nudge", "ws-1")
+    resp = server._handle_busy_submit("r1", "sid", session, "nudge")
 
     assert resp["result"]["status"] == "queued"
     assert session["queued_prompt"]["text"] == "nudge"
@@ -115,7 +114,7 @@ def test_busy_interrupt_does_not_hold_history_lock_or_delay_queue(monkeypatch):
     )
 
     started = time.monotonic()
-    resp = server._handle_busy_submit("r1", "sid", session, "keep this", "ws-1")
+    resp = server._handle_busy_submit("r1", "sid", session, "keep this")
 
     assert resp["result"]["status"] == "queued"
     assert time.monotonic() - started < 0.25
@@ -130,7 +129,7 @@ def test_busy_helper_retries_when_turn_finished(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     session = _session(running=False)
 
-    assert server._handle_busy_submit("r1", "sid", session, "run now", "ws-1") is None
+    assert server._handle_busy_submit("r1", "sid", session, "run now") is None
     assert session.get("queued_prompt") is None
 
 
@@ -142,13 +141,16 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
         server, "_run_prompt_submit",
         lambda rid, sid, session, text: fired.update(rid=rid, sid=sid, text=text),
     )
-    session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
+    session = _session(
+        transport="replacement-ws",
+        queued_prompt={"text": "go", "transport": "stale-ws"},
+    )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
     assert session["running"] is True
     assert session["queued_prompt"] is None
-    assert session["transport"] == "ws-9"
+    assert session["transport"] == "replacement-ws"
 
 
 def test_drain_noop_when_nothing_queued(monkeypatch):
@@ -162,7 +164,7 @@ def test_drain_noop_when_session_already_running(monkeypatch):
     """A fresh turn that claimed the session beats a stale queued entry —
     the drain leaves it for that turn's own tail."""
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fire")))
-    session = _session(running=True, queued_prompt={"text": "go", "transport": None})
+    session = _session(running=True, queued_prompt={"text": "go"})
     assert server._drain_queued_prompt("r1", "sid", session) is False
     assert session["queued_prompt"]["text"] == "go"
 
@@ -171,7 +173,7 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("dispatch failed")
     monkeypatch.setattr(server, "_run_prompt_submit", _boom)
-    session = _session(queued_prompt={"text": "go", "transport": None})
+    session = _session(queued_prompt={"text": "go"})
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.

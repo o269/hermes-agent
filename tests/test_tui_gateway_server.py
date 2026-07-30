@@ -15,6 +15,7 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
+from tui_gateway.transport import Transport
 
 
 @pytest.fixture(autouse=True)
@@ -67,11 +68,33 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         )
         assert list(server._sessions) == [sid]
 
-        closed = server._methods["session.close"]("r3", {"session_id": sid})
+        # A detached session releases its lease at soft-park but remains live.
+        first_session = server._sessions[sid]
+        first_session["transport"] = server._detached_ws_transport
+        first_session["_db_row_persisted"] = True
+        server._soft_park_session_after_grace(sid, first_session)
+        assert server._sessions[sid] is first_session
+        assert active_session_registry_snapshot() == []
+
+        replacement = server._methods["session.create"]("r3", {"cols": 80})
+        replacement_sid = replacement["result"]["session_id"]
+        blocked = server._methods["session.activate"]("r4", {"session_id": sid})
+        assert blocked["error"]["code"] == 4090
+        assert first_session["transport"] is server._detached_ws_transport
+
+        closed_replacement = server._methods["session.close"](
+            "r5", {"session_id": replacement_sid}
+        )
+        assert closed_replacement["result"]["closed"] is True
+        reactivated = server._methods["session.activate"]("r6", {"session_id": sid})
+        assert reactivated["result"]["session_id"] == sid
+        assert first_session["transport"] is not server._detached_ws_transport
+
+        closed = server._methods["session.close"]("r7", {"session_id": sid})
         assert closed["result"]["closed"] is True
         assert active_session_registry_snapshot() == []
 
-        third = server._methods["session.create"]("r4", {"cols": 80})
+        third = server._methods["session.create"]("r8", {"cols": 80})
         assert "result" in third
     finally:
         _clear_server_sessions()
@@ -2392,79 +2415,374 @@ def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     assert response["result"] == {"closed": True}
 
 
-def test_ws_orphan_reap_closes_worker_when_session_stays_detached(monkeypatch):
-    """A detached WS session past its grace window has its slash_worker closed.
-
-    Regression for #38591 fallout: every dashboard refresh spawned a fresh
-    session + _SlashWorker but never reaped the previous one, leaking one
-    python subprocess per refresh.
-    """
-    closed = {"worker": False}
+def test_ws_soft_park_preserves_resumable_state_and_releases_runtime_resources(
+    monkeypatch,
+):
+    """Grace cleanup parks worker/lease without deleting meaningful state."""
+    closed = {"worker": 0, "lease": 0}
 
     class _FakeWorker:
         def close(self):
-            closed["worker"] = True
+            closed["worker"] += 1
 
-    server._sessions["orphan-sid"] = _session(
+    class _FakeLease:
+        def release(self):
+            closed["lease"] += 1
+
+    agent = types.SimpleNamespace(_session_messages=[])
+    history = [{"role": "user", "content": "keep me"}]
+    session = _session(
+        agent=agent,
         transport=server._detached_ws_transport,
         slash_worker=_FakeWorker(),
-        running=False,
+        active_session_lease=_FakeLease(),
+        history=history,
+        _db_row_persisted=True,
     )
-    # Run the reap body synchronously (no real timer/grace) to assert behaviour.
-    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    server._sessions["park-sid"] = session
     try:
-        # Directly invoke the orphaned-check + teardown the timer would run.
-        assert server._ws_session_is_orphaned(server._sessions["orphan-sid"]) is True
-        session = server._sessions.pop("orphan-sid")
-        server._teardown_session(session)
-        assert closed["worker"] is True
+        server._soft_park_session_after_grace("park-sid", session)
+
+        assert server._sessions["park-sid"] is session
+        assert session["agent"] is agent
+        assert session["history"] == history
+        assert session["slash_worker"] is None
+        assert session["_active_session_lease_parked"] is True
+        assert "active_session_lease" not in session
+        assert closed == {"worker": 1, "lease": 1}
+        assert session.get("_finalized") is not True
     finally:
-        server._sessions.pop("orphan-sid", None)
+        server._sessions.pop("park-sid", None)
 
 
-def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
-    """Grace reaping claims under the lock but finalizes after releasing it."""
+def test_ws_soft_parked_worker_is_recreated_lazily_after_reattach(monkeypatch):
+    """Parking preserves the session and the next worker command self-heals."""
+    closed = []
+    runs = []
+
+    class _Worker:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def run(self, command):
+            runs.append(command)
+            return "worker output"
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(server, "_SlashWorker", _Worker)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_mirror_slash_side_effects", lambda *a, **k: "")
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live", _session_messages=[]),
+        transport=server._detached_ws_transport,
+        slash_worker=_Worker(),
+        history=[{"role": "user", "content": "keep me"}],
+        _db_row_persisted=True,
+    )
+    server._sessions["lazy-worker"] = session
+    try:
+        assert server._soft_park_session_after_grace("lazy-worker", session) is True
+        assert session["slash_worker"] is None
+        assert closed == [True]
+
+        payload, attach_error = server._reattach_live_session_payload(
+            "lazy-worker", session, transport=object()
+        )
+        assert attach_error is None
+        assert payload is not None
+
+        response = server._methods["slash.exec"](
+            "slash",
+            {"session_id": "lazy-worker", "command": "worker-only-command"},
+        )
+        assert response["result"]["output"] == "worker output"
+        assert runs == ["worker-only-command"]
+        assert isinstance(session["slash_worker"], _Worker)
+    finally:
+        worker = session.get("slash_worker")
+        server._sessions.pop("lazy-worker", None)
+        if worker is not None:
+            worker.close()
+
+
+def test_ws_soft_park_lease_release_failure_is_observable_and_keeps_binding(
+    caplog,
+):
+    """A failed registry release cannot lose the bound lease or fail silently."""
+
+    class _FailingLease:
+        released = False
+
+        def release(self):
+            self.released = True
+            raise RuntimeError("lease release exploded")
+
+    class _Worker:
+        def close(self):
+            raise AssertionError("worker must survive a rolled-back park")
+
+    lease = _FailingLease()
+    worker = _Worker()
+    before = server._session_lifecycle_counters["cleanup_exception"]
+    session = _session(
+        transport=server._detached_ws_transport,
+        active_session_lease=lease,
+        slash_worker=worker,
+        history=[{"role": "user", "content": "valuable"}],
+        _db_row_persisted=True,
+    )
+    server._sessions["release-failure"] = session
+    try:
+        assert server._soft_park_session_after_grace("release-failure", session) is False
+        assert session["active_session_lease"] is lease
+        assert lease.released is False
+        assert session["slash_worker"] is worker
+        assert "_active_session_lease_parked" not in session
+        assert server._session_lifecycle_counters["cleanup_exception"] == before + 1
+        assert "soft_park_lease_release" in caplog.text
+        assert "lease release exploded" in caplog.text
+    finally:
+        server._sessions.pop("release-failure", None)
+
+
+def test_finalize_worker_close_failure_is_observable(caplog, monkeypatch):
+    class _FailingWorker:
+        def close(self):
+            raise RuntimeError("worker close exploded")
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    before = server._session_lifecycle_counters["cleanup_exception"]
+    session = _session(
+        slash_worker=_FailingWorker(),
+        history=[],
+        session_key="",
+        _sid="worker-close-failure",
+    )
+
+    server._finalize_session(session)
+
+    assert session["_finalized"] is True
+    assert server._session_lifecycle_counters["cleanup_exception"] == before + 1
+    assert "finalize_worker_close" in caplog.text
+    assert "worker close exploded" in caplog.text
+
+
+def test_finalize_and_teardown_cleanup_failures_are_observable(caplog, monkeypatch):
+    """Every best-effort finalizer/teardown failure increments the shared counter."""
+
+    class _FailingAgent:
+        session_id = "cleanup-session"
+        model = "test-model"
+        platform = "tui"
+        _session_messages = [{"role": "user", "content": "persist me"}]
+
+        def _persist_session(self, _messages):
+            raise RuntimeError("persist exploded")
+
+        def commit_memory_session(self, _history):
+            raise RuntimeError("memory exploded")
+
+        def close(self):
+            raise RuntimeError("agent close exploded")
+
+    class _FailingDB:
+        def get_session(self, _session_id):
+            return {"source": "tui"}
+
+        def end_session(self, _session_id, _end_reason):
+            raise RuntimeError("db end exploded")
+
+    import hermes_cli.plugins as plugins
+    import tools.approval as approval
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setattr(
+        plugins,
+        "invoke_hook",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("hook exploded")),
+    )
+    monkeypatch.setattr(
+        approval,
+        "unregister_gateway_notify",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("unregister exploded")
+        ),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "interrupt_for_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("delegation exploded")
+        ),
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: _FailingDB())
+
+    before = server._session_lifecycle_counters["cleanup_exception"]
+    session = _session(
+        agent=_FailingAgent(),
+        history=[{"role": "user", "content": "keep me"}],
+        session_key="cleanup-session",
+        _sid="cleanup-sid",
+    )
+
+    server._teardown_session(session)
+
+    phases = {
+        "finalize_persist",
+        "finalize_on_session_end_hook",
+        "finalize_memory_commit",
+        "session_boundary_on_session_finalize",
+        "finalize_db_end",
+        "finalize_delegation_interrupt",
+        "teardown_approval_unregister",
+        "teardown_agent_close",
+    }
+    assert server._session_lifecycle_counters["cleanup_exception"] == before + len(
+        phases
+    )
+    for phase in phases:
+        assert phase in caplog.text
+
+
+def test_prompt_submit_rebinds_parked_session_and_reacquires_lease(monkeypatch):
+    replacement = object()
+    lease = object()
+    claims = []
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *args, **kwargs: (claims.append((args, kwargs)) or lease, None),
+    )
+    session = _session(
+        running=True,
+        transport=server._detached_ws_transport,
+        _active_session_lease_parked=True,
+    )
+    server._sessions["parked-submit"] = session
+    token = server.bind_transport(replacement)
+    try:
+        response = server.handle_request(
+            {
+                "id": "submit",
+                "method": "prompt.submit",
+                "params": {"session_id": "parked-submit", "text": "next"},
+            }
+        )
+
+        assert response["result"]["status"] == "queued"
+        assert session["transport"] is replacement
+        assert session["active_session_lease"] is lease
+        assert "_active_session_lease_parked" not in session
+        assert len(claims) == 1
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("parked-submit", None)
+
+
+def test_ws_soft_park_closes_worker_after_releasing_lifecycle_lock(monkeypatch):
+    """Slow worker teardown must not stall unrelated activate/resume traffic."""
     scheduled = {}
-    teardown_started = threading.Event()
-    release_teardown = threading.Event()
+    close_started = threading.Event()
+    release_close = threading.Event()
 
     class _Timer:
         def __init__(self, _delay, callback):
             scheduled["callback"] = callback
+            self.daemon = False
 
         def start(self):
             return None
 
-    def _slow_teardown(_session, *, end_reason="tui_close"):
-        assert end_reason == "ws_orphan_reap"
-        teardown_started.set()
-        assert release_teardown.wait(timeout=2.0)
+        def cancel(self):
+            return None
+
+    class _SlowWorker:
+        def close(self):
+            close_started.set()
+            assert release_close.wait(timeout=2.0)
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
-    monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
-    server._sessions["slow-orphan"] = _session(
+    session = _session(
         transport=server._detached_ws_transport,
-        running=False,
+        slash_worker=_SlowWorker(),
+        _db_row_persisted=True,
     )
+    server._sessions["slow-park"] = session
 
-    server._schedule_ws_orphan_reap("slow-orphan")
+    server._schedule_ws_soft_park("slow-park", expected_session=session)
     thread = threading.Thread(target=scheduled["callback"])
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
-        assert "slow-orphan" not in server._sessions
+        assert close_started.wait(timeout=1.0)
+        assert server._sessions["slow-park"] is session
         acquired = server._session_resume_lock.acquire(timeout=0.2)
-        assert acquired, "orphan teardown kept the global resume lock held"
+        assert acquired, "worker.close kept the lifecycle lock held"
     finally:
         if acquired:
             server._session_resume_lock.release()
-        release_teardown.set()
+        release_close.set()
         thread.join(timeout=2.0)
-        server._sessions.pop("slow-orphan", None)
+        server._sessions.pop("slow-park", None)
 
     assert not thread.is_alive()
+    assert "slow-park" not in server._ws_soft_park_timers
+
+
+def test_ws_soft_park_timer_retries_until_detached_turn_is_quiescent(monkeypatch):
+    """Disconnect during a turn keeps one timer until the turn can be parked."""
+    callbacks = []
+    closed = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+            self.daemon = False
+            self.cancelled = False
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Worker:
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+        slash_worker=_Worker(),
+        history=[{"role": "user", "content": "turn in progress"}],
+        _db_row_persisted=True,
+    )
+    server._sessions["retry-park"] = session
+    try:
+        server._schedule_ws_soft_park("retry-park", expected_session=session)
+        assert len(callbacks) == 1
+
+        callbacks[0]()
+        assert len(callbacks) == 2
+        assert len(server._ws_soft_park_timers) == 1
+        assert session["slash_worker"] is not None
+
+        session["running"] = False
+        callbacks[1]()
+        assert closed == [True]
+        assert session["slash_worker"] is None
+        assert "retry-park" not in server._ws_soft_park_timers
+    finally:
+        server._ws_soft_park_timers.pop("retry-park", None)
+        server._sessions.pop("retry-park", None)
 
 
 def test_finalize_session_closes_slash_worker(monkeypatch):
@@ -2498,32 +2816,116 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert closed["count"] == 1
 
 
-def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
-    """A session that rebinds a live transport is NOT considered orphaned."""
+def test_ws_soft_park_requires_positive_quiescence():
+    """Reattached, running, pending, queued, inflight, and building sessions survive."""
 
     class _LiveTransport:
         def write(self, *a, **k):
             return True
 
-    # Reattached: transport is a live (non-stdio) transport.
-    reattached = _session(transport=_LiveTransport(), running=False)
-    assert server._ws_session_is_orphaned(reattached) is False
+    cases = {
+        "reattached": _session(transport=_LiveTransport()),
+        "running": _session(transport=server._detached_ws_transport, running=True),
+        "queued": _session(
+            transport=server._detached_ws_transport,
+            queued_prompt={"text": "next"},
+        ),
+        "inflight": _session(
+            transport=server._detached_ws_transport,
+            inflight_turn={"user": "now"},
+        ),
+        "slash-worker-inflight": _session(
+            transport=server._detached_ws_transport,
+            _slash_worker_inflight=1,
+        ),
+        "building": _session(
+            transport=server._detached_ws_transport,
+            agent_ready=threading.Event(),
+            agent_build_started=True,
+        ),
+        "finalized": _session(
+            transport=server._detached_ws_transport,
+            _finalized=True,
+        ),
+    }
+    for sid, session in cases.items():
+        assert server._ws_session_is_quiescent(sid, session) is False
 
-    # Mid-turn sessions are also spared even if detached.
-    mid_turn = _session(transport=server._detached_ws_transport, running=True)
-    assert server._ws_session_is_orphaned(mid_turn) is False
+    pending = _session(transport=server._detached_ws_transport)
+    server._pending["pending-proof"] = ("pending", threading.Event())
+    try:
+        assert server._ws_session_is_quiescent("pending", pending) is False
+    finally:
+        server._pending.pop("pending-proof", None)
 
-    # Already finalized sessions are spared (idempotency).
-    done = _session(
+
+def test_ws_soft_park_empty_shell_discard_requires_proven_missing_row(monkeypatch):
+    """Only a history-free shell with a proven absent durable row is discarded."""
+    import contextlib
+
+    captured = {}
+
+    class _FakeDB:
+        def get_session(self, _key):
+            return None
+
+    @contextlib.contextmanager
+    def _fake_session_db(_session):
+        yield _FakeDB()
+
+    def _capture_teardown(session, *, end_reason):
+        captured["session"] = session
+        captured["end_reason"] = end_reason
+        return True
+
+    monkeypatch.setattr(server, "_session_db", _fake_session_db)
+    monkeypatch.setattr(server, "_teardown_popped_session", _capture_teardown)
+    shell = _session(
+        agent=types.SimpleNamespace(_session_messages=[]),
         transport=server._detached_ws_transport,
-        running=False,
-        _finalized=True,
+        session_key="never-persisted",
+        _db_row_persisted=False,
     )
-    assert server._ws_session_is_orphaned(done) is False
+    server._sessions["empty-shell"] = shell
+    try:
+        server._soft_park_session_after_grace("empty-shell", shell)
+        assert "empty-shell" not in server._sessions
+        assert captured == {"session": shell, "end_reason": "empty_shell_discard"}
+    finally:
+        server._sessions.pop("empty-shell", None)
 
 
-def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
-    """Grace=0 disables the reaper entirely (pre-fix park-forever behaviour)."""
+def test_ws_soft_park_preserves_unpersisted_shell_with_history(monkeypatch):
+    """A missing DB row never permits discarding meaningful in-memory history."""
+    import contextlib
+
+    class _FakeDB:
+        def get_session(self, _key):
+            return None
+
+    @contextlib.contextmanager
+    def _fake_session_db(_session):
+        yield _FakeDB()
+
+    monkeypatch.setattr(server, "_session_db", _fake_session_db)
+    session = _session(
+        agent=types.SimpleNamespace(_session_messages=[]),
+        transport=server._detached_ws_transport,
+        history=[{"role": "user", "content": "unsaved"}],
+        _db_row_persisted=False,
+    )
+    server._sessions["unsaved"] = session
+    try:
+        server._soft_park_session_after_grace("unsaved", session)
+        assert server._sessions["unsaved"] is session
+        assert session["history"] == [{"role": "user", "content": "unsaved"}]
+        assert session["_active_session_lease_parked"] is True
+    finally:
+        server._sessions.pop("unsaved", None)
+
+
+def test_ws_soft_park_disabled_when_legacy_grace_zero(monkeypatch):
+    """Legacy grace=0 disables soft parking for backward compatibility."""
     fired = {"timer": False}
 
     class _Timer:
@@ -2535,8 +2937,165 @@ def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.0)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
-    server._schedule_ws_orphan_reap("any-sid")
+    server._schedule_ws_soft_park("any-sid")
     assert fired["timer"] is False
+
+
+@pytest.mark.parametrize("method_name", ["session.activate", "session.resume"])
+def test_activate_and_resume_reacquire_parked_lease_and_cancel_timer(
+    monkeypatch, method_name
+):
+    """Both reattachment RPCs restore lease ownership before binding transport."""
+    claims = []
+
+    class _Lease:
+        def release(self):
+            return None
+
+    class _Timer:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _FakeDB:
+        def get_session(self, key):
+            return {"id": key, "cwd": ""}
+
+        def resolve_resume_session_id(self, key):
+            return key
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda key, **kwargs: (claims.append((key, kwargs)) or _Lease(), None),
+    )
+    timer = _Timer()
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        session_key="persisted-key",
+        transport=server._detached_ws_transport,
+        _active_session_lease_parked=True,
+        _db_row_persisted=True,
+    )
+    server._sessions["parked-live"] = session
+    server._ws_soft_park_timers["parked-live"] = timer
+    try:
+        params = {"session_id": "persisted-key" if method_name.endswith("resume") else "parked-live"}
+        response = server._methods[method_name]("reattach", params)
+
+        assert response["result"]["session_id"] == "parked-live"
+        assert session["transport"] is not server._detached_ws_transport
+        assert isinstance(session["active_session_lease"], _Lease)
+        assert "_active_session_lease_parked" not in session
+        assert len(claims) == 1
+        assert timer.cancelled is True
+        assert "parked-live" not in server._ws_soft_park_timers
+    finally:
+        server._ws_soft_park_timers.pop("parked-live", None)
+        server._sessions.pop("parked-live", None)
+
+
+def test_stale_transport_disconnect_serializes_with_replacement_rebind(monkeypatch):
+    """Disconnect cannot snapshot an owner, lose the lock, then clobber a rebind."""
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_schedule_ws_soft_park", lambda *_args, **_kwargs: None
+    )
+
+    class _Transport(Transport):
+        def write(self, obj: dict) -> bool:
+            del obj
+            return True
+
+        def close(self) -> None:
+            return None
+
+    disconnect_at_decision = threading.Event()
+    rebind_done = threading.Event()
+
+    class _InterleavingSession(dict):
+        """Pause after owner matching at the old snapshot/mutate race boundary."""
+
+        def get(self, key, default=None):
+            if key == "close_on_disconnect" and not dict.get(self, "_gate_used", False):
+                self["_gate_used"] = True
+                disconnect_at_decision.set()
+                # New code holds the lifecycle lock here, so rebind cannot finish
+                # until disconnect performs its CAS mutation. The pre-fix code
+                # released its only lock before this point, letting rebind finish
+                # and then overwriting that replacement with the detached sink.
+                rebind_done.wait(timeout=1.0)
+            return super().get(key, default)
+
+    old_transport = _Transport()
+    replacement_transport = _Transport()
+    session = _InterleavingSession(
+        _session(
+            agent=types.SimpleNamespace(model="model-live"),
+            transport=old_transport,
+            close_on_disconnect=False,
+            _db_row_persisted=True,
+        )
+    )
+    server._sessions["race-sid"] = session
+    results = {}
+
+    def disconnect() -> None:
+        results["disconnect"] = server._close_sessions_for_transport(old_transport)
+
+    def rebind() -> None:
+        results["rebind"] = server._reattach_live_session_payload(
+            "race-sid", session, transport=replacement_transport
+        )
+        rebind_done.set()
+
+    disconnect_thread = threading.Thread(target=disconnect)
+    rebind_thread = threading.Thread(target=rebind)
+    try:
+        disconnect_thread.start()
+        assert disconnect_at_decision.wait(timeout=1.0)
+        rebind_thread.start()
+        disconnect_thread.join(timeout=2.0)
+        rebind_thread.join(timeout=2.0)
+
+        assert not disconnect_thread.is_alive()
+        assert not rebind_thread.is_alive()
+        assert results["disconnect"] == (0, 1)
+        payload, attach_error = results["rebind"]
+        assert attach_error is None
+        assert payload is not None
+        assert server._sessions["race-sid"]["transport"] is replacement_transport
+    finally:
+        server._sessions.pop("race-sid", None)
+
+
+def test_parked_lease_limit_blocks_rebind_without_losing_session(monkeypatch):
+    """A parked session cannot exceed max_concurrent_sessions on reactivation."""
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *args, **kwargs: (None, "active limit reached"),
+    )
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        transport=server._detached_ws_transport,
+        _active_session_lease_parked=True,
+    )
+    server._sessions["limited"] = session
+    try:
+        response = server._methods["session.activate"](
+            "activate", {"session_id": "limited"}
+        )
+        assert response["error"] == {"code": 4090, "message": "active limit reached"}
+        assert server._sessions["limited"] is session
+        assert session["transport"] is server._detached_ws_transport
+        assert session["_active_session_lease_parked"] is True
+    finally:
+        server._sessions.pop("limited", None)
 
 
 def test_init_session_fires_reset_hook(monkeypatch):
@@ -8312,7 +8871,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     server._sessions["sid-live"] = session
     try:
         queued = server._handle_busy_submit(
-            "submit", "sid-live", session, "newest prompt", object()
+            "submit", "sid-live", session, "newest prompt"
         )
         assert queued["result"]["status"] == "queued"
 
@@ -10236,20 +10795,33 @@ def test_session_close_rpc_claims_then_tears_down(monkeypatch):
 def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     seen = []
     monkeypatch.setattr(
-        server, "_close_session_by_id",
-        lambda sid, *, end_reason: bool(seen.append((sid, end_reason))) or True,
+        server,
+        "_teardown_popped_session",
+        lambda session, *, end_reason: bool(
+            seen.append((session["_sid"], end_reason))
+        )
+        or True,
     )
     # Detached session "b" would schedule a real grace-reap threading.Timer that
     # outlives the test; grace=0 short-circuits it so no thread lingers.
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
     transport = object()  # the disconnecting transport
+    foreign_transport = object()
     server._sessions.clear()
     server._sessions["a"] = {"transport": transport, "close_on_disconnect": True}
     server._sessions["b"] = {"transport": transport, "close_on_disconnect": False}
+    server._sessions["foreign"] = {
+        "transport": foreign_transport,
+        "close_on_disconnect": True,
+    }
     try:
-        server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
+        counts = server._close_sessions_for_transport(
+            transport, end_reason="ws_disconnect"
+        )
+        assert counts == (1, 1)
         assert seen == [("a", "ws_disconnect")]  # only the flagged one closed
         assert server._sessions["b"]["transport"] is server._detached_ws_transport  # re-pointed
+        assert server._sessions["foreign"]["transport"] is foreign_transport
     finally:
         server._sessions.clear()
 
@@ -10327,6 +10899,15 @@ def test_session_not_evictable_violating_each_exemption(monkeypatch):
     running = _idle_evictable_session(now) | {"running": True}
     assert server._session_is_evictable("s", running, now) is False
 
+    queued = _idle_evictable_session(now) | {"queued_prompt": {"text": "next"}}
+    assert server._session_is_evictable("s", queued, now) is False
+
+    inflight = _idle_evictable_session(now) | {"inflight_turn": {"text": "now"}}
+    assert server._session_is_evictable("s", inflight, now) is False
+
+    slash_inflight = _idle_evictable_session(now) | {"_slash_worker_inflight": 1}
+    assert server._session_is_evictable("s", slash_inflight, now) is False
+
     starting = _idle_evictable_session(now)
     starting["agent_ready"] = threading.Event()  # not set -> still starting
     assert server._session_is_evictable("s", starting, now) is False
@@ -10349,8 +10930,11 @@ def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
     closed = []
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
     monkeypatch.setattr(
-        server, "_close_session_by_id",
-        lambda sid, *, end_reason: closed.append((sid, end_reason)),
+        server,
+        "_teardown_popped_session",
+        lambda session, *, end_reason: closed.append(
+            (session["_sid"], end_reason)
+        ),
     )
     now = time.time()
     server._sessions.clear()
