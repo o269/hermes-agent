@@ -11903,6 +11903,77 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_SPAWN_SKILL_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:[/:][A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_SPAWN_SKILL_IDENTIFIER_MAX_LENGTH = 256
+
+
+def _invalid_spawn_skills(task_id: object, reason: str) -> ValueError:
+    """Build a bounded, single-line worker-skill validation error."""
+    task_label = re.sub(r"\s+", " ", str(task_id)).strip() or "<unknown>"
+    if len(task_label) > 64:
+        task_label = f"{task_label[:61]}..."
+    return ValueError(
+        f"task {task_label} has invalid skills ({reason}); expected None, "
+        "list[str]/tuple[str, ...], a JSON-array string, or a "
+        "single/comma-delimited identifier string; identifiers may use only "
+        "letters, digits, '.', '_', '/', ':', and '-'"
+    )
+
+
+def _normalize_spawn_skills(value: object, *, task_id: object) -> list[str]:
+    """Normalize legacy and typed task skills before building worker argv.
+
+    This is the final trust boundary before a task's values reach ``Popen``.
+    Keep it independent of database decoding so direct ``Task(...)`` callers
+    and legacy broker serializers receive the same fail-closed behavior.
+    """
+    if value is None:
+        return []
+
+    raw_items: Sequence[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            if stripped[0] in '[{"':
+                raise _invalid_spawn_skills(
+                    task_id, "malformed JSON-looking value"
+                ) from None
+            raw_items = stripped.split(",")
+        else:
+            if not isinstance(decoded, list):
+                raise _invalid_spawn_skills(task_id, "JSON value must be an array")
+            raw_items = decoded
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raise _invalid_spawn_skills(task_id, "unsupported value type")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise _invalid_spawn_skills(task_id, "members must be strings")
+        name = item.strip()
+        if not name:
+            raise _invalid_spawn_skills(task_id, "members must be non-empty")
+        if (
+            len(name) > _SPAWN_SKILL_IDENTIFIER_MAX_LENGTH
+            or _SPAWN_SKILL_IDENTIFIER_RE.fullmatch(name) is None
+        ):
+            raise _invalid_spawn_skills(task_id, "member is not a valid identifier")
+        if name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11922,8 +11993,10 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
+
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    spawn_skills = _normalize_spawn_skills(task.skills, task_id=task.id)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -11942,6 +12015,7 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
     except FileNotFoundError:
@@ -12035,10 +12109,8 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    for skill in spawn_skills:
+        cmd.extend(["--skills", skill])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
