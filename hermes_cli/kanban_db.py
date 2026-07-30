@@ -5171,6 +5171,9 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        # ``result`` is a durable work-product field in its own right. Record
+        # its PR declarations even when the run summary intentionally differs.
+        _record_task_pr_declaration(conn, task_id, result, observed_at=now)
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -7106,11 +7109,13 @@ def _canonical_pr_urls_from_comments(
     urls: list[str] = []
     seen: set[str] = set()
     rows = conn.execute(
-        "SELECT body FROM task_comments "
+        "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
         (task_id, int(cutoff)),
     ).fetchall()
     for row in rows:
+        if _coerce_epoch(row["created_at"]) < int(cutoff):
+            continue
         for url in _canonical_pr_urls_from_text(row["body"] or ""):
             if url not in seen:
                 seen.add(url)
@@ -7153,29 +7158,75 @@ def _active_pr_candidates(
     lapse when the owning card finishes, so a citation of a completed card's
     PR stays a citation.
     """
-    # URL extraction stays in the single canonical scanner so ordering and the
-    # window semantics have exactly one definition. A second pass then attaches
-    # the comment that holds the guard open, so the emitted diagnostics can
-    # name the exact comment id and expiry rather than just a reason string.
-    urls = _canonical_pr_urls_from_comments(conn, task_id, cutoff=cutoff)
-    if not urls:
-        return (), ()
-    sightings: dict[str, dict[str, Any]] = {
-        url: {"canonical_url": url} for url in urls
-    }
+    # The normalized ownership ledger is authoritative for custody sightings:
+    # work product has no comment row, so a comment-only seed silently drops the
+    # exact result/run declaration the guard exists to protect. Seed from every
+    # in-window ledger row, preserving its nullable source_comment_id and the
+    # last_seen_at-based lease expiry. The comment pass below remains as a
+    # backwards-compatible enrichment for legacy/directly-inserted comments.
+    try:
+        ownership_rows = conn.execute(
+            "SELECT canonical_url, last_seen_at, source_comment_id "
+            "FROM task_pr_ownership "
+            "WHERE task_id = ? AND last_seen_at >= ? "
+            "ORDER BY first_seen_at ASC, canonical_url ASC",
+            (task_id, int(cutoff)),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # A pre-ownership-schema connection retains the historical
+        # comment-only behaviour. Any other read failure is unsafe to ignore:
+        # failing open here can let a second writer claim guarded work.
+        if "no such table: task_pr_ownership" not in str(exc).lower():
+            raise
+        ownership_rows = []
+
+    sightings: dict[str, dict[str, Any]] = {}
+    for row in ownership_rows:
+        seen_at = _coerce_epoch(row["last_seen_at"])
+        if seen_at < int(cutoff):
+            continue
+        url = str(row["canonical_url"])
+        source_comment_id = row["source_comment_id"]
+        sightings[url] = {
+            "canonical_url": url,
+            "source_comment_id": (
+                int(source_comment_id) if source_comment_id is not None else None
+            ),
+            "last_seen_at": seen_at,
+            "expires_at": seen_at + _RESPAWN_GUARD_PR_WINDOW,
+        }
+
     for row in conn.execute(
         "SELECT id, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
         (task_id, int(cutoff)),
     ).fetchall():
+        seen_at = _coerce_epoch(row["created_at"])
+        # SQLite permits legacy textual timestamps in this INTEGER-affinity
+        # column; the SQL comparison can admit them, so enforce the window
+        # again after canonical coercion.
+        if seen_at < int(cutoff):
+            continue
         for url in _canonical_pr_urls_from_text(row["body"] or ""):
             sighting = sightings.get(url)
             if sighting is None:
+                sightings[url] = {
+                    "canonical_url": url,
+                    "source_comment_id": int(row["id"]),
+                    "last_seen_at": seen_at,
+                    "expires_at": seen_at + _RESPAWN_GUARD_PR_WINDOW,
+                }
                 continue
-            seen_at = _coerce_epoch(row["created_at"])
-            sighting["source_comment_id"] = int(row["id"])
-            sighting["last_seen_at"] = seen_at
-            sighting["expires_at"] = seen_at + _RESPAWN_GUARD_PR_WINDOW
+            # A newer raw comment can enrich a stale normalized row. On a tie,
+            # preserve the ledger's source: a later same-second work-product
+            # declaration intentionally records source_comment_id=NULL.
+            if seen_at > int(sighting.get("last_seen_at") or 0):
+                sighting["source_comment_id"] = int(row["id"])
+                sighting["last_seen_at"] = seen_at
+                sighting["expires_at"] = seen_at + _RESPAWN_GUARD_PR_WINDOW
+    if not sightings:
+        return (), ()
+
     try:
         declared_here = {
             str(row["canonical_url"])
