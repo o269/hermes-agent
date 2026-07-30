@@ -577,6 +577,19 @@ def _apply_profile_override() -> None:
             consume = 0
             profile_index = None
 
+    # 1.75 Capture the parent profile before any override. The dispatcher sets
+    # both HERMES_PROFILE and HERMES_HOME (the latter to a profile directory),
+    # so either signal identifies the worker's owning profile. A nested process
+    # spawned with HERMES_HOME already pointing to a profile directory has its
+    # profile in the directory name even when HERMES_PROFILE is missing.
+    parent_profile: str | None = os.environ.get("HERMES_PROFILE")
+    if not parent_profile:
+        _home_env = os.environ.get("HERMES_HOME", "")
+        if _home_env:
+            _home_path = Path(_home_env)
+            if _home_path.parent.name == "profiles":
+                parent_profile = _home_path.name
+
     # 1.5 If HERMES_HOME is already set and no explicit flag was given, trust it
     # only when it already points to a specific profile directory.  The
     # distinguishing heuristic: a profile path has "profiles" as its immediate
@@ -589,6 +602,9 @@ def _apply_profile_override() -> None:
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
+            # HERMES_HOME already selects a profile; ensure HERMES_PROFILE agrees
+            # so downstream tools do not inherit a stale parent profile.
+            os.environ["HERMES_PROFILE"] = Path(hermes_home_env).name
             return
 
     # 2. If no flag, check active_profile in the hermes root.
@@ -638,6 +654,23 @@ def _apply_profile_override() -> None:
             )
             return
         os.environ["HERMES_HOME"] = hermes_home
+        # After profile resolution, always set HERMES_PROFILE to the selected
+        # profile so a nested session cannot inherit a stale parent profile. A
+        # cross-profile explicit switch from a dispatched worker must also drop
+        # inherited Kanban card context, or a nested `hermes -p other` would keep
+        # HERMES_KANBAN_* and lifecycle tools. Same-profile dispatcher startup
+        # (HERMES_PROFILE matches the new profile) is preserved.
+        os.environ["HERMES_PROFILE"] = profile_name
+        if (
+            profile_index is not None
+            and consume > 0
+            and os.environ.get("HERMES_KANBAN_TASK")
+            and parent_profile != profile_name
+        ):
+            for key in list(os.environ.keys()):
+                if key.startswith("HERMES_KANBAN_"):
+                    os.environ.pop(key, None)
+            os.environ.pop("TERMINAL_CWD", None)
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
             start = profile_index + 1  # +1 because argv is sys.argv[1:]
