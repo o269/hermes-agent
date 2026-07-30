@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -17,6 +16,7 @@ from hermes_cli.kb_client import Client
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOARDD = REPO_ROOT / "scripts" / "fleet" / "boardd.py"
+BLITZ_DISPATCHER = REPO_ROOT / "scripts" / "fleet" / "fleet-board-reconciler"
 VPS2_DISPATCHER = REPO_ROOT / "scripts" / "fleet" / "fleet-board-reconciler-vps2"
 
 CLAIM_PROGRAM = """
@@ -117,12 +117,8 @@ def broker(tmp_path: Path):
     finally:
         client.close()
         if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            process.kill()
+            process.wait(timeout=5)
 
 
 def _create_task(
@@ -445,6 +441,70 @@ def test_vps2_outage_is_fatal(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "FATAL: vps2 dispatcher cannot reach boardd" in completed.stderr
+
+
+def test_blitz_dispatcher_spawns_and_records_worker_pid(broker) -> None:
+    client = broker["client"]
+    _create_task(client, "t_00000017", "engineer")
+    fake_hermes = broker["tmp"] / "fake-hermes"
+    fake_hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_hermes.chmod(0o755)
+
+    completed = subprocess.run(
+        [sys.executable, str(BLITZ_DISPATCHER)],
+        cwd=REPO_ROOT,
+        env=_python_env(
+            BOARDD_SOCK=str(broker["sock"]),
+            FLEET_HOST_IDENTITY="blitz",
+            HERMES_BIN=str(fake_hermes),
+            FLEET_WORKSPACE_ROOT=str(broker["tmp"] / "workspaces"),
+            FLEET_DISPATCH_LOG=str(broker["tmp"] / "blitz-dispatch.log"),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Spawned: 1" in completed.stdout
+    task = client.get_task("t_00000017")
+    worker_pid = int(task["worker_pid"])
+    assert worker_pid > 0
+    run = client.query(
+        "SELECT worker_pid FROM task_runs WHERE id=?", [task["current_run_id"]]
+    )
+    assert run == [{"worker_pid": worker_pid}]
+
+
+def test_split_brain_guard_rejects_live_foreign_worker(broker) -> None:
+    client = broker["client"]
+    _create_task(client, "t_00000018", "vps2-eng1")
+    foreign = _claim(
+        broker["sock"],
+        identity="blitz-vps-2",
+        assignee="vps2-eng1",
+        task_id="t_00000018",
+    )
+    assert foreign["won"] is True
+    assert client.record_worker_pid(
+        foreign["task_id"], foreign["run_id"], os.getpid(), foreign["claim_lock"]
+    ) == {"ok": True}
+
+    completed = subprocess.run(
+        [sys.executable, str(BLITZ_DISPATCHER)],
+        cwd=REPO_ROOT,
+        env=_python_env(
+            BOARDD_SOCK=str(broker["sock"]),
+            FLEET_HOST_IDENTITY="blitz",
+            FLEET_DISPATCH_LOG=str(broker["tmp"] / "split-brain.log"),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 1
+    assert "FATAL: split-brain live foreign worker(s)" in completed.stderr
 
 
 def test_disabling_vps2_prevents_new_remote_claims_without_rewriting_old_state(
