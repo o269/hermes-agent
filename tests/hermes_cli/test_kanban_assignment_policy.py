@@ -434,6 +434,29 @@ def test_generic_parking_words_do_not_admit_unparented_fable_executor(
         )
 
 
+@pytest.mark.parametrize(
+    "exact_task_id",
+    ("t_69961c40", "t_1ec8fc59", "t_5f21b5af"),
+)
+def test_required_exact_ids_classify_without_semantic_markers(exact_task_id: str):
+    assert is_nonspawnable_contract(
+        "ordinary-looking row",
+        "",
+        task_id=exact_task_id,
+    )
+    assert (
+        assignment_guard_reason(
+            task_id=exact_task_id,
+            title="ordinary-looking row",
+            body="",
+            assignee="fable",
+            status="ready",
+            authority_profiles=("fable", "operator"),
+        )
+        == "nonspawnable_contract_active"
+    )
+
+
 def test_exact_id_and_old_state_block_atomic_semantic_erasure(guarded_board):
     conn, _config_path, _db_path = guarded_board
     _raw_insert(
