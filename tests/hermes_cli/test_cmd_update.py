@@ -10,11 +10,39 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
-def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
+def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0", fork_remote=None):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+
+        # git remote get-url fork
+        if "remote get-url fork" in joined:
+            if fork_remote is not None:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{fork_remote}\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd,
+                128,
+                stdout="",
+                stderr="error: No such remote 'fork'\n",
+            )
+
+        # git remote get-url origin
+        if "remote get-url origin" in joined:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="https://github.com/example/hermes-agent.git\n",
+                stderr="",
+            )
+
+        # git rev-list {remote}/main..HEAD --count (committed-work guard)
+        if "rev-list" in joined and "..HEAD" in joined and "--count" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="0\n", stderr=""
+            )
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -359,9 +387,11 @@ class TestCmdUpdateBranchFallback:
 
         # rev-list should use origin/main, not origin/fix/stoicneko
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
+        assert len(rev_list_cmds) >= 1
+        update_rev_list = next((c for c in rev_list_cmds if "HEAD.." in c), None)
+        assert update_rev_list is not None
+        assert "origin/main" in update_rev_list
+        assert "origin/fix/stoicneko" not in update_rev_list
 
         # pull should use main, not fix/stoicneko
         pull_cmds = [c for c in commands if "pull" in c]
@@ -382,8 +412,10 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        assert len(rev_list_cmds) >= 1
+        update_rev_list = next((c for c in rev_list_cmds if "HEAD.." in c), None)
+        assert update_rev_list is not None
+        assert "origin/main" in update_rev_list
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
@@ -424,17 +456,13 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        with patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT, update_remote="origin")
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -741,6 +769,26 @@ class TestCmdUpdateBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+
+            # Remote resolution for the fork-remote fence.
+            if "remote get-url fork" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    128,
+                    stdout="",
+                    stderr="error: No such remote 'fork'\n",
+                )
+            if "remote get-url origin" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="https://github.com/example/hermes-agent.git\n",
+                    stderr="",
+                )
+
+            # Committed-work guard: pretend there are no local-only commits.
+            if "rev-list" in joined and "..HEAD" in joined and "--count" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
@@ -1242,3 +1290,111 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+class TestCmdUpdateForkRemoteFence:
+    """Reproduce the fleet-down topology and verify the fence."""
+
+    @staticmethod
+    def _git(repo, *args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    def _init_repo(self, repo):
+        self._git(repo, "init", "--initial-branch=main")
+        self._git(repo, "config", "user.email", "test@example.com")
+        self._git(repo, "config", "user.name", "Test")
+        (repo / "base.txt").write_text("base")
+        self._git(repo, "add", "base.txt")
+        self._git(repo, "commit", "-m", "base")
+
+    def test_resolve_update_remote_prefers_fork_when_origin_is_upstream(self, tmp_path):
+        """Topology: origin=upstream, fork=ours. Update must target fork."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/Hermes-Agent.git",
+        )
+        self._git(
+            repo, "remote", "add", "fork", "https://github.com/o269/hermes-agent.git"
+        )
+
+        remote, url = hm._resolve_update_remote(["git"], repo)
+        assert remote == "fork"
+        assert "o269" in url
+
+    def test_resolve_update_remote_refuses_origin_upstream_without_fork(self, tmp_path):
+        """origin=upstream and no fork remote must be refused, not reset."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/Hermes-Agent.git",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._resolve_update_remote(["git"], repo)
+        assert exc_info.value.code == 1
+
+    def test_resolve_update_remote_allows_origin_when_it_is_a_fork(self, tmp_path):
+        """A plain fork checkout (origin=fork, no fork remote) is allowed."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo, "remote", "add", "origin", "https://github.com/example/hermes-agent.git"
+        )
+
+        remote, url = hm._resolve_update_remote(["git"], repo)
+        assert remote == "origin"
+        assert "example" in url
+
+    def test_is_fork_case_insensitive(self):
+        """The URL comparison must be case-insensitive (this was the banner bug)."""
+        from hermes_cli import main as hm
+
+        assert hm._is_fork("https://github.com/NousResearch/Hermes-Agent.git") is False
+        assert hm._is_fork("https://github.com/nousresearch/hermes-agent") is False
+        assert hm._is_fork("git@github.com:NousResearch/Hermes-Agent.git") is False
+        assert hm._is_fork("https://github.com/o269/hermes-agent.git") is True
+
+    def test_count_local_commits_ahead_counts_commits_only_on_branch(self, tmp_path):
+        """The committed-work guard must count commits absent from the remote."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        remote_sha = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+        self._git(
+            repo, "remote", "add", "origin", "https://github.com/example/hermes-agent.git"
+        )
+        # Simulate fetched origin/main
+        self._git(repo, "update-ref", "refs/remotes/origin/main", remote_sha)
+
+        (repo / "local.txt").write_text("local")
+        self._git(repo, "add", "local.txt")
+        self._git(repo, "commit", "-m", "local-only")
+
+        assert hm._count_local_commits_ahead(["git"], repo, "origin/main") == 1
+
