@@ -89,23 +89,98 @@ def test_no_idempotency_key_never_collides(kanban_home):
         conn.close()
 
 
-def test_explicit_todo_initial_status_never_becomes_dispatchable(kanban_home):
+def test_parent_free_initial_block_survives_recompute_and_dispatch_tick(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="parent-free validated external intake",
+            assignee="orchestrator",
+            initial_status="blocked",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.started_at is None
+        assert task.current_run_id is None
+        assert kb.recompute_ready(conn) == 0
+        tick = kb.dispatch_once(conn, dry_run=True)
+        assert tick.promoted == 0
+        assert tick.spawned == []
+        persisted = kb.get_task(conn, task_id)
+        assert persisted is not None
+        assert persisted.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_done_parent_initial_block_survives_recompute_and_dispatch_tick(kanban_home):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="already complete")
         assert kb.complete_task(conn, parent)
         task_id = kb.create_task(
             conn,
-            title="validated external intake",
+            title="done-parent validated external intake",
             assignee="orchestrator",
             parents=[parent],
-            initial_status="todo",
+            initial_status="blocked",
         )
-        task = kb.get_task(conn, task_id)
-        assert task is not None
-        assert task.status == "todo"
-        assert task.started_at is None
-        assert task.current_run_id is None
+        created = kb.get_task(conn, task_id)
+        assert created is not None
+        assert created.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        tick = kb.dispatch_once(conn, dry_run=True)
+        assert tick.promoted == 0
+        assert tick.spawned == []
+        persisted = kb.get_task(conn, task_id)
+        assert persisted is not None
+        assert persisted.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_explicit_authorized_promote_releases_initial_block(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "orchestrator")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="operator-releasable validated external intake",
+            assignee="orchestrator",
+            initial_status="blocked",
+        )
+        promoted, refusal = kb.promote_task(
+            conn,
+            task_id,
+            actor="fable",
+            reason="authorized structured-intake release",
+        )
+        assert promoted is True
+        assert refusal is None
+        released = kb.get_task(conn, task_id)
+        assert released is not None
+        assert released.status == "ready"
+
+        tick = kb.dispatch_once(conn, dry_run=True)
+        assert tick.spawned == [(task_id, "orchestrator", "")]
+
+        # The audited manual promotion must also clear the sticky marker for
+        # later ordinary circuit-breaker recovery; otherwise the historical
+        # intake hold would weaken recompute_ready forever.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=1 WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.recompute_ready(conn) == 1
+        recovered = kb.get_task(conn, task_id)
+        assert recovered is not None
+        assert recovered.status == "ready"
     finally:
         conn.close()
 
@@ -856,14 +931,14 @@ def test_cli_create_with_idempotency_key(kanban_home):
     assert tid1 == tid2
 
 
-def test_cli_create_todo_readback_includes_idempotency_key(kanban_home):
+def test_cli_create_blocked_readback_includes_idempotency_key(kanban_home):
     payload = json.loads(
         run_slash(
             "create 'owner intake' --assignee orchestrator "
-            "--initial-status todo --idempotency-key buzz-intake-v1 --json"
+            "--initial-status blocked --idempotency-key buzz-intake-v1 --json"
         )
     )
-    assert payload["status"] == "todo"
+    assert payload["status"] == "blocked"
     assert payload["idempotency_key"] == "buzz-intake-v1"
 
 

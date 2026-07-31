@@ -2,7 +2,7 @@
 """Fail-closed Buzz <-> Kanban fleet control bridge.
 
 Phase 1 accepts only owner-signed, marker-prefixed JSON envelopes from one
-configured Buzz channel. It creates parked ``todo`` cards through Hermes'
+configured Buzz channel. It creates sticky ``blocked`` cards through Hermes'
 boardd-backed CLI, reads the card back, and only then emits a thread receipt.
 It also replaces aggregate ticker posts with cursor-based high-signal Kanban
 activity messages.
@@ -546,7 +546,7 @@ def validate_card_readback(
         "title": intake.envelope.title,
         "body": render_card_body(intake),
         "assignee": intake.envelope.requested_specialist,
-        "status": "todo",
+        "status": "blocked",
         "priority": intake.envelope.priority,
         "workspace_kind": expected_kind,
         "workspace_path": expected_path,
@@ -639,7 +639,7 @@ class HermesBroker:
             "--created-by",
             intake.owner_pubkey,
             "--initial-status",
-            "todo",
+            "blocked",
             "--json",
         ]
         for parent in envelope.parents:

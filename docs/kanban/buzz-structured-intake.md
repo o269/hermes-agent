@@ -57,8 +57,10 @@ fields are unknown fields and are rejected rather than forwarded.
   dispatch a card. Assignees must be predeclared operator-approved profiles.
 - Cards are created through `hermes kanban --board fleet` with
   `HERMES_KANBAN_BROKER=1` and `BOARDD_SOCK` pinned to boardd.
-- `--initial-status todo` is explicit. A completed/missing parent cannot turn
-  trusted intake into a transient `ready` or `running` card.
+- `--initial-status blocked` is explicit and emits the broker-native sticky
+  block event. Parent-free and completed-parent cards therefore remain blocked
+  across dependency recomputation and dispatcher ticks. Only an explicit,
+  authorized broker `promote`/`unblock` action can release the card.
 - The idempotency key returns the existing non-archived card on replay. A replay
   is acknowledged only if title, body, owner, assignee, priority, workspace,
   parents, status, and idempotency key all match the broker read-back.
@@ -99,14 +101,18 @@ PYTHONPATH="$PWD" python3 -m pytest -q \
   tests/hermes_cli/test_buzz_kanban_bridge.py
 
 PYTHONPATH="$PWD" python3 -m pytest -q \
-  tests/hermes_cli/test_kanban_core_functionality.py::test_explicit_todo_initial_status_never_becomes_dispatchable \
-  tests/hermes_cli/test_kanban_core_functionality.py::test_cli_create_todo_readback_includes_idempotency_key
+  tests/hermes_cli/test_kanban_core_functionality.py::test_parent_free_initial_block_survives_recompute_and_dispatch_tick \
+  tests/hermes_cli/test_kanban_core_functionality.py::test_done_parent_initial_block_survives_recompute_and_dispatch_tick \
+  tests/hermes_cli/test_kanban_core_functionality.py::test_explicit_authorized_promote_releases_initial_block \
+  tests/hermes_cli/test_kanban_core_functionality.py::test_cli_create_blocked_readback_includes_idempotency_key
 ```
 
-The fixtures cover duplicate delivery, crash-after-receipt replay, malformed and
-duplicate-key JSON, unauthorized sender, stale input, workspace and approval
-allowlists, broker failure, broker read-back mismatch, private atomic state,
-high-signal filtering, and first-run outbound cursor bootstrap.
+The fixtures cover parent-free and completed-parent sticky creation, dependency
+recomputation, dispatcher dry ticks, explicit authorized release, duplicate
+delivery, crash-after-receipt replay, malformed and duplicate-key JSON,
+unauthorized sender, stale input, workspace and approval allowlists, broker
+failure, broker read-back mismatch, private atomic state, high-signal filtering,
+and first-run outbound cursor bootstrap.
 
 ## Operator-only enablement shape
 

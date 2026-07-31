@@ -34,7 +34,7 @@ def envelope_payload(**overrides: Any) -> dict[str, Any]:
         "objective": "Create one parked card and acknowledge it only after broker read-back.",
         "acceptance_criteria": [
             "Reject unauthorized senders.",
-            "Create exactly one todo card.",
+            "Create exactly one sticky blocked card.",
         ],
         "requested_specialist": "orchestrator",
         "urgency": "high",
@@ -108,7 +108,7 @@ class FakeBroker:
             "title": intake.envelope.title,
             "body": bridge_module.render_card_body(intake),
             "assignee": intake.envelope.requested_specialist,
-            "status": "todo",
+            "status": "blocked",
             "priority": intake.envelope.priority,
             "workspace_kind": kind,
             "workspace_path": path,
@@ -215,7 +215,7 @@ def test_duplicate_delivery_creates_one_card_and_one_receipt() -> None:
     receipt = buzz.receipts[SOURCE_EVENT][1]
     assert "card_id: t_deadbeef" in receipt
     assert f"owner: {OWNER}" in receipt
-    assert "status: todo" in receipt
+    assert "status: blocked" in receipt
     assert "broker read-back receipt" in receipt
     assert "reviewer: independent Grok security review" in receipt
 
@@ -356,7 +356,7 @@ def test_secret_like_envelope_value_is_rejected_before_card_creation() -> None:
     assert broker.create_calls == 0
 
 
-def test_hermes_create_is_broker_pinned_parked_and_has_no_model_override(
+def test_hermes_create_is_broker_pinned_sticky_blocked_and_has_no_model_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     intake = bridge_module.validate_intake_event(
@@ -400,7 +400,7 @@ def test_hermes_create_is_broker_pinned_parked_and_has_no_model_override(
         "fleet",
         "create",
     ]
-    assert argv[argv.index("--initial-status") + 1] == "todo"
+    assert argv[argv.index("--initial-status") + 1] == "blocked"
     assert argv[argv.index("--idempotency-key") + 1] == "buzz-intake-test-v1"
     assert "--model" not in argv
     assert "--provider" not in argv
