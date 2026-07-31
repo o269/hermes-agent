@@ -104,7 +104,7 @@ def parse_ssh_claim_lock(lock: Optional[str]) -> Optional[int]:
 
 def is_local_pid_alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok
         return True
     except (OSError, ProcessLookupError, ValueError):
         return False
