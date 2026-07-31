@@ -20,11 +20,13 @@ chain provenance proof.  Installation runs in a background thread so startup
 never blocks.
 """
 
+import errno
 import hashlib
 import json
 import logging
 import os
 import platform
+import secrets
 import shutil
 import stat
 import subprocess
@@ -125,6 +127,13 @@ def _record_tirith_crash() -> None:
             "disabling for the rest of the process",
             _crash_count,
         )
+
+
+def _reset_tirith_circuit() -> None:
+    """Close the breaker after an explicit successful install/recovery."""
+    global _crash_count, _circuit_open
+    _crash_count = 0
+    _circuit_open = False
 
 # Background install thread coordination
 _install_lock = threading.Lock()
@@ -236,9 +245,19 @@ def _clear_install_failed():
 
 
 def _hermes_bin_dir() -> str:
-    """Return $HERMES_HOME/bin, creating it if needed."""
-    d = os.path.join(_get_hermes_home(), "bin")
-    os.makedirs(d, exist_ok=True)
+    """Return $HERMES_HOME/bin, creating new directories owner-only.
+
+    Existing directories are not chmodded behind the user's back. Publication
+    performs a descriptor-bound ownership/mode check and fails closed if an
+    existing directory is unsafe.
+    """
+    home = os.path.abspath(_get_hermes_home())
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    d = os.path.join(home, "bin")
+    try:
+        os.mkdir(d, mode=0o700)
+    except FileExistsError:
+        pass
     return d
 
 
@@ -280,6 +299,40 @@ def is_platform_supported() -> bool:
     return _detect_target() is not None
 
 
+def _target_from_binary_header(header: bytes) -> str | None:
+    """Identify a supported executable target from a native binary header."""
+    # ELF64, little-endian, current ELF version. Shared-object (ET_DYN) is
+    # accepted because modern PIE executables use it; relocatable/object files
+    # and unspecified types are not executable artifacts.
+    if len(header) >= 20 and header[:4] == b"\x7fELF":
+        if header[4] != 2 or header[5] != 1 or header[6] != 1:
+            return None
+        if header[7] not in {0, 3}:  # System V or GNU/Linux OSABI
+            return None
+        elf_type = int.from_bytes(header[16:18], "little")
+        if elf_type not in {2, 3}:  # ET_EXEC or ET_DYN
+            return None
+        machine = int.from_bytes(header[18:20], "little")
+        if machine == 0x3E:
+            return "x86_64-unknown-linux-gnu"
+        if machine == 0xB7:
+            return "aarch64-unknown-linux-gnu"
+        return None
+
+    # Thin little-endian Mach-O 64-bit. Only MH_EXECUTE is runnable; MH_OBJECT,
+    # dylibs, bundles, and malformed zero-filled fixtures must not pass.
+    if len(header) >= 16 and header[:4] == b"\xcf\xfa\xed\xfe":
+        if int.from_bytes(header[12:16], "little") != 2:  # MH_EXECUTE
+            return None
+        cpu_type = int.from_bytes(header[4:8], "little")
+        if cpu_type == 0x01000007:
+            return "x86_64-apple-darwin"
+        if cpu_type == 0x0100000C:
+            return "aarch64-apple-darwin"
+
+    return None
+
+
 def _binary_target(path: str) -> str | None:
     """Identify the supported release target encoded in a native binary header.
 
@@ -291,30 +344,10 @@ def _binary_target(path: str) -> str | None:
     """
     try:
         with open(path, "rb") as binary:
-            header = binary.read(20)
+            header = binary.read(32)
     except OSError:
         return None
-
-    # ELF64, little-endian. e_machine is a 16-bit field at bytes 18..20.
-    if len(header) >= 20 and header[:4] == b"\x7fELF":
-        if header[4] != 2 or header[5] != 1:
-            return None
-        machine = int.from_bytes(header[18:20], "little")
-        if machine == 0x3E:
-            return "x86_64-unknown-linux-gnu"
-        if machine == 0xB7:
-            return "aarch64-unknown-linux-gnu"
-        return None
-
-    # Thin little-endian Mach-O 64-bit. cputype is bytes 4..8.
-    if len(header) >= 8 and header[:4] == b"\xcf\xfa\xed\xfe":
-        cpu_type = int.from_bytes(header[4:8], "little")
-        if cpu_type == 0x01000007:
-            return "x86_64-apple-darwin"
-        if cpu_type == 0x0100000C:
-            return "aarch64-apple-darwin"
-
-    return None
+    return _target_from_binary_header(header)
 
 
 def _is_compatible_tirith_binary(path: str, target: str | None = None) -> bool:
@@ -450,6 +483,141 @@ def _extract_tirith_binary(tar: tarfile.TarFile, dest_dir: str, log) -> tuple[st
     return None, "binary_not_in_archive"
 
 
+_MANAGED_BINARY_MODE = 0o755
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_secure_install_dir(path: str) -> int:
+    """Open and bind the managed bin directory after security validation."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(path, flags)
+    try:
+        bound = os.fstat(dir_fd)
+        named = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(bound.st_mode) or not _same_inode(bound, named):
+            raise OSError(errno.EPERM, "managed bin path is not a stable directory", path)
+        if bound.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, "managed bin directory is not owned by current user", path)
+        if stat.S_IMODE(bound.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+            raise OSError(errno.EPERM, "managed bin directory is group/world-writable", path)
+        return dir_fd
+    except Exception:
+        os.close(dir_fd)
+        raise
+
+
+def _open_staged_binary(dir_fd: int) -> tuple[int, str]:
+    """Create an unpredictable no-follow staging file in the destination dir."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(16):
+        name = f".tirith-stage-{secrets.token_hex(16)}"
+        try:
+            return os.open(name, flags, 0o700, dir_fd=dir_fd), name
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, "could not allocate a unique Tirith staging file")
+
+
+def _copy_binary_to_fd(src: str, dest_fd: int) -> bytes:
+    digest = hashlib.sha256()
+    with open(src, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(dest_fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write while staging Tirith")
+                view = view[written:]
+    return digest.digest()
+
+
+def _digest_fd(fd: int) -> bytes:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    return digest.digest()
+
+
+def _verify_managed_binary_fd(fd: int, target: str, digest: bytes) -> bool:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if info.st_uid != os.geteuid() or info.st_nlink != 1:
+        return False
+    if stat.S_IMODE(info.st_mode) != _MANAGED_BINARY_MODE:
+        return False
+    if _digest_fd(fd) != digest:
+        return False
+    os.lseek(fd, 0, os.SEEK_SET)
+    return _target_from_binary_header(os.read(fd, 32)) == target
+
+
+def _publish_tirith_binary(src: str, target: str) -> tuple[str | None, str]:
+    """Atomically publish a verified executable without following destination links."""
+    try:
+        bin_dir = _hermes_bin_dir()
+        dir_fd = _open_secure_install_dir(bin_dir)
+    except OSError:
+        return None, "install_directory_insecure"
+
+    stage_fd: int | None = None
+    stage_name: str | None = None
+    stage_identity: os.stat_result | None = None
+    try:
+        stage_fd, stage_name = _open_staged_binary(dir_fd)
+        stage_identity = os.fstat(stage_fd)
+        digest = _copy_binary_to_fd(src, stage_fd)
+        os.fchmod(stage_fd, _MANAGED_BINARY_MODE)
+        os.fsync(stage_fd)
+        if not _verify_managed_binary_fd(stage_fd, target, digest):
+            return None, "staged_binary_unusable"
+
+        # Both names are relative to the same descriptor-bound directory, so
+        # publication cannot cross devices. Never fall back to a symlink-following
+        # copy if replace is unavailable or fails.
+        os.replace(stage_name, "tirith", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        stage_name = None
+        os.fsync(dir_fd)
+
+        read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        read_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        published_fd = os.open("tirith", read_flags, dir_fd=dir_fd)
+        try:
+            published = os.fstat(published_fd)
+            named = os.stat("tirith", dir_fd=dir_fd, follow_symlinks=False)
+            canonical_dir = os.stat(bin_dir, follow_symlinks=False)
+            if not _same_inode(published, named):
+                return None, "published_binary_rebound"
+            if not _same_inode(os.fstat(dir_fd), canonical_dir):
+                return None, "install_directory_rebound"
+            if not _verify_managed_binary_fd(published_fd, target, digest):
+                return None, "published_binary_unusable"
+        finally:
+            os.close(published_fd)
+
+        return os.path.join(bin_dir, "tirith"), ""
+    except OSError:
+        return None, "atomic_publish_failed"
+    finally:
+        if stage_name is not None and stage_identity is not None:
+            try:
+                named_stage = os.stat(stage_name, dir_fd=dir_fd, follow_symlinks=False)
+                if _same_inode(stage_identity, named_stage):
+                    os.unlink(stage_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        if stage_fd is not None:
+            os.close(stage_fd)
+        os.close(dir_fd)
+
+
 def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
     """Download and install tirith to $HERMES_HOME/bin/tirith.
 
@@ -533,27 +701,10 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
             log("tirith release binary is incompatible with target %s", target)
             return None, "binary_target_mismatch"
 
-        dest = os.path.join(_hermes_bin_dir(), "tirith")
-        try:
-            shutil.move(src, dest)
-        except OSError:
-            # Cross-device move (common in Docker, NFS): shutil.move() falls
-            # back to copy2 + unlink, but copy2's metadata step can raise
-            # PermissionError.  Use plain copy + manual chmod instead.
-            try:
-                shutil.copy(src, dest)
-            except OSError:
-                # Clean up partial dest to prevent a non-executable retry loop
-                try:
-                    os.unlink(dest)
-                except OSError:
-                    pass
-                return None, "cross_device_copy_failed"
-        # This is a Hermes-managed executable, not a user-authored file whose
-        # ambient umask-derived write bits should be preserved. Pin 0755 so a
-        # permissive umask cannot leave the security scanner group-writable.
-        os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
-                 stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        dest, publish_reason = _publish_tirith_binary(src, target)
+        if dest is None:
+            log("tirith install failed during atomic publication: %s", publish_reason)
+            return None, publish_reason
 
         verification = "cosign + SHA-256" if cosign_verified else "SHA-256 only"
         logger.info("tirith installed to %s (%s)", dest, verification)
@@ -568,30 +719,30 @@ def _is_explicit_path(configured_path: str) -> bool:
     return configured_path != "tirith"
 
 
-def _resolve_tirith_path(configured_path: str) -> str:
-    """Resolve the tirith binary path, auto-installing if necessary.
+def _canonical_binary_path(path: str) -> str:
+    """Freeze a successful relative resolution against later cwd changes."""
+    return os.path.abspath(os.path.expanduser(path))
 
-    If the user explicitly set a path (anything other than the bare "tirith"
-    default), that path is authoritative — we never fall through to
-    auto-download a different binary.
 
-    For the default "tirith":
-    1. PATH lookup via shutil.which
-    2. $HERMES_HOME/bin/tirith (previously auto-installed)
-    3. Auto-install from GitHub releases → $HERMES_HOME/bin/tirith
+def _resolve_tirith_path(configured_path: str) -> str | None:
+    """Resolve a currently usable Tirith path, auto-installing if necessary.
 
-    Failed installs are cached for the process lifetime (and persisted to
-    disk for 24h) to avoid repeated network attempts.
+    Every successful resolution is cached as an absolute path and revalidated on
+    every call. Missing, rejected, failed, and install-in-progress states return
+    None so the caller applies fail-open/fail-closed without spawning a known-bad
+    PATH artifact or incrementing the crash circuit.
     """
     global _resolved_path, _install_failure_reason
 
-    # Fast path: successfully resolved on a previous call. Resolved paths must
-    # remain native for this host, including relative explicit paths such as
-    # ./tirith. The bare "tirith" value is retained for callers that deliberately
-    # let subprocess PATH resolution occur.
     if isinstance(_resolved_path, str):
-        if _resolved_path == "tirith" or _is_usable_tirith_binary(_resolved_path):
+        # The exact bare default exists only for legacy/test callers. Production
+        # resolutions below are always canonical absolute paths.
+        if _resolved_path == "tirith":
             return _resolved_path
+        cached = _canonical_binary_path(_resolved_path)
+        if _is_usable_tirith_binary(cached):
+            _resolved_path = cached
+            return cached
         _resolved_path = None
         _install_failure_reason = "cached_binary_incompatible"
 
@@ -599,87 +750,81 @@ def _resolve_tirith_path(configured_path: str) -> str:
     explicit = _is_explicit_path(configured_path)
     install_failed = _resolved_path is _INSTALL_FAILED
 
-    # Platform has no tirith build (Windows etc.). Cache the verdict and
-    # return the unexpanded configured path — the spawn loop will fail-open
-    # via the dedupe'd OSError handler, but only after the first call; on
-    # subsequent calls the fast-path above short-circuits before spawning.
     if not explicit and not is_platform_supported():
         _resolved_path = _INSTALL_FAILED
         _install_failure_reason = "unsupported_platform"
-        return expanded
+        return None
 
-    # Explicit path: check it and stop. Never auto-download a replacement.
     if explicit:
-        if _is_usable_tirith_binary(expanded):
-            _resolved_path = expanded
-            return expanded
-        # Also try shutil.which in case it's a bare name on PATH
+        candidate = _canonical_binary_path(expanded)
+        if _is_usable_tirith_binary(candidate):
+            _resolved_path = candidate
+            _install_failure_reason = ""
+            return candidate
         found = shutil.which(expanded)
+        if found:
+            found = _canonical_binary_path(found)
         if found and _is_usable_tirith_binary(found):
             _resolved_path = found
+            _install_failure_reason = ""
             return found
-        logger.warning("Configured tirith path %r is missing or incompatible; scanning disabled", configured_path)
+        logger.warning(
+            "Configured tirith path %r is missing or incompatible; scanning disabled",
+            configured_path,
+        )
         _resolved_path = _INSTALL_FAILED
         _install_failure_reason = "explicit_path_unusable"
-        return expanded
+        return None
 
-    # Default "tirith" — always re-run cheap local checks so a manual
-    # install is picked up even after a previous network failure (P2 fix:
-    # long-lived gateway/CLI recovers without restart).
+    # Always re-run cheap local checks so a corrected manual install is picked up
+    # even after a previous network failure.
     found = shutil.which("tirith")
+    if found:
+        found = _canonical_binary_path(found)
     if found and _is_usable_tirith_binary(found):
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
         return found
 
-    hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
+    hermes_bin = _canonical_binary_path(os.path.join(_hermes_bin_dir(), "tirith"))
     if _is_usable_tirith_binary(hermes_bin):
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
         return hermes_bin
 
-    # Local checks failed.  If a previous install attempt already failed,
-    # skip the network retry — UNLESS the failure was "cosign_missing" and
-    # cosign is now available (retryable cause resolved in-process).
     if install_failed:
         if _install_failure_reason == "cosign_missing" and shutil.which("cosign"):
-            # Retryable cause resolved — clear sentinel and fall through to retry
             _resolved_path = None
             _install_failure_reason = ""
             _clear_install_failed()
             install_failed = False
         else:
-            return expanded
+            return None
 
-    # If a background install thread is running, don't start a parallel one —
-    # return the configured path; the OSError handler in check_command_security
-    # will apply fail_open until the thread finishes.
     if _install_thread is not None and _install_thread.is_alive():
-        return expanded
+        return None
 
-    # Check disk failure marker before attempting network download.
-    # Preserve the marker's real reason so in-memory retry logic can
-    # detect retryable causes (e.g. cosign_missing) without restart.
     disk_reason = _read_failure_reason()
     if disk_reason is not None and _is_install_failed_on_disk():
         _resolved_path = _INSTALL_FAILED
         _install_failure_reason = disk_reason
-        return expanded
+        return None
 
     installed, reason = _install_tirith()
     if installed:
+        installed = _canonical_binary_path(installed)
         _resolved_path = installed
         _install_failure_reason = ""
         _clear_install_failed()
+        _reset_tirith_circuit()
         return installed
 
-    # Install failed — cache the miss and persist reason to disk
     _resolved_path = _INSTALL_FAILED
     _install_failure_reason = reason
     _mark_install_failed(reason)
-    return expanded
+    return None
 
 
 def _background_install(*, log_failures: bool = True):
@@ -692,22 +837,27 @@ def _background_install(*, log_failures: bool = True):
 
         # Re-check local paths (may have been installed by another process)
         found = shutil.which("tirith")
+        if found:
+            found = _canonical_binary_path(found)
         if found and _is_usable_tirith_binary(found):
             _resolved_path = found
             _install_failure_reason = ""
+            _reset_tirith_circuit()
             return
 
-        hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
+        hermes_bin = _canonical_binary_path(os.path.join(_hermes_bin_dir(), "tirith"))
         if _is_usable_tirith_binary(hermes_bin):
             _resolved_path = hermes_bin
             _install_failure_reason = ""
+            _reset_tirith_circuit()
             return
 
         installed, reason = _install_tirith(log_failures=log_failures)
         if installed:
-            _resolved_path = installed
+            _resolved_path = _canonical_binary_path(installed)
             _install_failure_reason = ""
             _clear_install_failed()
+            _reset_tirith_circuit()
         else:
             _resolved_path = _INSTALL_FAILED
             _install_failure_reason = reason
@@ -730,7 +880,11 @@ def ensure_installed(*, log_failures: bool = True):
     # Already resolved from a previous call
     if isinstance(_resolved_path, str):
         path = _resolved_path
-        if path == "tirith" or _is_usable_tirith_binary(path):
+        if path == "tirith":
+            return path
+        path = _canonical_binary_path(path)
+        if _is_usable_tirith_binary(path):
+            _resolved_path = path
             return path
         _resolved_path = None
         _install_failure_reason = "cached_binary_incompatible"
@@ -749,12 +903,17 @@ def ensure_installed(*, log_failures: bool = True):
 
     # Explicit path: synchronous check only, no download
     if explicit:
-        if _is_usable_tirith_binary(expanded):
-            _resolved_path = expanded
-            return expanded
+        candidate = _canonical_binary_path(expanded)
+        if _is_usable_tirith_binary(candidate):
+            _resolved_path = candidate
+            _reset_tirith_circuit()
+            return candidate
         found = shutil.which(expanded)
+        if found:
+            found = _canonical_binary_path(found)
         if found and _is_usable_tirith_binary(found):
             _resolved_path = found
+            _reset_tirith_circuit()
             return found
         _resolved_path = _INSTALL_FAILED
         _install_failure_reason = "explicit_path_unusable"
@@ -762,17 +921,21 @@ def ensure_installed(*, log_failures: bool = True):
 
     # Default "tirith" — quick local checks first (no network)
     found = shutil.which("tirith")
+    if found:
+        found = _canonical_binary_path(found)
     if found and _is_usable_tirith_binary(found):
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
+        _reset_tirith_circuit()
         return found
 
-    hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
+    hermes_bin = _canonical_binary_path(os.path.join(_hermes_bin_dir(), "tirith"))
     if _is_usable_tirith_binary(hermes_bin):
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
+        _reset_tirith_circuit()
         return hermes_bin
 
     # If previously failed in-memory, check if the cause is now resolved
@@ -830,13 +993,21 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
+    fail_open = cfg["tirith_fail_open"]
+
     # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row,
     # stop trying for the rest of the process.  Without this, a corrupted
     # or missing binary causes every tool call to hit the same spawn failure
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
     # (issue #41400).
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        action = "allow" if fail_open else "block"
+        suffix = "" if fail_open else " (fail-closed)"
+        return {
+            "action": action,
+            "findings": [],
+            "summary": f"tirith disabled (circuit breaker){suffix}",
+        }
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.
@@ -846,7 +1017,6 @@ def check_command_security(command: str) -> dict:
 
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
-    fail_open = cfg["tirith_fail_open"]
 
     if tirith_path is None:
         _warn_once(
