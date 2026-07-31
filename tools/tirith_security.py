@@ -490,6 +490,12 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _effective_uid() -> int | None:
+    """Return the effective uid where POSIX ownership checks are available."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter is not None else None
+
+
 def _open_secure_install_dir(path: str) -> int:
     """Open and bind the managed bin directory after security validation."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -500,7 +506,8 @@ def _open_secure_install_dir(path: str) -> int:
         named = os.stat(path, follow_symlinks=False)
         if not stat.S_ISDIR(bound.st_mode) or not _same_inode(bound, named):
             raise OSError(errno.EPERM, "managed bin path is not a stable directory", path)
-        if bound.st_uid != os.geteuid():
+        owner = _effective_uid()
+        if owner is None or bound.st_uid != owner:
             raise OSError(errno.EPERM, "managed bin directory is not owned by current user", path)
         if stat.S_IMODE(bound.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
             raise OSError(errno.EPERM, "managed bin directory is group/world-writable", path)
@@ -549,7 +556,8 @@ def _verify_managed_binary_fd(fd: int, target: str, digest: bytes) -> bool:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         return False
-    if info.st_uid != os.geteuid() or info.st_nlink != 1:
+    owner = _effective_uid()
+    if owner is None or info.st_uid != owner or info.st_nlink != 1:
         return False
     if stat.S_IMODE(info.st_mode) != _MANAGED_BINARY_MODE:
         return False
