@@ -280,6 +280,74 @@ def is_platform_supported() -> bool:
     return _detect_target() is not None
 
 
+def _binary_target(path: str) -> str | None:
+    """Identify the supported release target encoded in a native binary header.
+
+    Hermes downloads target-specific tirith archives, so accepting an executable
+    bit alone is not enough: a copied macOS/arm64 binary is executable according
+    to ``os.access`` on Linux but fails later with ``ENOEXEC``. Parse the small
+    stable portion of ELF64 and Mach-O 64-bit headers directly instead of relying
+    on the optional external ``file`` command.
+    """
+    try:
+        with open(path, "rb") as binary:
+            header = binary.read(20)
+    except OSError:
+        return None
+
+    # ELF64, little-endian. e_machine is a 16-bit field at bytes 18..20.
+    if len(header) >= 20 and header[:4] == b"\x7fELF":
+        if header[4] != 2 or header[5] != 1:
+            return None
+        machine = int.from_bytes(header[18:20], "little")
+        if machine == 0x3E:
+            return "x86_64-unknown-linux-gnu"
+        if machine == 0xB7:
+            return "aarch64-unknown-linux-gnu"
+        return None
+
+    # Thin little-endian Mach-O 64-bit. cputype is bytes 4..8.
+    if len(header) >= 8 and header[:4] == b"\xcf\xfa\xed\xfe":
+        cpu_type = int.from_bytes(header[4:8], "little")
+        if cpu_type == 0x01000007:
+            return "x86_64-apple-darwin"
+        if cpu_type == 0x0100000C:
+            return "aarch64-apple-darwin"
+
+    return None
+
+
+def _is_compatible_tirith_binary(path: str, target: str | None = None) -> bool:
+    """Return whether ``path`` is a native tirith artifact for ``target``."""
+    expected = target or _detect_target()
+    if expected is None:
+        return False
+    actual = _binary_target(path)
+    if actual == expected:
+        return True
+    _warn_once(
+        f"tirith_incompatible_binary:{os.path.abspath(path)}:{actual}:{expected}",
+        "Ignoring incompatible tirith binary at %s (found %s, expected %s)",
+        path,
+        actual or "unknown format",
+        expected,
+    )
+    return False
+
+
+def _is_usable_tirith_binary(path: str, target: str | None = None) -> bool:
+    """Require a regular executable with the current platform's native format."""
+    if not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return False
+    expected = target or _detect_target()
+    # Preserve explicit-path support on platforms for which Hermes has no
+    # downloadable release. The user may provide a locally built executable,
+    # and there is no supported target header against which to compare it.
+    if expected is None:
+        return True
+    return _is_compatible_tirith_binary(path, expected)
+
+
 def _download_file(url: str, dest: str, timeout: int = 10):
     """Download a URL to a local file."""
     req = urllib.request.Request(url)
@@ -458,6 +526,13 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
             if src is None:
                 return None, reason
 
+        # The checksum authenticates archive bytes, but it cannot prove that
+        # release asset selection matched this host. Refuse to publish a
+        # cross-platform/cross-architecture binary into HERMES_HOME/bin.
+        if not _is_compatible_tirith_binary(src, target):
+            log("tirith release binary is incompatible with target %s", target)
+            return None, "binary_target_mismatch"
+
         dest = os.path.join(_hermes_bin_dir(), "tirith")
         try:
             shutil.move(src, dest)
@@ -474,7 +549,11 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
                 except OSError:
                     pass
                 return None, "cross_device_copy_failed"
-        os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        # This is a Hermes-managed executable, not a user-authored file whose
+        # ambient umask-derived write bits should be preserved. Pin 0755 so a
+        # permissive umask cannot leave the security scanner group-writable.
+        os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
+                 stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
         verification = "cosign + SHA-256" if cosign_verified else "SHA-256 only"
         logger.info("tirith installed to %s (%s)", dest, verification)
@@ -506,9 +585,15 @@ def _resolve_tirith_path(configured_path: str) -> str:
     """
     global _resolved_path, _install_failure_reason
 
-    # Fast path: successfully resolved on a previous call.
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
-        return _resolved_path
+    # Fast path: successfully resolved on a previous call. Resolved paths must
+    # remain native for this host, including relative explicit paths such as
+    # ./tirith. The bare "tirith" value is retained for callers that deliberately
+    # let subprocess PATH resolution occur.
+    if isinstance(_resolved_path, str):
+        if _resolved_path == "tirith" or _is_usable_tirith_binary(_resolved_path):
+            return _resolved_path
+        _resolved_path = None
+        _install_failure_reason = "cached_binary_incompatible"
 
     expanded = os.path.expanduser(configured_path)
     explicit = _is_explicit_path(configured_path)
@@ -525,31 +610,31 @@ def _resolve_tirith_path(configured_path: str) -> str:
 
     # Explicit path: check it and stop. Never auto-download a replacement.
     if explicit:
-        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+        if _is_usable_tirith_binary(expanded):
             _resolved_path = expanded
             return expanded
         # Also try shutil.which in case it's a bare name on PATH
         found = shutil.which(expanded)
-        if found:
+        if found and _is_usable_tirith_binary(found):
             _resolved_path = found
             return found
-        logger.warning("Configured tirith path %r not found; scanning disabled", configured_path)
+        logger.warning("Configured tirith path %r is missing or incompatible; scanning disabled", configured_path)
         _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "explicit_path_missing"
+        _install_failure_reason = "explicit_path_unusable"
         return expanded
 
     # Default "tirith" — always re-run cheap local checks so a manual
     # install is picked up even after a previous network failure (P2 fix:
     # long-lived gateway/CLI recovers without restart).
     found = shutil.which("tirith")
-    if found:
+    if found and _is_usable_tirith_binary(found):
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
         return found
 
     hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-    if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+    if _is_usable_tirith_binary(hermes_bin):
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
@@ -607,13 +692,13 @@ def _background_install(*, log_failures: bool = True):
 
         # Re-check local paths (may have been installed by another process)
         found = shutil.which("tirith")
-        if found:
+        if found and _is_usable_tirith_binary(found):
             _resolved_path = found
             _install_failure_reason = ""
             return
 
         hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-        if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+        if _is_usable_tirith_binary(hermes_bin):
             _resolved_path = hermes_bin
             _install_failure_reason = ""
             return
@@ -643,11 +728,12 @@ def ensure_installed(*, log_failures: bool = True):
         return None
 
     # Already resolved from a previous call
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
+    if isinstance(_resolved_path, str):
         path = _resolved_path
-        if os.path.isfile(path) and os.access(path, os.X_OK):
+        if path == "tirith" or _is_usable_tirith_binary(path):
             return path
-        return None
+        _resolved_path = None
+        _install_failure_reason = "cached_binary_incompatible"
 
     # Platform has no tirith build (e.g. Windows) — don't probe PATH,
     # don't start a download thread, don't write a disk failure marker.
@@ -663,27 +749,27 @@ def ensure_installed(*, log_failures: bool = True):
 
     # Explicit path: synchronous check only, no download
     if explicit:
-        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+        if _is_usable_tirith_binary(expanded):
             _resolved_path = expanded
             return expanded
         found = shutil.which(expanded)
-        if found:
+        if found and _is_usable_tirith_binary(found):
             _resolved_path = found
             return found
         _resolved_path = _INSTALL_FAILED
-        _install_failure_reason = "explicit_path_missing"
+        _install_failure_reason = "explicit_path_unusable"
         return None
 
     # Default "tirith" — quick local checks first (no network)
     found = shutil.which("tirith")
-    if found:
+    if found and _is_usable_tirith_binary(found):
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
         return found
 
     hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-    if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+    if _is_usable_tirith_binary(hermes_bin):
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
