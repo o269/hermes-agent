@@ -89,6 +89,27 @@ def test_no_idempotency_key_never_collides(kanban_home):
         conn.close()
 
 
+def test_explicit_todo_initial_status_never_becomes_dispatchable(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="already complete")
+        assert kb.complete_task(conn, parent)
+        task_id = kb.create_task(
+            conn,
+            title="validated external intake",
+            assignee="orchestrator",
+            parents=[parent],
+            initial_status="todo",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert task.started_at is None
+        assert task.current_run_id is None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
@@ -833,6 +854,17 @@ def test_cli_create_with_idempotency_key(kanban_home):
     out2 = run_slash("create 'y' --idempotency-key abc --json")
     tid2 = json.loads(out2)["id"]
     assert tid1 == tid2
+
+
+def test_cli_create_todo_readback_includes_idempotency_key(kanban_home):
+    payload = json.loads(
+        run_slash(
+            "create 'owner intake' --assignee orchestrator "
+            "--initial-status todo --idempotency-key buzz-intake-v1 --json"
+        )
+    )
+    assert payload["status"] == "todo"
+    assert payload["idempotency_key"] == "buzz-intake-v1"
 
 
 # ---------------------------------------------------------------------------
