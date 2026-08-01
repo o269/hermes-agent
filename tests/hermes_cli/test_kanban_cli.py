@@ -315,7 +315,23 @@ def test_run_slash_dispatch_logs_active_pr_identity_and_expiry(
         detail={
             "pr_url": "https://github.com/o269/hermes-agent/pull/8",
             "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
         },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_recent",
+        "recent_success",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
         phase="ready",
     )
     monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
@@ -325,7 +341,13 @@ def test_run_slash_dispatch_logs_active_pr_identity_and_expiry(
     assert (
         "SKIP t_owned respawn_guarded=active_pr "
         "pr=https://github.com/o269/hermes-agent/pull/8 "
-        "expires=1785660000 phase=ready"
+        "expires=1785660000 "
+        "pr=https://github.com/o269/hermes-agent/pull/9 "
+        "expires=1785660300 phase=ready"
+    ) in out
+    assert (
+        "SKIP t_recent respawn_guarded=recent_success "
+        "expires=1785660600 phase=ready"
     ) in out
 
 
@@ -339,7 +361,23 @@ def test_run_slash_dispatch_json_includes_respawn_guard_diagnostics(
         detail={
             "pr_url": "https://github.com/o269/hermes-agent/pull/8",
             "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
         },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_rate",
+        "rate_limit_cooldown",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
         phase="ready",
     )
     monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
@@ -350,11 +388,64 @@ def test_run_slash_dispatch_json_includes_respawn_guard_diagnostics(
         {
             "pr_url": "https://github.com/o269/hermes-agent/pull/8",
             "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
             "task_id": "t_owned",
             "reason": "active_pr",
             "phase": "ready",
-        }
+        },
+        {
+            "expires_at": 1785660600,
+            "window_seconds": 600,
+            "task_id": "t_rate",
+            "reason": "rate_limit_cooldown",
+            "phase": "ready",
+        },
     ]
+
+
+def test_legacy_daemon_tick_uses_shared_respawn_diagnostics(
+    kanban_home, monkeypatch, capsys
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_rate",
+        "rate_limit_cooldown",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
+        phase="ready",
+    )
+
+    def run_one_tick(**kwargs):
+        kwargs["on_tick"](result)
+
+    monkeypatch.setattr(kb, "run_daemon", run_one_tick)
+    monkeypatch.setattr(kb, "has_spawnable_ready", lambda _conn: False)
+
+    rc = kc._cmd_daemon(
+        argparse.Namespace(
+            force=True,
+            pidfile=None,
+            verbose=False,
+            interval=1,
+            max=1,
+            failure_limit=2,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (
+        "SKIP t_rate respawn_guarded=rate_limit_cooldown "
+        "expires=1785660600 phase=ready"
+    ) in captured.out
 
 
 def test_run_slash_context_output_format(kanban_home):

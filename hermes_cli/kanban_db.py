@@ -8368,10 +8368,25 @@ class DispatchResult:
                 f"SKIP {detail['task_id']}",
                 f"respawn_guarded={detail['reason']}",
             ]
-            if detail.get("pr_url"):
-                fields.append(f"pr={detail['pr_url']}")
-            if detail.get("expires_at") is not None:
-                fields.append(f"expires={detail['expires_at']}")
+            pr_details = detail.get("pr_details")
+            rendered_pr_detail = False
+            if isinstance(pr_details, Sequence) and not isinstance(
+                pr_details, (str, bytes)
+            ):
+                for pr_detail in pr_details:
+                    if not isinstance(pr_detail, Mapping) or not pr_detail.get(
+                        "pr_url"
+                    ):
+                        continue
+                    fields.append(f"pr={pr_detail['pr_url']}")
+                    if pr_detail.get("expires_at") is not None:
+                        fields.append(f"expires={pr_detail['expires_at']}")
+                    rendered_pr_detail = True
+            if not rendered_pr_detail:
+                if detail.get("pr_url"):
+                    fields.append(f"pr={detail['pr_url']}")
+                if detail.get("expires_at") is not None:
+                    fields.append(f"expires={detail['expires_at']}")
             if detail.get("phase"):
                 fields.append(f"phase={detail['phase']}")
             if detail.get("continuation_denial"):
@@ -10871,20 +10886,29 @@ def _active_pr_guard_detail(
     and when the window lapses — the four facts an operator needs to tell a
     real active-PR hold apart from a stale one without reading the DB.
     """
-    last_seen = max(
-        (
-            int(record.get("last_seen_at") or 0)
-            for record in owned
-            if record.get("last_seen_at") is not None
-        ),
-        default=0,
-    )
+    pr_details: list[dict[str, Any]] = []
+    for record in owned:
+        last_seen = int(record.get("last_seen_at") or 0)
+        expires_at = record.get("expires_at")
+        if expires_at is None and last_seen:
+            expires_at = last_seen + _RESPAWN_GUARD_PR_WINDOW
+        pr_details.append(
+            {
+                "pr_url": str(record["canonical_url"]),
+                "ownership": str(record.get("ownership") or "referenced"),
+                "source_comment_id": record.get("source_comment_id"),
+                "last_seen_at": last_seen or None,
+                "expires_at": int(expires_at) if expires_at is not None else None,
+            }
+        )
+    primary = pr_details[0] if pr_details else None
     detail: dict[str, Any] = {
-        "pr_url": str(owned[0]["canonical_url"]) if owned else None,
-        "pr_urls": [str(record["canonical_url"]) for record in owned],
-        "ownership": str(owned[0].get("ownership") or "referenced") if owned else None,
-        "source_comment_id": owned[0].get("source_comment_id") if owned else None,
-        "expires_at": (last_seen + _RESPAWN_GUARD_PR_WINDOW) if last_seen else None,
+        "pr_url": primary["pr_url"] if primary else None,
+        "pr_urls": [record["pr_url"] for record in pr_details],
+        "pr_details": pr_details,
+        "ownership": primary["ownership"] if primary else None,
+        "source_comment_id": primary["source_comment_id"] if primary else None,
+        "expires_at": primary["expires_at"] if primary else None,
         "window_seconds": _RESPAWN_GUARD_PR_WINDOW,
     }
     if disowned:
@@ -10979,7 +11003,13 @@ def evaluate_respawn_guard(
             and ended_at is not None
             and (now - int(ended_at)) < rl_cooldown
         ):
-            return RespawnGuardDecision(reason="rate_limit_cooldown")
+            return RespawnGuardDecision(
+                reason="rate_limit_cooldown",
+                detail={
+                    "expires_at": int(ended_at) + rl_cooldown,
+                    "window_seconds": rl_cooldown,
+                },
+            )
         # Cooldown disabled/elapsed: preserve the pre-continuation cheap-probe
         # contract. Rate-limited workers intentionally retry forever, including
         # when they already opened a PR, until quota returns or a newer outcome
@@ -11009,7 +11039,13 @@ def evaluate_respawn_guard(
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return RespawnGuardDecision(reason="recent_success")
+            return RespawnGuardDecision(
+                reason="recent_success",
+                detail={
+                    "expires_at": completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW,
+                    "window_seconds": _RESPAWN_GUARD_SUCCESS_WINDOW,
+                },
+            )
 
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
@@ -11038,8 +11074,6 @@ def evaluate_respawn_guard(
         authorization,
         now=now,
     )
-    if decision.reason is None:
-        return decision
     return replace(decision, detail=detail)
 
 
@@ -11531,6 +11565,7 @@ def _dispatch_once_locked(
                 ),
                 continuation_denial=exc.code,
                 detail={
+                    **(guard_decision.detail or {}),
                     "continuation_denial": exc.code,
                     "continuation_authorization_id": (
                         guard_decision.continuation_authorization_id

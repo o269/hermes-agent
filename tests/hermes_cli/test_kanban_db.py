@@ -1049,7 +1049,12 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
         # Inside cooldown → defer with the rate-limit-specific reason.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
-        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        decision = kb.evaluate_respawn_guard(conn, tid)
+        assert decision.reason == "rate_limit_cooldown"
+        assert decision.detail == {
+            "expires_at": now + 300,
+            "window_seconds": 300,
+        }
 
         # Past cooldown → allowed (None), NOT trapped by blocker_auth even
         # though last_failure_error contains "rate-limited".
@@ -1961,8 +1966,12 @@ def test_respawn_guard_recent_success(kanban_home):
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, now - 120, now - 60),
         )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason == "recent_success"
+        decision = kb.evaluate_respawn_guard(conn, t)
+    assert decision.reason == "recent_success"
+    assert decision.detail == {
+        "expires_at": now - 60 + kb._RESPAWN_GUARD_SUCCESS_WINDOW,
+        "window_seconds": kb._RESPAWN_GUARD_SUCCESS_WINDOW,
+    }
 
 
 def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
@@ -2378,6 +2387,82 @@ def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):
     assert payload["window_seconds"] == kb._RESPAWN_GUARD_PR_WINDOW
 
 
+def test_active_pr_diagnostics_keep_each_pr_paired_with_its_own_expiry(
+    kanban_home, monkeypatch
+):
+    """Unequal PR leases must never render one PR beside another PR's expiry."""
+    pr_a = "https://github.com/o269/hermes-agent/pull/20"
+    pr_b = "https://github.com/o269/hermes-agent/pull/21"
+    seen_a = 10_000_000
+    seen_b = seen_a + 100
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="two active PRs", assignee="worker")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_a)
+        comment_a = kb.add_comment(conn, task_id, "worker", f"Opened {pr_a}")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_b)
+        comment_b = kb.add_comment(conn, task_id, "worker", f"Opened {pr_b}")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_b + 1)
+
+        decision = kb.evaluate_respawn_guard(conn, task_id)
+
+    assert decision.reason == "active_pr"
+    assert decision.detail is not None
+    assert decision.detail["pr_url"] == pr_a
+    assert decision.detail["expires_at"] == (
+        seen_a + kb._RESPAWN_GUARD_PR_WINDOW
+    )
+    assert decision.detail["pr_details"] == [
+        {
+            "pr_url": pr_a,
+            "ownership": "declared",
+            "source_comment_id": comment_a,
+            "last_seen_at": seen_a,
+            "expires_at": seen_a + kb._RESPAWN_GUARD_PR_WINDOW,
+        },
+        {
+            "pr_url": pr_b,
+            "ownership": "declared",
+            "source_comment_id": comment_b,
+            "last_seen_at": seen_b,
+            "expires_at": seen_b + kb._RESPAWN_GUARD_PR_WINDOW,
+        },
+    ]
+
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        task_id,
+        "active_pr",
+        detail=decision.detail,
+        phase="ready",
+    )
+    assert result.respawn_guard_log_lines() == [
+        f"SKIP {task_id} respawn_guarded=active_pr "
+        f"pr={pr_a} expires={seen_a + kb._RESPAWN_GUARD_PR_WINDOW} "
+        f"pr={pr_b} expires={seen_b + kb._RESPAWN_GUARD_PR_WINDOW} phase=ready"
+    ]
+
+
+def test_respawn_guard_log_corrupt_per_pr_payload_falls_back_to_legacy_fields():
+    """A malformed optional per-PR payload cannot erase known diagnostics."""
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": _OWN_PR,
+            "expires_at": 1785660000,
+            "pr_details": [None, "corrupt", {"expires_at": 1785660300}],
+        },
+        phase="ready",
+    )
+
+    assert result.respawn_guard_log_lines() == [
+        "SKIP t_owned respawn_guarded=active_pr "
+        f"pr={_OWN_PR} expires=1785660000 phase=ready"
+    ]
+
+
 def test_disowned_pr_mention_is_audited_not_silent(kanban_home):
     """Letting a citation through is recorded too — silence hid the old bug."""
     with kb.connect() as conn:
@@ -2534,6 +2619,39 @@ def test_dispatch_never_supersedes_its_evaluated_authorization(
             "phase": "claim_race",
             "reason": "authorization_revoked",
         }
+
+
+def test_dispatch_claim_exception_preserves_active_pr_identity_and_expiry(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A claim-time authorization race retains the evaluated PR diagnosis."""
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    canonical_url = kb.parse_continuation_pr_tuple(pr_tuple).canonical_url
+
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+
+        def expire_before_claim(_connection, _task_id, **_kwargs):
+            raise kb.ContinuationAuthorizationError("authorization_expired")
+
+        monkeypatch.setattr(kb, "claim_task", expire_before_claim)
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: None)
+
+    assert result.spawned == []
+    assert result.respawn_guarded == [(task_id, "active_pr")]
+    diagnostic = result.respawn_guard_details[-1]
+    assert diagnostic["pr_url"] == canonical_url
+    assert diagnostic["pr_details"][0]["pr_url"] == canonical_url
+    assert diagnostic["pr_details"][0]["expires_at"] is not None
+    assert diagnostic["continuation_authorization_id"] == authorization.id
+    assert diagnostic["continuation_denial"] == "authorization_expired"
+    assert diagnostic["phase"] == "claim_exception"
+    rendered = result.respawn_guard_log_lines()[0]
+    assert f"pr={canonical_url}" in rendered
+    assert "expires=" in rendered
+    assert "phase=claim_exception" in rendered
+    assert "denial=authorization_expired" in rendered
 
 
 def test_post_claim_guard_audits_consumed_continuation_without_spawn(

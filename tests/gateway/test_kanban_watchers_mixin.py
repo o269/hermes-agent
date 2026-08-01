@@ -57,7 +57,23 @@ def test_embedded_dispatcher_logs_guard_reason_pr_and_expiry(caplog):
         detail={
             "pr_url": "https://github.com/o269/hermes-agent/pull/8",
             "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
         },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_recent",
+        "recent_success",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
         phase="ready",
     )
 
@@ -67,7 +83,13 @@ def test_embedded_dispatcher_logs_guard_reason_pr_and_expiry(caplog):
     assert (
         "kanban dispatcher [fleet]: SKIP t_owned respawn_guarded=active_pr "
         "pr=https://github.com/o269/hermes-agent/pull/8 "
-        "expires=1785660000 phase=ready"
+        "expires=1785660000 "
+        "pr=https://github.com/o269/hermes-agent/pull/9 "
+        "expires=1785660300 phase=ready"
+    ) in caplog.messages
+    assert (
+        "kanban dispatcher [fleet]: SKIP t_recent "
+        "respawn_guarded=recent_success expires=1785660600 phase=ready"
     ) in caplog.messages
 
 
