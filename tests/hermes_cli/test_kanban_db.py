@@ -2056,7 +2056,9 @@ def _requeue_after_completed_work_product(
         )
 
 
-def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
+def test_dispatch_respawns_card_with_cross_repo_pr_cite_owned_by_another_card(
+    kanban_home, all_assignees_spawnable
+):
     """The live repro: a companion PR quoted in a comment must not freeze us.
 
     ``t_45e612bd`` (engine work) sat Ready for hours because an unrelated
@@ -2075,7 +2077,18 @@ def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
             "card's bounded resolver; please coordinate land order.",
         )
 
-        assert kb.check_respawn_guard(conn, cited) is None
+        decision = kb.evaluate_respawn_guard(conn, cited)
+        assert decision.reason is None
+        assert decision.detail is not None
+        assert decision.detail["ignored_pr_urls"] == [
+            {"pr_url": _COMPANION_PR, "declared_by": owner}
+        ]
+
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        assert cited in {
+            task_id for task_id, _assignee, _workspace in dispatch.spawned
+        }
+        assert (cited, "active_pr") not in dispatch.respawn_guarded
         # Custody is not laundered away — the PR is still attributed to the
         # card whose own work product opened it, and only to that card.
         declared_by = [
@@ -2089,7 +2102,9 @@ def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
         assert declared_by == [owner]
 
 
-def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
+def test_dispatch_suppresses_self_authored_active_pr_custody(
+    kanban_home, all_assignees_spawnable
+):
     """The card's OWN worker announcing its own PR is custody, not a citation.
 
     This is the over-freeing case, and it is the common one. Replayed against
@@ -2112,6 +2127,11 @@ def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
         )
 
         assert kb.check_respawn_guard(conn, author_card) == "active_pr"
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        assert (author_card, "active_pr") in dispatch.respawn_guarded
+        assert author_card not in {
+            task_id for task_id, _assignee, _workspace in dispatch.spawned
+        }
         # Both cards legitimately hold the PR; neither disowns the other.
         _requeue_after_completed_work_product(conn, reviewer)
         assert kb.check_respawn_guard(conn, reviewer) == "active_pr"
