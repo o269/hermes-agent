@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -78,6 +79,63 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_orchestration_api_uses_dispatcher_profile_resolution(client, monkeypatch):
+    from hermes_cli import config as config_mod
+    from hermes_cli import kanban_decompose as decomp
+
+    cfg = {
+        "kanban": {
+            "orchestrator_profile": "retired-lane",
+            "default_assignee": "retired-lane",
+        }
+    }
+    profiles = [
+        SimpleNamespace(
+            name="default",
+            description="implicit root",
+            provider=None,
+            model=None,
+        ),
+        SimpleNamespace(
+            name="engineer",
+            description="live lane",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+        ),
+    ]
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(decomp.profiles_mod, "list_profiles", lambda: profiles)
+    monkeypatch.setattr(
+        decomp.profiles_mod,
+        "get_active_profile_name",
+        lambda: "default",
+    )
+    monkeypatch.setattr(decomp, "_fleet_named_lanes_only", lambda: True)
+
+    expected = decomp.resolve_orchestration_profiles(cfg)
+    response = client.get("/api/plugins/kanban/orchestration")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["resolved_orchestrator_profile"] == (
+        expected.orchestrator_profile or ""
+    )
+    assert payload["resolved_default_assignee"] == (
+        expected.default_assignee or ""
+    )
+    assert payload["active_profile"] == (expected.active_profile or "")
+    assert payload["resolved_orchestrator_profile"] == ""
+    assert payload["resolved_default_assignee"] == ""
+    assert payload["active_profile"] == ""
+
+    rejected = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={"orchestrator_profile": "retired-lane"},
+    )
+    assert rejected.status_code == 400
+    assert "does not exist" in rejected.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

@@ -2325,31 +2325,27 @@ def get_orchestration_settings():
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
-    # Resolve fallbacks the same way the decomposer does.
-    resolved_orch = explicit_orch
-    resolved_default = explicit_default
+    # Resolve through the exact same live-profile authority used by the
+    # decomposer/dispatcher. This keeps fleet ``default`` handling and retired
+    # profile rejection identical across CLI, automatic dispatch, and dashboard.
     try:
-        from hermes_cli import profiles as profiles_mod
-        active_default = profiles_mod.get_active_profile_name() or "default"
-        if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
-            resolved_orch = active_default
-        if not resolved_default or not profiles_mod.profile_exists(resolved_default):
-            resolved_default = active_default
-    except Exception:
-        active_default = "default"
-        if not resolved_orch:
-            resolved_orch = active_default
-        if not resolved_default:
-            resolved_default = active_default
+        from hermes_cli import kanban_decompose
+
+        resolution = kanban_decompose.resolve_orchestration_profiles(cfg)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to resolve orchestration profiles: {exc}",
+        )
 
     return {
         "orchestrator_profile": explicit_orch,
         "default_assignee": explicit_default,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
-        "resolved_orchestrator_profile": resolved_orch,
-        "resolved_default_assignee": resolved_default,
-        "active_profile": active_default,
+        "resolved_orchestrator_profile": resolution.orchestrator_profile or "",
+        "resolved_default_assignee": resolution.default_assignee or "",
+        "active_profile": resolution.active_profile or "",
     }
 
 
@@ -2373,40 +2369,35 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
         kanban_section = {}
         cfg["kanban"] = kanban_section
 
-    # Validate any non-empty profile names exist before saving.
+    # Validate through the same current live-profile resolver as GET and the
+    # dispatcher. Historical runs and stale task assignees never authorize a
+    # new orchestration route.
     try:
-        from hermes_cli import profiles as profiles_mod
-    except Exception:
-        profiles_mod = None  # type: ignore
+        from hermes_cli import kanban_decompose
+
+        valid_names = kanban_decompose.resolve_orchestration_profiles(cfg).valid_names
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to resolve orchestration profiles: {exc}",
+        )
 
     if payload.orchestrator_profile is not None:
         name = (payload.orchestrator_profile or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass  # fail open if the lookup itself errors
+        if name and name not in valid_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"profile '{name}' does not exist",
+            )
         kanban_section["orchestrator_profile"] = name
 
     if payload.default_assignee is not None:
         name = (payload.default_assignee or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
+        if name and name not in valid_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"profile '{name}' does not exist",
+            )
         kanban_section["default_assignee"] = name
 
     if payload.auto_decompose is not None:

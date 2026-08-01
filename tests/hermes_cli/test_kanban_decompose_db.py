@@ -4,7 +4,6 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -173,21 +172,23 @@ def test_decompose_returns_none_for_control_plane_gate(kanban_home):
         assert root.assignee is None
 
 
-def test_comment_history_operator_hold_blocks_decomposition(kanban_home):
+def test_free_form_operator_prose_is_not_a_permanent_hold(kanban_home):
     with kb.connect() as conn:
-        tid = _create_triage(conn, title="PR19 infrastructure preflight")
+        tid = _create_triage(
+            conn,
+            title="PR19 infrastructure preflight",
+            body="The prior operator authority finding is closed; proceed normally.",
+        )
         kb.add_comment(
             conn,
             tid,
             "operator",
-            "Normalized unassigned/non-dispatchable pending operator authority.",
+            "The prior operator authority finding is closed; proceed normally.",
         )
-        reason = kb.decomposition_hold_reason(conn, tid)
-        assert reason is not None
-        assert "comment history" in reason
+        assert kb.decomposition_hold_reason(conn, tid) is None
 
 
-def test_operator_hold_survives_more_than_fifty_later_comments(kanban_home):
+def test_free_form_comment_history_is_not_scanned_for_holds(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="PR19 infrastructure preflight")
         kb.add_comment(
@@ -199,9 +200,7 @@ def test_operator_hold_survives_more_than_fifty_later_comments(kanban_home):
         for index in range(55):
             kb.add_comment(conn, tid, "worker", f"benign follow-up {index}")
 
-        reason = kb.decomposition_hold_reason(conn, tid)
-        assert reason is not None
-        assert "comment history" in reason
+        assert kb.decomposition_hold_reason(conn, tid) is None
 
 
 def test_ordinary_comment_wording_is_not_an_operator_ruling(kanban_home):
@@ -287,18 +286,37 @@ def test_append_task_gate_rejects_done_card(kanban_home):
             kb.append_task_gate(conn, tid, "FREEZE-GATE")
 
 
-def test_known_routable_profiles_requires_completed_run(kanban_home):
+def test_batched_triage_eligibility_uses_one_bounded_read(kanban_home):
     with kb.connect() as conn:
-        completed_id = kb.create_task(conn, title="remote success", assignee="remote-ok")
-        assert kb.claim_task(conn, completed_id) is not None
-        kb._set_worker_pid(conn, completed_id, os.getpid())
-        assert kb.complete_task(conn, completed_id)
+        eligible_id = _create_triage(conn, title="ordinary executable work")
+        gated_id = _create_triage(conn, title="release [OPERATOR-GATE]")
+        pr_id = _create_triage(conn, title="continue existing change", assignee="worker")
+        kb.add_comment(
+            conn,
+            pr_id,
+            "worker",
+            "Opened https://github.com/acme/widgets/pull/42 for this card.",
+        )
+        for index in range(25):
+            other_id = _create_triage(conn, title=f"ordinary {index}")
+            kb.add_comment(conn, other_id, "worker", f"benign comment {index}")
 
-        failed_id = kb.create_task(conn, title="remote crash", assignee="remote-bad")
-        assert kb.claim_task(conn, failed_id) is not None
-        assert kb.reclaim_task(conn, failed_id, reason="spawn failed")
+        class CountingConnection:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.execute_calls = 0
 
-        assert kb.known_routable_profiles(conn) == {"remote-ok"}
+            def execute(self, *args, **kwargs):
+                self.execute_calls += 1
+                return self.wrapped.execute(*args, **kwargs)
+
+        counted = CountingConnection(conn)
+        ids = kb.list_decomposition_eligible_triage_ids(counted)
+
+        assert counted.execute_calls == 1
+        assert eligible_id in ids
+        assert gated_id not in ids
+        assert pr_id not in ids
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):

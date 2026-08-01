@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -100,6 +101,24 @@ def test_roster_includes_profile_provider_and_model_defaults(kanban_home):
     assert "profile defaults: provider=p, model=m" in rendered
 
 
+def test_completed_run_for_retired_profile_does_not_grant_authority(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="historical run", assignee="retired-lane")
+        assert kb.claim_task(conn, tid) is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+        assert kb.complete_task(conn, tid)
+
+    with patch.object(decomp.profiles_mod, "list_profiles", return_value=[]), patch.object(
+        decomp,
+        "_fleet_named_lanes_only",
+        return_value=False,
+    ):
+        roster, valid_names = decomp._build_roster()
+
+    assert roster == []
+    assert valid_names == set()
+
+
 def test_json_response_wrapper_preserves_exact_values():
     payload = jsonlib.dumps(
         {"fanout": False, "body": "  keep exact whitespace and {braces}  "}
@@ -154,6 +173,48 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+
+
+def test_fanout_preserves_exact_metadata_body_bytes(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="preserve exact body", triage=True)
+
+    exact_body = '  {"metadata":{"artifact":{"bytes":17}}}  '
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {
+                    "title": "preserve metadata",
+                    "body": exact_body,
+                    "assignee": "engineer",
+                    "parents": [],
+                },
+                {
+                    "title": "verify metadata",
+                    "body": "verify",
+                    "assignee": "engineer",
+                    "parents": [0],
+                },
+            ],
+        }
+    )
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.body == exact_body
+    assert child.body.encode() == exact_body.encode()
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
@@ -236,7 +297,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
     assert tid not in decomp.list_triage_ids()
 
 
-def test_no_fanout_preserves_custody_added_while_llm_runs(kanban_home):
+def test_no_fanout_skips_when_custody_changes_while_llm_runs(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="race-sensitive root", triage=True)
 
@@ -276,16 +337,73 @@ def test_no_fanout_preserves_custody_added_while_llm_runs(kanban_home):
         for item in patches:
             item.stop()
 
-    assert outcome.ok, outcome.reason
+    assert outcome.ok is False
+    assert outcome.skipped is True
+    assert "assignee changed from None to 'fable'" in outcome.reason
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
     assert task is not None
     assert task.assignee == "fable"
     assert task.status == "triage"
-    assert task.title == "Tightened title"
-    assert any(event.kind == "decomposed" for event in events)
-    assert tid not in decomp.list_triage_ids()
+    assert task.title == "race-sensitive root"
+    assert task.body is None
+    assert not any(event.kind == "decomposed" for event in events)
+
+
+def test_fanout_skips_all_children_when_custody_changes_while_llm_runs(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="race-sensitive root", triage=True)
+
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {"title": "child A", "body": "A", "assignee": "engineer", "parents": []},
+                {"title": "child B", "body": "B", "assignee": "engineer", "parents": []},
+            ],
+        }
+    )
+
+    def assign_during_llm(*_args, **_kwargs):
+        with kb.connect() as conn, kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = 'fable' WHERE id = ?",
+                (tid,),
+            )
+        return _fake_aux_response(llm_payload)
+
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=assign_during_llm,
+        ):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert outcome.skipped is True
+    assert outcome.child_ids is None
+    assert "assignee changed from None to 'fable'" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id = ?",
+            (tid,),
+        ).fetchone()[0]
+    assert task is not None
+    assert task.assignee == "fable"
+    assert task.status == "triage"
+    assert child_count == 0
+    assert not any(event.kind == "decomposed" for event in events)
 
 
 def test_no_fanout_rechecks_gate_added_while_llm_runs(kanban_home):
@@ -413,6 +531,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         "rationale": "test",
         "tasks": [
             {"title": "do X", "body": "", "assignee": "made_up", "parents": []},
+            {"title": "do Y", "body": "", "assignee": "made_up", "parents": []},
         ],
     })
 
@@ -439,11 +558,11 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
             p.stop()
 
     assert outcome.ok, outcome.reason
-    assert outcome.child_ids and len(outcome.child_ids) == 1
+    assert outcome.child_ids and len(outcome.child_ids) == 2
     with kb.connect() as conn:
-        child = kb.get_task(conn, outcome.child_ids[0])
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
     # 'made_up' wasn't in roster, so assignee rewritten to 'fallback'
-    assert child.assignee == "fallback"
+    assert all(child is not None and child.assignee == "fallback" for child in children)
 
 
 def test_decompose_fanout_preserves_assigned_root_custody(kanban_home):
@@ -465,7 +584,13 @@ def test_decompose_fanout_preserves_assigned_root_custody(kanban_home):
                     "body": "Verify the candidate.",
                     "assignee": "engineer",
                     "parents": [],
-                }
+                },
+                {
+                    "title": "Run release preflight",
+                    "body": "Verify release custody.",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
             ],
         }
     )
@@ -639,10 +764,53 @@ def test_decompose_reports_status_race_as_skip(kanban_home):
     assert task.body is None
 
 
+@pytest.mark.parametrize("task_count", [1, 7])
+def test_decompose_rejects_fanout_outside_two_through_six(
+    kanban_home,
+    task_count,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bounded graph", triage=True)
+
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {
+                    "title": f"child {index}",
+                    "body": f"body {index}",
+                    "assignee": "engineer",
+                    "parents": [],
+                }
+                for index in range(task_count)
+            ],
+        }
+    )
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert f"{task_count} tasks; expected 2-6" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        task_count_after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert task is not None
+    assert task.status == "triage"
+    assert task.assignee is None
+    assert task_count_after == 1
+
+
 @pytest.mark.parametrize(
     ("parents", "expected"),
     [
-        ([3], "outside 0..0"),
+        ([3], "outside 0..1"),
         ([0], "cannot depend on itself"),
         (["0"], "must be an integer index"),
         ([False], "must be an integer index"),
@@ -663,7 +831,13 @@ def test_decompose_rejects_invalid_dependency_with_diagnostic(
                     "body": "must not be created",
                     "assignee": "engineer",
                     "parents": parents,
-                }
+                },
+                {
+                    "title": "valid sibling",
+                    "body": "must not be created",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
             ],
         }
     )

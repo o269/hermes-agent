@@ -125,20 +125,13 @@ KANBAN_GATE_KEYWORDS = frozenset({
 })
 _KANBAN_GATE_KEYWORD_RE = re.compile(r"GATE-[A-Z0-9][A-Z0-9_-]*\Z")
 _DECOMPOSITION_HOLD_RE = re.compile(
-    r"\b(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY)|DECISION[-_\s]+REQUIRED|"
+    r"\[(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY)|DECISION[-_\s]+REQUIRED|"
     r"DO\s+NOT\s+DISPATCH|NON[- ]?(?:EXECUTABLE|DISPATCHABLE)|"
     r"OWNER/PRODUCT\s+DECISION|QUIESCE(?:[- ]GATE)?|FREEZE[- ]GATE|"
-    r"GATE[-_][A-Z0-9][A-Z0-9_-]*)\b",
+    r"GATE[-_][A-Z0-9][A-Z0-9_-]*)\]",
     re.IGNORECASE,
 )
-_OPERATOR_RULING_RE = re.compile(
-    r"\b(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY|RULING)|"
-    r"(?:NON[- ]?DISPATCHABLE|DO\s+NOT\s+DISPATCH).{0,80}"
-    r"(?:OPERATOR|AUTHORITY|RULING|PENDING)|"
-    r"(?:OPERATOR|AUTHORITY|RULING|PENDING).{0,80}"
-    r"(?:NON[- ]?DISPATCHABLE|DO\s+NOT\s+DISPATCH))\b",
-    re.IGNORECASE | re.DOTALL,
-)
+_EXPECTED_ASSIGNEE_UNSET = object()
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -6218,6 +6211,7 @@ def specify_triage_task(
     preserve_status: bool = False,
     valid_assignees: Optional[Iterable[str]] = None,
     decomposition_guard: bool = False,
+    expected_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
 ) -> bool:
     """Flesh out a triage task, optionally preserving control-card custody.
 
@@ -6234,11 +6228,12 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions. When ``valid_assignees`` is
-    provided, a newly written assignee must be present in that resolved
-    cross-host roster. ``decomposition_guard=True`` rechecks control holds and
-    current custody inside the same write transaction, preserves any assignee
-    that appeared while the LLM was running, and records the durable replay
-    marker used by automatic no-fanout decomposition.
+    provided, a newly written assignee must be present in the current live
+    profile roster. ``decomposition_guard=True`` rechecks control holds inside
+    the same write transaction. When ``expected_assignee`` is supplied, the
+    assignee must still exactly match the pre-LLM snapshot; a mismatch returns
+    ``False`` before title, body, status, comments, or events are mutated. This
+    is the decomposer's immutable custody token for the no-fanout path.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -6260,6 +6255,12 @@ def specify_triage_task(
         if decomposition_guard and decomposition_hold_reason(conn, task_id) is not None:
             return False
         existing_assignee = _canonical_assignee(existing["assignee"])
+        if decomposition_guard and expected_assignee is not _EXPECTED_ASSIGNEE_UNSET:
+            expected_canonical = _canonical_assignee(
+                expected_assignee if isinstance(expected_assignee, str) else None
+            )
+            if existing_assignee != expected_canonical:
+                return False
         if decomposition_guard and existing_assignee is not None:
             assignee = existing_assignee
             preserve_status = True
@@ -6357,11 +6358,11 @@ def decomposition_hold_reason(
 ) -> Optional[str]:
     """Return why auto-decomposition must leave a triage task untouched.
 
-    Control-plane gates are encoded in the card itself or in its durable
-    comment history.  They are not executable work, even when they sit in the
-    triage column.  A prior ``decomposed`` event also makes the root ineligible:
-    custody-preserving decompositions intentionally leave an assigned root in
-    triage, and a later dispatcher tick must not fan it out a second time.
+    Control-plane gates are current, structured state: canonical markers in
+    the card title/body, normalized active-PR custody, or a prior
+    ``decomposed`` event. Free-form historical comments are deliberately not
+    interpreted as permanent holds: prose such as "the prior operator hold is
+    closed" must never strand a card forever.
     """
     row = conn.execute(
         "SELECT title, body FROM tasks WHERE id = ?",
@@ -6398,17 +6399,72 @@ def decomposition_hold_reason(
         match = _DECOMPOSITION_HOLD_RE.search(text or "")
         if match:
             return f"{source} contains control-plane hold {match.group(0)!r}"
-
-    comments = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? "
-        "ORDER BY created_at DESC, id DESC",
-        (task_id,),
-    ).fetchall()
-    for comment in comments:
-        match = _OPERATOR_RULING_RE.search(comment["body"] or "")
-        if match:
-            return f"comment history contains operator hold {match.group(0)!r}"
     return None
+
+
+def list_decomposition_eligible_triage_ids(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
+    """Return a bounded triage eligibility page using one broker read.
+
+    The former caller loaded up to 1,000 tasks and then invoked
+    :func:`decomposition_hold_reason` once per row. On broker-backed boards that
+    became an N+1 RPC pattern, and each hold check could scan an unbounded
+    comment history. This query batches the structured DB evidence in one
+    statement; the only Python-side check is the canonical marker regex over
+    the bounded title/body page.
+    """
+    bounded_limit = max(1, min(int(limit), 1000))
+    tenant_clause = " AND t.tenant = ?" if tenant is not None else ""
+    params: list[Any] = []
+    if tenant is not None:
+        params.append(tenant)
+    cutoff = int(time.time()) - _RESPAWN_GUARD_PR_WINDOW
+    params.extend((bounded_limit, cutoff))
+    rows = conn.execute(
+        f"""
+        WITH candidates AS (
+            SELECT t.id, t.title, t.body, t.priority, t.created_at
+            FROM tasks AS t
+            WHERE t.status = 'triage'{tenant_clause}
+            ORDER BY t.priority DESC, t.created_at ASC
+            LIMIT ?
+        )
+        SELECT c.id, c.title, c.body,
+               EXISTS (
+                   SELECT 1 FROM task_events AS e
+                   WHERE e.task_id = c.id AND e.kind = 'decomposed'
+               ) AS was_decomposed,
+               EXISTS (
+                   SELECT 1 FROM task_pr_ownership AS own
+                   WHERE own.task_id = c.id
+                     AND own.last_seen_at >= ?
+                     AND (
+                         own.declared = 1
+                         OR NOT EXISTS (
+                             SELECT 1 FROM task_pr_ownership AS other
+                             WHERE other.canonical_url = own.canonical_url
+                               AND other.task_id <> c.id
+                               AND other.declared = 1
+                         )
+                     )
+               ) AS has_active_pr
+        FROM candidates AS c
+        ORDER BY c.priority DESC, c.created_at ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return [
+        str(row["id"])
+        for row in rows
+        if not bool(row["was_decomposed"])
+        and not bool(row["has_active_pr"])
+        and _DECOMPOSITION_HOLD_RE.search(row["title"] or "") is None
+        and _DECOMPOSITION_HOLD_RE.search(row["body"] or "") is None
+    ]
 
 
 def canonical_gate_keyword(keyword: str) -> str:
@@ -6503,6 +6559,7 @@ def decompose_triage_task(
     valid_assignees: Iterable[str],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    expected_root_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
 ) -> Optional[list[str]]:
     """Fan a triage task out without stealing explicit root custody.
 
@@ -6521,9 +6578,14 @@ def decompose_triage_task(
             "parents": [0, 2],                 # indices into this same children list
         }
 
-    ``valid_assignees`` is the caller's resolved profile roster across known
-    hosts.  Every newly-written assignee must appear in it; an unroutable
+    ``valid_assignees`` is the caller's current configured profile roster.
+    Every newly-written assignee must appear in it; an unroutable
     assignee aborts the same write transaction as the inserts.
+
+    When supplied, ``expected_root_assignee`` is the exact pre-LLM custody
+    snapshot. The transactional helper compares it with the live root assignee
+    before any child creation; every assignment transition, including
+    ``None -> name``, is a compare-and-set miss and leaves the graph untouched.
 
     Returns the list of created child task ids (in input order) on success.
     Returns ``None`` when the root is missing, no longer in ``triage``, already
@@ -6605,6 +6667,14 @@ def decompose_triage_task(
             return None
 
         existing_root_assignee = _canonical_assignee(root_row["assignee"])
+        if expected_root_assignee is not _EXPECTED_ASSIGNEE_UNSET:
+            expected_canonical = _canonical_assignee(
+                expected_root_assignee
+                if isinstance(expected_root_assignee, str)
+                else None
+            )
+            if existing_root_assignee != expected_canonical:
+                return None
         preserve_root_custody = existing_root_assignee is not None
         if not preserve_root_custody:
             if root_assignee is None:
@@ -13200,28 +13270,6 @@ def read_worker_log(
 # ---------------------------------------------------------------------------
 # Assignee enumeration (known profiles + per-profile board stats)
 # ---------------------------------------------------------------------------
-
-def known_routable_profiles(conn: sqlite3.Connection) -> set[str]:
-    """Return profiles proven runnable by completed work on this shared board.
-
-    A multi-host board cannot inspect another host's profile directory.  A
-    completed spawned run is durable, conservative proof that the named profile
-    was resolvable on at least one known host.  Manually synthesized completions
-    and failed/reclaimed/blocked attempts do not qualify, preventing typoed or
-    crash-loop lanes from becoming routing authorities merely because they were
-    claimed once.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT profile FROM task_runs "
-        "WHERE outcome = 'completed' AND worker_started_at IS NOT NULL "
-        "AND profile IS NOT NULL AND TRIM(profile) != ''"
-    ).fetchall()
-    return {
-        canonical
-        for row in rows
-        if (canonical := _canonical_assignee(row["profile"])) is not None
-    }
-
 
 def list_profiles_on_disk() -> list[str]:
     """Return the set of assignee/profile names discovered on disk.

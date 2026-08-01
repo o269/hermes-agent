@@ -48,6 +48,9 @@ from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
 
+_MIN_FANOUT_TASKS = 2
+_MAX_FANOUT_TASKS = 6
+
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
@@ -145,6 +148,17 @@ class DecomposeOutcome:
     leaf_count: int = 0
 
 
+@dataclass
+class OrchestrationProfileResolution:
+    """One canonical live-profile resolution shared by every surface."""
+
+    roster: list[dict]
+    valid_names: set[str]
+    active_profile: Optional[str]
+    orchestrator_profile: Optional[str]
+    default_assignee: Optional[str]
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -226,12 +240,13 @@ def _resolve_orchestrator_profile(
     *,
     existing_assignee: Optional[str],
     valid_names: set[str],
+    active_profile: Optional[str],
 ) -> Optional[str]:
     """Resolve root custody without inventing the literal ``default`` lane.
 
     An existing task assignee wins unconditionally because preserving it is not
-    a new routing write.  Otherwise only configured/active profiles proven by
-    the current roster are candidates.  ``None`` means resolution failed and
+    a new routing write. Otherwise only configured/active profiles proven by
+    the current roster are candidates. ``None`` means resolution failed and
     the caller must leave the task in triage with a visible error.
     """
     existing = (existing_assignee or "").strip()
@@ -243,10 +258,7 @@ def _resolve_orchestrator_profile(
     if explicit and _profile_is_resolved(explicit, valid_names):
         return explicit
 
-    try:
-        active = (profiles_mod.get_active_profile_name() or "").strip()
-    except Exception:
-        active = ""
+    active = (active_profile or "").strip()
     if active and _profile_is_resolved(active, valid_names):
         return active
     return None
@@ -257,6 +269,7 @@ def _resolve_default_assignee(
     *,
     orchestrator: Optional[str],
     valid_names: set[str],
+    active_profile: Optional[str],
 ) -> Optional[str]:
     """Resolve the child fallback to a real profile or return ``None``."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
@@ -267,10 +280,7 @@ def _resolve_default_assignee(
     if orchestrator and _profile_is_resolved(orchestrator, valid_names):
         return orchestrator
 
-    try:
-        active = (profiles_mod.get_active_profile_name() or "").strip()
-    except Exception:
-        active = ""
+    active = (active_profile or "").strip()
     if active and _profile_is_resolved(active, valid_names):
         return active
     return None
@@ -308,28 +318,48 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "model": p.model,
         })
         valid.add(p.name)
-
-    # Shared boards may span hosts. We cannot inspect another host's profile
-    # directory, so completed runs are the conservative durable proof that a
-    # remote profile is resolvable there. Failed attempts never enter this set.
-    try:
-        with kb.connect_closing() as conn:
-            remote_names = kb.known_routable_profiles(conn)
-    except Exception as exc:
-        logger.warning("decompose: failed to read known remote profiles: %s", exc)
-        remote_names = set()
-    if fleet_named_lanes_only:
-        remote_names.discard("default")
-    for name in sorted(remote_names - valid):
-        roster.append({
-            "name": name,
-            "description": "(profile previously completed work on this shared board)",
-            "has_description": False,
-            "provider": None,
-            "model": None,
-        })
-        valid.add(name)
     return roster, valid
+
+
+def resolve_orchestration_profiles(
+    cfg: dict,
+    *,
+    existing_assignee: Optional[str] = None,
+) -> OrchestrationProfileResolution:
+    """Resolve routes from the current configured profile set.
+
+    This is the sole resolver used by the dispatcher/decomposer and dashboard.
+    Historical task/run rows are intentionally absent: a retired profile cannot
+    remain routing authority merely because it completed work in the past.
+    """
+    roster, valid_names = _build_roster()
+    try:
+        active_profile = (profiles_mod.get_active_profile_name() or "").strip() or None
+    except Exception:
+        active_profile = None
+    orchestrator = _resolve_orchestrator_profile(
+        cfg,
+        existing_assignee=existing_assignee,
+        valid_names=valid_names,
+        active_profile=active_profile,
+    )
+    default_assignee = _resolve_default_assignee(
+        cfg,
+        orchestrator=orchestrator,
+        valid_names=valid_names,
+        active_profile=active_profile,
+    )
+    return OrchestrationProfileResolution(
+        roster=roster,
+        valid_names=valid_names,
+        active_profile=(
+            active_profile
+            if _profile_is_resolved(active_profile or "", valid_names)
+            else None
+        ),
+        orchestrator_profile=orchestrator,
+        default_assignee=default_assignee,
+    )
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -371,6 +401,8 @@ def _skip_outcome(
     conn,
     task_id: str,
     fallback: str,
+    *,
+    expected_assignee: Optional[str],
 ) -> DecomposeOutcome:
     """Describe a compare-and-set miss without misreporting it as an LLM error."""
     current = kb.get_task(conn, task_id)
@@ -379,6 +411,12 @@ def _skip_outcome(
         status = None
     elif current.status != "triage":
         reason = f"task status changed to {current.status!r} before the decomposition write"
+        status = current.status
+    elif current.assignee != expected_assignee:
+        reason = (
+            "task assignee changed from "
+            f"{expected_assignee!r} to {current.assignee!r} before the decomposition write"
+        )
         status = current.status
     else:
         hold_reason = kb.decomposition_hold_reason(conn, task_id)
@@ -470,23 +508,20 @@ def decompose_task(
     cfg = _load_config()
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
-    orchestrator = _resolve_orchestrator_profile(
+    resolution = resolve_orchestration_profiles(
         cfg,
         existing_assignee=task.assignee,
-        valid_names=valid_names,
     )
+    roster = resolution.roster
+    valid_names = resolution.valid_names
+    orchestrator = resolution.orchestrator_profile
     if task.assignee is None and orchestrator is None:
         return DecomposeOutcome(
             task_id,
             False,
             "no resolvable orchestrator profile; task left in triage",
         )
-    default_assignee = _resolve_default_assignee(
-        cfg,
-        orchestrator=orchestrator,
-        valid_names=valid_names,
-    )
+    default_assignee = resolution.default_assignee
     if default_assignee is None:
         return DecomposeOutcome(
             task_id,
@@ -566,12 +601,14 @@ def decompose_task(
                 preserve_status=bool(task.assignee),
                 valid_assignees=valid_names,
                 decomposition_guard=True,
+                expected_assignee=task.assignee,
             )
             if not ok:
                 return _skip_outcome(
                     conn,
                     task_id,
                     "task changed concurrently before single-task promotion",
+                    expected_assignee=task.assignee,
                 )
             promoted = kb.get_task(conn, task_id)
         return DecomposeOutcome(
@@ -585,6 +622,13 @@ def decompose_task(
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
+        )
+    if not _MIN_FANOUT_TASKS <= len(raw_tasks) <= _MAX_FANOUT_TASKS:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "decomposer returned fanout=true with "
+            f"{len(raw_tasks)} tasks; expected {_MIN_FANOUT_TASKS}-{_MAX_FANOUT_TASKS}",
         )
 
     # Rewrite invalid assignees to the default fallback. Never leave a
@@ -654,7 +698,7 @@ def decompose_task(
             clean_parents.append(parent_index)
         children.append({
             "title": title.strip()[:200],
-            "body": body.strip(),
+            "body": body,
             "assignee": chosen,
             "parents": clean_parents,
         })
@@ -672,6 +716,7 @@ def decompose_task(
                 root_assignee=orchestrator,
                 children=children,
                 valid_assignees=valid_names,
+                expected_root_assignee=task.assignee,
                 author=audit_author,
                 auto_promote=auto_promote,
             )
@@ -680,6 +725,7 @@ def decompose_task(
                     conn,
                     task_id,
                     "task changed concurrently before graph creation",
+                    expected_assignee=task.assignee,
                 )
             decomposed_root = kb.get_task(conn, task_id)
     except ValueError as exc:
@@ -702,14 +748,8 @@ def decompose_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return only triage cards eligible for automatic decomposition."""
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
+        return kb.list_decomposition_eligible_triage_ids(
             conn,
-            status="triage",
             tenant=tenant,
             limit=1000,
         )
-        return [
-            row.id
-            for row in rows
-            if kb.decomposition_hold_reason(conn, row.id) is None
-        ]
