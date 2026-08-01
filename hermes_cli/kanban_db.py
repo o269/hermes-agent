@@ -11043,61 +11043,61 @@ def record_respawn_guard_decision(
             )
 
 
+def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
+    """Return whether an assignee has a local profile or configured VPS2 SSH target."""
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.fleet_vps2_worker import (
+            configured_vps2_worker,
+            is_vps2_assignee,
+        )
+    except Exception:
+        # A partial/rolling install must fail closed for remote-only lanes while
+        # retaining the historical degraded-install fallback for local lanes.
+        if assignee.lower().startswith("vps2-"):
+            return False
+    else:
+        # vps2-* lanes are remote-only. If the transport is disabled or its
+        # config cannot be read, they remain nonspawnable rather than falling
+        # through to a coincidentally named local profile.
+        if is_vps2_assignee(assignee):
+            try:
+                return configured_vps2_worker(assignee) is not None
+            except Exception:
+                return False
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        # Preserve the historical degraded-install behavior for local lanes.
+        return True
+    return bool(profile_exists(assignee))
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    """Return True iff a ready+assigned+unclaimed task has a spawn target.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
-
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Spawn targets are either local Hermes profiles or an operator-enabled
+    ``kanban.vps2_ssh`` transport for ``vps2-*`` profiles.  This telemetry uses
+    the same predicate as canonical dispatch, so remote lanes are neither
+    silently starved nor handled by an independent scanner.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
+    """Mirror :func:`has_spawnable_ready` for the review column."""
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def dispatch_once(
@@ -11389,27 +11389,10 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+        # Spawn only through the canonical target predicate.  A target is either
+        # a local profile or the configured attached-SSH VPS2 transport; terminal
+        # control-plane lanes remain nonspawnable and pull claims themselves.
+        if not _assignee_has_spawn_target(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
             continue
         # A live owner for THIS card is left to the same-card respawn guard
@@ -11583,11 +11566,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_has_spawn_target(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         active_cards = _per_profile_active_cards.get(row["assignee"], set())
@@ -12063,28 +12042,38 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
+    from hermes_cli.fleet_vps2_worker import (
+        RemoteStartError,
+        configured_vps2_worker,
+        is_vps2_assignee,
+    )
+
+    remote_config = configured_vps2_worker(profile_arg)
+    if is_vps2_assignee(profile_arg) and remote_config is None:
+        # A config reload/disable between eligibility and spawn must never turn
+        # a remote-only lane into a local process after the canonical claim.
+        raise RemoteStartError(
+            f"VPS2 SSH transport is not enabled for remote-only assignee {profile_arg!r}"
+        )
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
-    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
-    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
-    # env, and when the child process starts `hermes -p <name>` the
-    # _apply_profile_override() runs *before* hermes_constants is imported.
-    # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
-    # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
-    # profile-specific config entirely.  Fixes profile-scoped fallback_providers
-    # being invisible to kanban workers.
+    # Local workers inherit the assignee profile home. Remote VPS2 workers must
+    # resolve that profile on VPS2 instead; forwarding the dispatcher's local
+    # HERMES_HOME would point at a path/profile that does not exist there.
     from hermes_cli.profiles import resolve_profile_env
 
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if remote_config is None:
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            # Profile dir doesn't exist — defer resolution to the CLI's
+            # _apply_profile_override() via HERMES_PROFILE (set below).
+            # This only happens in test fixtures where the isolated
+            # HERMES_HOME never had profiles created.
+            pass
+    else:
+        env.pop("HERMES_HOME", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -12155,8 +12144,7 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
+    worker_argv = [
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
@@ -12171,23 +12159,27 @@ def _default_spawn(
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
     for skill in spawn_skills:
-        cmd.extend(["--skills", skill])
+        worker_argv.extend(["--skills", skill])
     if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        worker_argv.extend(["-m", task.model_override])
+    # Local profile toolsets are not authoritative for a profile that exists
+    # only on VPS2. Let the remote CLI resolve that profile's own config.
+    worker_toolsets = (
+        _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if remote_config is None
+        else None
+    )
     if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
+        worker_argv.extend(["--toolsets", ",".join(worker_toolsets)])
+    worker_argv.extend([
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    if task.goal_mode or remote_config is not None:
+        # Goal-mode and remote workers take the fully-quiet path. Remote workers
+        # use that path so Hermes can emit its internal readiness token only
+        # after credentials, profile config, and the agent are initialized.
+        worker_argv.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -12201,30 +12193,44 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        if remote_config is not None:
+            from hermes_cli.fleet_vps2_worker import spawn_vps2_worker_via_ssh
+
+            proc = spawn_vps2_worker_via_ssh(
+                task_id=task.id,
+                board=resolved_board,
+                workspace=workspace,
+                local_workspace_root=env["HERMES_KANBAN_WORKSPACES_ROOT"],
+                local_env=env,
+                worker_argv=worker_argv,
+                stderr=log_f,
+                config=remote_config,
+            )
+        else:
+            cmd = [*_resolve_hermes_argv(), *worker_argv]
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            )
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    except Exception:
+        log_f.close()
+        raise
+    # The child has inherited the log FD.  For VPS2, the local SSH process keeps
+    # the diagnostics FD while the foreground remote worker writes its remote
+    # log.  In both cases the Popen PID is the canonical local lifecycle token.
     # ``start_new_session=True`` guarantees PGID/SID == child PID on POSIX.
-    # Capture that contract here, before a short-lived wrapper can disappear;
-    # descendants inherit the group even after its leader exits.
     pgid, sid, started_at = _read_worker_process_identity(proc.pid)
     if started_at is None:
         started_at = time.time()

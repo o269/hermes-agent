@@ -15996,6 +15996,16 @@ def main(
                         runtime_override=turn_route["runtime"],
                         request_overrides=turn_route.get("request_overrides"),
                     ):
+                        # An attached VPS2 worker is accepted only after this
+                        # process has loaded its profile/credentials and built
+                        # the real agent. The internal FD is supplied by the
+                        # remote supervisor; all normal CLI runs are unchanged.
+                        if os.environ.get("_HERMES_INTERNAL_KANBAN_READY_FD"):
+                            from hermes_cli.fleet_vps2_worker import (
+                                signal_vps2_worker_ready_from_env,
+                            )
+
+                            signal_vps2_worker_ready_from_env()
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays

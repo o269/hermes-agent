@@ -1543,6 +1543,33 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Fleet-only attached SSH transport for vps2-* profiles. Disabled by
+        # default: enabling it is an operator deployment choice, not a second
+        # dispatcher. Canonical dispatch_once still owns policy, claim/run
+        # creation, capacity, continuation, crash detection, and reclaim.
+        "vps2_ssh": {
+            "enabled": False,
+            "host": "vps2",
+            "user": "root",
+            "hermes_bin": "/root/.local/bin/hermes",
+            "boardd_sock": "/run/boardd-blitz.sock",
+            "workspace_root": "/mnt/HC_Volume_106418160/fleet-workspaces",
+            "log_root": "/tmp",
+            "path": (
+                "/root/.local/bin:/usr/local/sbin:/usr/local/bin:"
+                "/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "connect_timeout_seconds": 15,
+            "server_alive_interval_seconds": 15,
+            "server_alive_count_max": 2,
+            "start_timeout_seconds": 20.0,
+            "start_grace_seconds": 0.1,
+            # Local lease pulses feed a remote supervisor. The timeout is capped
+            # below canonical process-tree termination's five-second grace so
+            # the remote worker is dead before its local lifecycle PID exits.
+            "lease_interval_seconds": 1.0,
+            "lease_timeout_seconds": 4.0,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
