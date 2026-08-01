@@ -593,7 +593,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `unlink <parent> <child>` | Remove a dependency. |
 | `claim <id>` | Atomically claim a ready task. Prints resolved workspace path. |
 | `comment <id> "<text>"` | Append a comment. The next worker that claims the task reads it as part of its `kanban_show()` response. |
-| `gate <id> <keyword>` | Append a canonical control-plane marker without changing the card's status or assignee. Use `--field title|body` (default `title`) and optional `--author`. Keywords: `OPERATOR-GATE`, `OPERATOR-HOLD`, `DECISION REQUIRED`, `DO NOT DISPATCH`, `QUIESCE-GATE`, `FREEZE-GATE`, or a specific `GATE-<NAME>`. Done/archived cards are refused. |
+| `gate <id> <keyword>` | Append a canonical control-plane marker without changing the card's status or assignee. Use `--field title\|body` (default `title`) and optional `--author`. Keywords: `OPERATOR-GATE`, `OPERATOR-HOLD`, `DECISION REQUIRED`, `DO NOT DISPATCH`, `QUIESCE-GATE`, `FREEZE-GATE`, or a specific `GATE-<NAME>`. Done/archived cards are refused. |
 | `complete <id>` | Mark task done. Flags: `--result`, `--summary`, `--metadata`. |
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
