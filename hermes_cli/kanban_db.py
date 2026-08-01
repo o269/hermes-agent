@@ -4087,18 +4087,36 @@ def _reject_claim_while_profile_running(
     the dispatcher's in-memory profile map remains a fast-path and telemetry
     aid, not the concurrency control.
     """
-    owner = conn.execute(
-        "SELECT candidate.assignee AS assignee, owner.id AS running_task_id "
-        "FROM tasks candidate "
-        "JOIN tasks owner ON owner.assignee = candidate.assignee "
-        "WHERE candidate.id = ? AND candidate.status = ? "
-        "  AND candidate.claim_lock IS NULL "
-        "  AND candidate.assignee IS NOT NULL "
-        "  AND candidate.assignee != '' "
-        "  AND owner.status = 'running' AND owner.id != candidate.id "
-        "ORDER BY owner.started_at ASC, owner.created_at ASC, owner.id ASC "
-        "LIMIT 1",
+    candidate = conn.execute(
+        "SELECT assignee FROM tasks "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
         (task_id, expected_status),
+    ).fetchone()
+    if candidate is None:
+        return False
+
+    assignee = candidate["assignee"]
+    try:
+        canonical_assignee = _canonical_assignee(assignee)
+    except (TypeError, ValueError):
+        canonical_assignee = None
+    if not assignee or canonical_assignee != assignee:
+        _append_event(
+            conn,
+            task_id,
+            "claim_rejected",
+            {
+                "reason": "assignee_required",
+                "source_status": expected_status,
+            },
+        )
+        return True
+
+    owner = conn.execute(
+        "SELECT id AS running_task_id FROM tasks "
+        "WHERE assignee = ? AND status = 'running' AND id != ? "
+        "ORDER BY started_at ASC, created_at ASC, id ASC LIMIT 1",
+        (canonical_assignee, task_id),
     ).fetchone()
     if owner is None:
         return False
@@ -4108,7 +4126,7 @@ def _reject_claim_while_profile_running(
         "claim_rejected",
         {
             "reason": "profile_running",
-            "profile": owner["assignee"],
+            "profile": canonical_assignee,
             "running_task_id": owner["running_task_id"],
             "source_status": expected_status,
         },

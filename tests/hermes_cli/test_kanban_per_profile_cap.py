@@ -232,6 +232,50 @@ def test_review_claim_transaction_shares_running_profile_fence(
         assert kb.get_task(conn, review).status == "review"
 
 
+@pytest.mark.parametrize("assignee", [None, "", "   ", "Alpha"])
+@pytest.mark.parametrize("source_status", ["ready", "review"])
+def test_missing_assignee_claims_fail_closed_without_corruption(
+    isolated_kanban_home_with_profiles,
+    assignee,
+    source_status,
+):
+    """Legacy NULL/blank holds cannot escape the profile claim authority."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        owner = kb.create_task(conn, title="running alpha", assignee="alpha")
+        candidate = kb.create_task(conn, title="unassigned hold", assignee="alpha")
+        assert kb.claim_task(conn, owner) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, status = ? WHERE id = ?",
+                (assignee, source_status, candidate),
+            )
+
+        claim = kb.claim_task if source_status == "ready" else kb.claim_review_task
+        assert claim(conn, candidate) is None
+        row = conn.execute(
+            "SELECT status, assignee, claim_lock, claim_expires, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (candidate,),
+        ).fetchone()
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (candidate,)
+        ).fetchone()[0]
+        rejection = [
+            event
+            for event in kb.list_events(conn, candidate)
+            if event.kind == "claim_rejected"
+        ][-1]
+
+    assert tuple(row) == (source_status, assignee, None, None, None)
+    assert runs == 0
+    assert rejection.payload == {
+        "reason": "assignee_required",
+        "source_status": source_status,
+    }
+
+
 def test_subsequent_pulse_while_one_card_active_does_not_claim_second(
     isolated_kanban_home_with_profiles,
 ):
