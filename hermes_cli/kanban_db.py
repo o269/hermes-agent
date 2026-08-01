@@ -115,6 +115,31 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+KANBAN_GATE_KEYWORDS = frozenset({
+    "OPERATOR-GATE",
+    "OPERATOR-HOLD",
+    "DECISION REQUIRED",
+    "DO NOT DISPATCH",
+    "QUIESCE-GATE",
+    "FREEZE-GATE",
+})
+_KANBAN_GATE_KEYWORD_RE = re.compile(r"GATE-[A-Z0-9][A-Z0-9_-]*\Z")
+_DECOMPOSITION_HOLD_RE = re.compile(
+    r"\b(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY)|DECISION[-_\s]+REQUIRED|"
+    r"DO\s+NOT\s+DISPATCH|NON[- ]?(?:EXECUTABLE|DISPATCHABLE)|"
+    r"OWNER/PRODUCT\s+DECISION|QUIESCE(?:[- ]GATE)?|FREEZE[- ]GATE|"
+    r"GATE[-_][A-Z0-9][A-Z0-9_-]*)\b",
+    re.IGNORECASE,
+)
+_OPERATOR_RULING_RE = re.compile(
+    r"\b(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY|RULING)|"
+    r"(?:NON[- ]?DISPATCHABLE|DO\s+NOT\s+DISPATCH).{0,80}"
+    r"(?:OPERATOR|AUTHORITY|RULING|PENDING)|"
+    r"(?:OPERATOR|AUTHORITY|RULING|PENDING).{0,80}"
+    r"(?:NON[- ]?DISPATCHABLE|DO\s+NOT\s+DISPATCH))\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -6190,13 +6215,16 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    preserve_status: bool = False,
+    valid_assignees: Optional[Iterable[str]] = None,
+    decomposition_guard: bool = False,
 ) -> bool:
-    """Flesh out a triage task and promote it to ``todo``.
+    """Flesh out a triage task, optionally preserving control-card custody.
 
-    Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
-    False when the task is missing or not in the ``triage`` column — callers
-    should surface that as "nothing to specify" rather than an error.
+    The normal specify path atomically updates fields and transitions
+    ``triage -> todo``.  ``preserve_status=True`` is reserved for the
+    decomposer's no-fanout fallback on an already-assigned root: it may tighten
+    title/body but must not make the custody card dispatchable.
 
     ``todo`` (not ``ready``) is the correct landing column: ``recompute_ready``
     promotes parent-free / parent-done todos to ``ready`` on the next
@@ -6205,11 +6233,23 @@ def specify_triage_task(
 
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
-    comment spam for status-only promotions.
+    comment spam for status-only promotions. When ``valid_assignees`` is
+    provided, a newly written assignee must be present in that resolved
+    cross-host roster. ``decomposition_guard=True`` rechecks control holds and
+    current custody inside the same write transaction, preserves any assignee
+    that appeared while the LLM was running, and records the durable replay
+    marker used by automatic no-fanout decomposition.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    requested_assignee = _canonical_assignee(assignee)
+    resolved_assignees = None
+    if valid_assignees is not None:
+        resolved_assignees = {
+            canonical
+            for name in valid_assignees
+            if (canonical := _canonical_assignee(name)) is not None
+        }
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -6217,7 +6257,24 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        if decomposition_guard and decomposition_hold_reason(conn, task_id) is not None:
+            return False
+        existing_assignee = _canonical_assignee(existing["assignee"])
+        if decomposition_guard and existing_assignee is not None:
+            assignee = existing_assignee
+            preserve_status = True
+        else:
+            assignee = requested_assignee
+        if (
+            assignee is not None
+            and assignee != existing_assignee
+            and resolved_assignees is not None
+            and assignee not in resolved_assignees
+        ):
+            raise ValueError(
+                f"assignee {assignee!r} has no resolvable profile on any known host"
+            )
+        sets: list[str] = [] if preserve_status else ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -6232,14 +6289,15 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
-        params.append(task_id)
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
-            tuple(params),
-        )
-        if cur.rowcount != 1:
-            return False
+        if sets:
+            params.append(task_id)
+            cur = conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} "
+                f"WHERE id = ? AND status = 'triage'",
+                tuple(params),
+            )
+            if cur.rowcount != 1:
+                return False
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
@@ -6254,7 +6312,11 @@ def specify_triage_task(
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    + (
+                        "; custody status preserved."
+                        if preserve_status
+                        else " and promoted to todo."
+                    ),
                     int(time.time()),
                 ),
             )
@@ -6262,14 +6324,173 @@ def specify_triage_task(
             conn,
             task_id,
             "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            {
+                "changed_fields": changed_fields,
+                "status_preserved": preserve_status,
+            },
         )
+        if decomposition_guard:
+            _append_event(
+                conn,
+                task_id,
+                "decomposed",
+                {
+                    "fanout": False,
+                    "child_ids": [],
+                    "custody_preserved": preserve_status,
+                },
+            )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
-    # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    # idling in 'todo' until the next sweep. Custody-preserving calls remain
+    # in triage and must not enter the ready queue.
+    if not preserve_status:
+        recompute_ready(conn)
+    return True
+
+
+def decomposition_hold_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return why auto-decomposition must leave a triage task untouched.
+
+    Control-plane gates are encoded in the card itself or in its durable
+    comment history.  They are not executable work, even when they sit in the
+    triage column.  A prior ``decomposed`` event also makes the root ineligible:
+    custody-preserving decompositions intentionally leave an assigned root in
+    triage, and a later dispatcher tick must not fan it out a second time.
+    """
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    prior = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior is not None:
+        return "already decomposed"
+
+    active_prs = _active_pr_custody(
+        conn,
+        task_id,
+        cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if active_prs:
+        return (
+            f"active PR custody detected ({', '.join(active_prs)}). Finish or close "
+            "the existing PR instead of creating replacement work. For an "
+            "operator-approved repair, use the live root gateway to run "
+            f"`/kanban continuation review {task_id} --verdict fix-required "
+            "--reason <reason>` and then `/kanban continuation authorize "
+            f"{task_id} --pr OWNER/REPO#N@SHA --reason <reason> --profile "
+            "<assignee> --provider <provider>`"
+        )
+
+    for source, text in (("title", row["title"]), ("body", row["body"])):
+        match = _DECOMPOSITION_HOLD_RE.search(text or "")
+        if match:
+            return f"{source} contains control-plane hold {match.group(0)!r}"
+
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for comment in comments:
+        match = _OPERATOR_RULING_RE.search(comment["body"] or "")
+        if match:
+            return f"comment history contains operator hold {match.group(0)!r}"
+    return None
+
+
+def canonical_gate_keyword(keyword: str) -> str:
+    """Validate and normalize a user-facing Kanban gate keyword."""
+    canonical = re.sub(r"\s+", " ", str(keyword or "").strip().upper())
+    canonical = {
+        "QUIESCE": "QUIESCE-GATE",
+        "FREEZE": "FREEZE-GATE",
+    }.get(canonical, canonical)
+    if (
+        canonical not in KANBAN_GATE_KEYWORDS
+        and _KANBAN_GATE_KEYWORD_RE.fullmatch(canonical) is None
+    ):
+        allowed = ", ".join(sorted(KANBAN_GATE_KEYWORDS))
+        raise ValueError(
+            f"unknown gate keyword {keyword!r}; choose one of: {allowed}, "
+            "or GATE-<NAME>"
+        )
+    return canonical
+
+
+def append_task_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    keyword: str,
+    *,
+    field: str = "title",
+    author: Optional[str] = None,
+) -> bool:
+    """Idempotently append a canonical control-plane gate marker.
+
+    This is deliberately a content-only mutation: it never changes task
+    status, assignee, claims, or dependency links.  Workers can therefore mark
+    a non-done card as a gate without taking custody or accidentally making it
+    dispatchable.
+    """
+    canonical = canonical_gate_keyword(keyword)
+    if field not in {"title", "body"}:
+        raise ValueError("gate field must be 'title' or 'body'")
+
+    marker = f"[{canonical}]"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in {"done", "archived"}:
+            raise ValueError(
+                f"cannot mark {row['status']} task {task_id} as a control-plane gate"
+            )
+
+        current = row[field] or ""
+        if marker.casefold() not in current.casefold():
+            if field == "title":
+                updated = f"{current.rstrip()} {marker}".strip()
+            else:
+                separator = "\n\n" if current.strip() else ""
+                updated = f"{current.rstrip()}{separator}{marker}"
+            conn.execute(
+                f"UPDATE tasks SET {field} = ? WHERE id = ?",
+                (updated, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "gate_marked",
+                {"keyword": canonical, "field": field, "by": author or "user"},
+            )
+            if author and author.strip():
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        author.strip(),
+                        f"Marked {field} with {marker}; status and assignee preserved.",
+                        now,
+                    ),
+                )
     return True
 
 
@@ -6279,39 +6500,44 @@ def decompose_triage_task(
     *,
     root_assignee: Optional[str],
     children: list[dict],
+    valid_assignees: Iterable[str],
     author: Optional[str] = None,
     auto_promote: bool = True,
 ) -> Optional[list[str]]:
-    """Fan a triage task out into child tasks and promote the root to ``todo``.
+    """Fan a triage task out without stealing explicit root custody.
 
-    The root task stays alive and becomes the parent of every child —
-    when all children reach ``done``, the root promotes to ``ready`` and
-    its assignee (typically the orchestrator profile) wakes back up to
-    judge completion or spawn more work.
+    Unassigned executable roots keep the original orchestration behaviour:
+    they move to ``todo`` and are assigned to ``root_assignee`` while waiting
+    on every child.  An already-assigned root is a custody-bearing control
+    card, so its assignee *and status* are preserved byte-for-byte while the
+    child graph runs beneath it.
 
     ``children`` is a list of dicts, each shaped like::
 
         {
             "title": "...",
             "body": "...",                     # optional
-            "assignee": "profile-name",        # optional, None -> default fallback
+            "assignee": "profile-name",        # required after routing
             "parents": [0, 2],                 # indices into this same children list
         }
 
-    Returns the list of created child task ids (in input order) on
-    success. Returns ``None`` when:
-      - The root task does not exist
-      - The root task is not in ``triage``
-      - A cycle would result (caller built a bad graph)
+    ``valid_assignees`` is the caller's resolved profile roster across known
+    hosts.  Every newly-written assignee must appear in it; an unroutable
+    assignee aborts the same write transaction as the inserts.
 
-    Validation of titles/assignees happens inside the same write_txn as
-    the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    Returns the list of created child task ids (in input order) on success.
+    Returns ``None`` when the root is missing, no longer in ``triage``, already
+    decomposed, or protected by a control-plane hold.
     """
     if not children:
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
+    resolved_assignees = {
+        canonical
+        for name in valid_assignees
+        if (canonical := _canonical_assignee(name)) is not None
+    }
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -6366,7 +6592,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, assignee, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6374,6 +6600,24 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        hold_reason = decomposition_hold_reason(conn, task_id)
+        if hold_reason is not None:
+            return None
+
+        existing_root_assignee = _canonical_assignee(root_row["assignee"])
+        preserve_root_custody = existing_root_assignee is not None
+        if not preserve_root_custody:
+            if root_assignee is None:
+                raise ValueError(
+                    "cannot decompose an unassigned root without a resolved "
+                    "orchestrator profile"
+                )
+            if root_assignee not in resolved_assignees:
+                raise ValueError(
+                    f"root assignee {root_assignee!r} has no resolvable profile "
+                    "on any known host"
+                )
+
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -6390,7 +6634,12 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = _canonical_assignee(child.get("assignee")) or root_assignee
+            if assignee is None or assignee not in resolved_assignees:
+                raise ValueError(
+                    f"child[{idx}] assignee {assignee!r} has no resolvable "
+                    "profile on any known host"
+                )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -6452,29 +6701,32 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
-        params: list[Any] = []
-        if root_assignee is not None:
-            sets.append("assignee = ?")
-            params.append(root_assignee)
-        params.append(task_id)
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
-            tuple(params),
-        )
+        # An assigned triage root is an explicit custody/control card.  Keep
+        # both assignee and status unchanged; only unassigned executable roots
+        # join the ordinary orchestrator wake-up path.
+        if not preserve_root_custody:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', assignee = ? WHERE id = ?",
+                (root_assignee, task_id),
+            )
+        effective_root_assignee = existing_root_assignee or root_assignee
+        effective_root_status = "triage" if preserve_root_custody else "todo"
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
+            if preserve_root_custody:
+                disposition = (
+                    " Root custody preserved; assignee and triage status unchanged."
+                )
+            else:
+                disposition = " Root will wake when all children complete."
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (
                     task_id,
                     author.strip(),
-                    "Decomposed into "
-                    + ", ".join(child_ids)
-                    + ". Root will wake when all children complete.",
+                    "Decomposed into " + ", ".join(child_ids) + "." + disposition,
                     now,
                 ),
             )
@@ -6482,7 +6734,9 @@ def decompose_triage_task(
             conn, task_id, "decomposed",
             {
                 "child_ids": child_ids,
-                "root_assignee": root_assignee,
+                "root_assignee": effective_root_assignee,
+                "root_status": effective_root_status,
+                "custody_preserved": preserve_root_custody,
             },
         )
 
@@ -12946,6 +13200,28 @@ def read_worker_log(
 # ---------------------------------------------------------------------------
 # Assignee enumeration (known profiles + per-profile board stats)
 # ---------------------------------------------------------------------------
+
+def known_routable_profiles(conn: sqlite3.Connection) -> set[str]:
+    """Return profiles proven runnable by completed work on this shared board.
+
+    A multi-host board cannot inspect another host's profile directory.  A
+    completed spawned run is durable, conservative proof that the named profile
+    was resolvable on at least one known host.  Manually synthesized completions
+    and failed/reclaimed/blocked attempts do not qualify, preventing typoed or
+    crash-loop lanes from becoming routing authorities merely because they were
+    claimed once.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT profile FROM task_runs "
+        "WHERE outcome = 'completed' AND worker_started_at IS NOT NULL "
+        "AND profile IS NOT NULL AND TRIM(profile) != ''"
+    ).fetchall()
+    return {
+        canonical
+        for row in rows
+        if (canonical := _canonical_assignee(row["profile"])) is not None
+    }
+
 
 def list_profiles_on_disk() -> list[str]:
     """Return the set of assignee/profile names discovered on disk.

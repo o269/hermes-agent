@@ -604,6 +604,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    p_gate = sub.add_parser(
+        "gate",
+        help="Append a control-plane gate marker without changing custody/status",
+    )
+    p_gate.add_argument("task_id")
+    p_gate.add_argument(
+        "keyword",
+        help=(
+            "Canonical gate keyword, e.g. OPERATOR-GATE, GATE-FABLE-LAND, "
+            "QUIESCE-GATE, or quoted 'DECISION REQUIRED'"
+        ),
+    )
+    p_gate.add_argument(
+        "--field",
+        choices=("title", "body"),
+        default="title",
+        help="Where to append the marker (default: title)",
+    )
+    p_gate.add_argument(
+        "--author",
+        default=None,
+        help="Audit author (default: active profile)",
+    )
+
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
     p_attach.add_argument("task_id")
@@ -920,7 +944,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_decompose = sub.add_parser(
         "decompose",
         help="Decompose a triage-column task into a graph of child tasks "
-             "routed to specialist profiles by description. Falls back to "
+             "routed to specialist profiles by capability description and "
+             "provider/model defaults. Falls back to "
              "specify-style single-task promotion when the task doesn't "
              "benefit from fan-out. Uses auxiliary.kanban_decomposer.",
     )
@@ -1055,6 +1080,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "continuation": _cmd_continuation,
             "comment":  _cmd_comment,
+            "gate":     _cmd_gate,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
@@ -2058,6 +2084,27 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gate(args: argparse.Namespace) -> int:
+    author = args.author or _profile_author()
+    canonical = kb.canonical_gate_keyword(args.keyword)
+    with kb.connect_closing() as conn:
+        ok = kb.append_task_gate(
+            conn,
+            args.task_id,
+            canonical,
+            field=args.field,
+            author=author,
+        )
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    print(
+        f"Marked {args.task_id} as {canonical} "
+        f"in {args.field}; status and assignee preserved"
+    )
+    return 0
+
+
 def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file to a task.
 
@@ -2988,25 +3035,43 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
         return 2
 
     ok_count = 0
+    fail_count = 0
     for tid in ids:
         outcome = decomp.decompose_task(tid, author=author)
         if outcome.ok:
             ok_count += 1
+        elif not outcome.skipped:
+            fail_count += 1
         if want_json:
             print(json.dumps({
                 "task_id": outcome.task_id,
                 "ok": outcome.ok,
+                "skipped": outcome.skipped,
                 "reason": outcome.reason,
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
+                "root_status": outcome.root_status,
+                "dependency_closure": {
+                    "internal_edges": outcome.dependency_edges,
+                    "root_dependencies": outcome.root_dependencies,
+                    "leaf_count": outcome.leaf_count,
+                },
             }))
         elif outcome.ok:
             if outcome.fanout and outcome.child_ids:
                 child_summary = ", ".join(outcome.child_ids)
+                root_summary = (
+                    "root custody preserved in triage"
+                    if outcome.root_status == "triage"
+                    else f"root promoted to {outcome.root_status or 'todo'}"
+                )
                 print(
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
-                    f"children ({child_summary}); root promoted to todo"
+                    f"children ({child_summary}); {root_summary}; dependency "
+                    f"closure: {outcome.dependency_edges} internal edge(s), "
+                    f"root waits on {outcome.root_dependencies} child task(s), "
+                    f"{outcome.leaf_count} leaf task(s)"
                 )
             else:
                 title_suffix = (
@@ -3014,10 +3079,15 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                     if outcome.new_title
                     else ""
                 )
-                print(
-                    f"Specified {outcome.task_id} → todo "
-                    f"(no fanout){title_suffix}"
+                root_summary = (
+                    "custody preserved in triage"
+                    if outcome.root_status == "triage"
+                    else f"promoted to {outcome.root_status or 'todo'}"
                 )
+                print(f"Specified {outcome.task_id} → {root_summary} "
+                      f"(no fanout){title_suffix}")
+        elif outcome.skipped:
+            print(f"Skipped {outcome.task_id}: {outcome.reason}")
         else:
             print(
                 f"kanban: decompose {outcome.task_id}: {outcome.reason}",
@@ -3025,7 +3095,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
             )
     if not all_flag:
         return 0 if ok_count == 1 else 1
-    return 0 if (ok_count > 0 or not ids) else 1
+    # A compare-and-set miss is a reported skip, not an LLM/DB failure. This
+    # keeps --all race-safe while preserving a non-zero result when every
+    # attempted decomposition actually failed.
+    return 1 if (fail_count > 0 and ok_count == 0) else 0
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
@@ -3091,6 +3164,9 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `decompose <id>`      Fan a triage task into dependency-gated child tasks
+  `gate <id> <keyword>` Mark a control-plane gate without changing custody
+  `continuation …`      Review/authorize an exact-head active-PR repair
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

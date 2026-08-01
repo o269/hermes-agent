@@ -7,11 +7,13 @@ import json
 import os
 import threading
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
 
 
 @pytest.fixture
@@ -636,6 +638,9 @@ def test_run_slash_bare_returns_curated_help(kanban_home):
     assert "/kanban" in out
     assert "list" in out
     assert "show" in out
+    assert "decompose" in out
+    assert "gate" in out
+    assert "continuation" in out
     # Sanity: should be a chat-friendly size, not the raw usage tree.
     assert len(out) < 2000
     # Shouldn't surface argparse's usage-error sentinel.
@@ -657,6 +662,44 @@ def test_run_slash_subcommand_help_returns_help_text(kanban_home):
     assert "task_id" in out
     assert "/kanban show" in out
     assert not out.startswith("⚠")
+
+
+def test_run_slash_decompose_json_reports_stale_skip(kanban_home):
+    outcome = decomp.DecomposeOutcome(
+        "t_stale",
+        False,
+        "skipped: task status changed to 'ready'; task left unchanged",
+        skipped=True,
+        root_status="ready",
+    )
+    with patch.object(decomp, "decompose_task", return_value=outcome):
+        payload = json.loads(kc.run_slash("decompose t_stale --json"))
+
+    assert payload["ok"] is False
+    assert payload["skipped"] is True
+    assert payload["root_status"] == "ready"
+    assert "status changed" in payload["reason"]
+
+
+def test_run_slash_decompose_reports_dependency_closure(kanban_home):
+    outcome = decomp.DecomposeOutcome(
+        "t_graph",
+        True,
+        "decomposed into 3 children",
+        fanout=True,
+        child_ids=["t_a", "t_b", "t_c"],
+        root_status="triage",
+        dependency_edges=2,
+        root_dependencies=3,
+        leaf_count=1,
+    )
+    with patch.object(decomp, "decompose_task", return_value=outcome):
+        out = kc.run_slash("decompose t_graph")
+
+    assert "root custody preserved in triage" in out
+    assert "dependency closure: 2 internal edge(s)" in out
+    assert "root waits on 3 child task(s)" in out
+    assert "1 leaf task(s)" in out
 
 
 def test_run_slash_unknown_action_friendly_error(kanban_home):
