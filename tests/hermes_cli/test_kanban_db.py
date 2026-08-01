@@ -2214,6 +2214,12 @@ def test_respawn_guard_work_product_only_custody_blocks_dispatch_and_direct_clai
             spawn_fn=lambda task, _workspace: spawned.append(task.id),
         )
         assert (task_id, "active_pr") in dispatch.respawn_guarded
+        diagnostic = dispatch.respawn_guard_details[-1]
+        assert diagnostic["task_id"] == task_id
+        assert diagnostic["reason"] == "active_pr"
+        assert diagnostic["pr_url"] == _OWN_PR
+        assert diagnostic["expires_at"] == decision.detail["expires_at"]
+        assert diagnostic["phase"] == "ready"
         after_dispatch = kb.get_task(conn, task_id)
         assert after_dispatch is not None
         assert after_dispatch.status == "ready"

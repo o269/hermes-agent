@@ -305,6 +305,58 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_run_slash_dispatch_logs_active_pr_identity_and_expiry(
+    kanban_home, monkeypatch
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+        },
+        phase="ready",
+    )
+    monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert (
+        "SKIP t_owned respawn_guarded=active_pr "
+        "pr=https://github.com/o269/hermes-agent/pull/8 "
+        "expires=1785660000 phase=ready"
+    ) in out
+
+
+def test_run_slash_dispatch_json_includes_respawn_guard_diagnostics(
+    kanban_home, monkeypatch
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+        },
+        phase="ready",
+    )
+    monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
+
+    payload = json.loads(kc.run_slash("dispatch --dry-run --json"))
+
+    assert payload["respawn_guarded"] == [
+        {
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+            "task_id": "t_owned",
+            "reason": "active_pr",
+            "phase": "ready",
+        }
+    ]
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re

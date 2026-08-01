@@ -2443,6 +2443,11 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
+def _respawn_guard_details(res: kb.DispatchResult) -> list[dict]:
+    """Compatibility helper for dispatch JSON output."""
+    return res.normalized_respawn_guard_details()
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
@@ -2509,6 +2514,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "respawn_guarded": _respawn_guard_details(res),
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2530,6 +2536,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    for line in res.respawn_guard_log_lines():
+        print(line)
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
@@ -2619,6 +2627,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
+        for line in res.respawn_guard_log_lines():
+            print(
+                f"[{_fmt_ts(int(time.time()))}] {line}",
+                flush=True,
+            )
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
