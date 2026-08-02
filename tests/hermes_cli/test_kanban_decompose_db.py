@@ -62,14 +62,40 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         c1 = kb.get_task(conn, child_ids[1])
 
     # Root flipped to todo with orchestrator assignee, gated by children.
+    assert root is not None
     assert root.status == "todo"
     assert root.assignee == "orchestrator"
+    assert root.assignment_generation == 1
     # First child has no internal parents → ready on recompute_ready.
     assert c0.status == "ready"
     assert c0.assignee == "researcher"
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+
+
+def test_assignment_generation_tracks_public_assignment_transitions(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="ABA fence")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignment_generation == 0
+
+        assert kb.assign_task(conn, tid, "fable")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignment_generation == 1
+
+        assert kb.assign_task(conn, tid, None)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignment_generation == 2
+
+        # Re-applying the same value is not an assignment transition.
+        assert kb.assign_task(conn, tid, None)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignment_generation == 2
 
 
 def test_decompose_preserves_assigned_root_custody_and_triage_status(kanban_home):

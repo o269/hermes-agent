@@ -403,6 +403,7 @@ def _skip_outcome(
     fallback: str,
     *,
     expected_assignee: Optional[str],
+    expected_assignment_generation: int,
 ) -> DecomposeOutcome:
     """Describe a compare-and-set miss without misreporting it as an LLM error."""
     current = kb.get_task(conn, task_id)
@@ -416,6 +417,13 @@ def _skip_outcome(
         reason = (
             "task assignee changed from "
             f"{expected_assignee!r} to {current.assignee!r} before the decomposition write"
+        )
+        status = current.status
+    elif current.assignment_generation != expected_assignment_generation:
+        reason = (
+            "task assignment generation changed from "
+            f"{expected_assignment_generation} to {current.assignment_generation} "
+            "before the decomposition write"
         )
         status = current.status
     else:
@@ -590,27 +598,41 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
-                preserve_status=bool(task.assignee),
-                valid_assignees=valid_names,
-                decomposition_guard=True,
-                expected_assignee=task.assignee,
-            )
-            if not ok:
-                return _skip_outcome(
+        # The prompt roster is only an inference-time hint. The DB helper calls
+        # this resolver inside its write transaction so a profile removed
+        # during the LLM call cannot receive this task.
+        def live_valid_assignees() -> set[str]:
+            return resolve_orchestration_profiles(
+                _load_config(),
+                existing_assignee=task.assignee,
+            ).valid_names
+
+        try:
+            with kb.connect_closing() as conn:
+                ok = kb.specify_triage_task(
                     conn,
                     task_id,
-                    "task changed concurrently before single-task promotion",
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                    preserve_status=bool(task.assignee),
+                    valid_assignees=live_valid_assignees,
+                    decomposition_guard=True,
                     expected_assignee=task.assignee,
+                    expected_assignment_generation=task.assignment_generation,
                 )
-            promoted = kb.get_task(conn, task_id)
+                if not ok:
+                    return _skip_outcome(
+                        conn,
+                        task_id,
+                        "task changed concurrently before single-task promotion",
+                        expected_assignee=task.assignee,
+                        expected_assignment_generation=task.assignment_generation,
+                    )
+                promoted = kb.get_task(conn, task_id)
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, f"DB rejected single task: {exc}")
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False,
@@ -709,14 +731,23 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, str(exc))
 
     try:
+        # The graph writer invokes this resolver inside its transaction and
+        # rolls back the whole graph if any selected/root route disappeared.
+        def live_valid_assignees() -> set[str]:
+            return resolve_orchestration_profiles(
+                _load_config(),
+                existing_assignee=task.assignee,
+            ).valid_names
+
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
                 root_assignee=orchestrator,
                 children=children,
-                valid_assignees=valid_names,
+                valid_assignees=live_valid_assignees,
                 expected_root_assignee=task.assignee,
+                expected_root_assignment_generation=task.assignment_generation,
                 author=audit_author,
                 auto_promote=auto_promote,
             )
@@ -726,6 +757,7 @@ def decompose_task(
                     task_id,
                     "task changed concurrently before graph creation",
                     expected_assignee=task.assignee,
+                    expected_assignment_generation=task.assignment_generation,
                 )
             decomposed_root = kb.get_task(conn, task_id)
     except ValueError as exc:

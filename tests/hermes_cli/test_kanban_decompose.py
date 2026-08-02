@@ -406,6 +406,220 @@ def test_fanout_skips_all_children_when_custody_changes_while_llm_runs(
     assert not any(event.kind == "decomposed" for event in events)
 
 
+def test_no_fanout_skips_assignment_aba_from_public_transitions(kanban_home):
+    original_body = ' \t\n{"metadata":{"blank":" ","bytes":17}}\n\t '
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ABA original title",
+            body=original_body,
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": False,
+            "title": "ABA stale title",
+            "body": "ABA stale body",
+            "assignee": "engineer",
+        }
+    )
+
+    def assign_and_restore(*_args, **_kwargs):
+        with kb.connect() as conn:
+            assert kb.assign_task(conn, tid, "fable")
+        with kb.connect() as conn:
+            assert kb.assign_task(conn, tid, None)
+        return _fake_aux_response(llm_payload)
+
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=assign_and_restore,
+        ):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert outcome.skipped is True
+    assert "assignment generation changed from 0 to 2" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert task is not None
+    assert task.title == "ABA original title"
+    assert task.body is not None
+    assert task.body.encode("utf-8") == original_body.encode("utf-8")
+    assert task.assignee is None
+    assert task.status == "triage"
+    assert task.assignment_generation == 2
+    assert task_count == 1
+    assert sum(event.kind == "assigned" for event in events) == 2
+    assert not any(event.kind in {"specified", "decomposed"} for event in events)
+
+
+def test_fanout_skips_assignment_aba_from_public_transitions(kanban_home):
+    original_body = "fanout root bytes\n\n  preserved  \n"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ABA fanout root",
+            body=original_body,
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {
+                    "title": "child A",
+                    "body": "A",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
+                {
+                    "title": "child B",
+                    "body": "B",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
+            ],
+        }
+    )
+
+    def assign_and_restore(*_args, **_kwargs):
+        with kb.connect() as conn:
+            assert kb.assign_task(conn, tid, "fable")
+        with kb.connect() as conn:
+            assert kb.assign_task(conn, tid, None)
+        return _fake_aux_response(llm_payload)
+
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=assign_and_restore,
+        ):
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert outcome.skipped is True
+    assert outcome.child_ids is None
+    assert "assignment generation changed from 0 to 2" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+    assert task is not None
+    assert task.title == "ABA fanout root"
+    assert task.body is not None
+    assert task.body.encode("utf-8") == original_body.encode("utf-8")
+    assert task.assignee is None
+    assert task.status == "triage"
+    assert task.assignment_generation == 2
+    assert task_count == 1
+    assert links == 0
+    assert sum(event.kind == "assigned" for event in events) == 2
+    assert not any(event.kind == "decomposed" for event in events)
+
+
+def test_fanout_rejects_profile_removed_during_inference(kanban_home):
+    from types import SimpleNamespace
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="live roster root",
+            body="must remain byte exact\n",
+            triage=True,
+        )
+
+    live_names = ["engineer"]
+
+    def list_live_profiles():
+        return [
+            SimpleNamespace(
+                name=name,
+                description=f"{name} capability",
+                provider="p",
+                model="m",
+            )
+            for name in live_names
+        ]
+
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {
+                    "title": "child A",
+                    "body": "A",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
+                {
+                    "title": "child B",
+                    "body": "B",
+                    "assignee": "engineer",
+                    "parents": [],
+                },
+            ],
+        }
+    )
+
+    def retire_then_answer(*_args, **_kwargs):
+        live_names.clear()
+        return _fake_aux_response(llm_payload)
+
+    with patch.object(
+        decomp.profiles_mod,
+        "list_profiles",
+        side_effect=list_live_profiles,
+    ), patch.object(
+        decomp.profiles_mod,
+        "get_active_profile_name",
+        return_value="engineer",
+    ), patch.object(
+        decomp,
+        "_fleet_named_lanes_only",
+        return_value=False,
+    ), patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=retire_then_answer,
+    ):
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "has no resolvable profile" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.title == "live roster root"
+    assert task.body == "must remain byte exact\n"
+    assert task.assignee is None
+    assert task.status == "triage"
+    assert task.assignment_generation == 0
+    assert task_count == 1
+    assert links == 0
+    assert not any(event.kind == "decomposed" for event in events)
+
+
 def test_no_fanout_rechecks_gate_added_while_llm_runs(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="race-sensitive root", triage=True)
