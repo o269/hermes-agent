@@ -326,15 +326,22 @@ class BrokerConnection:
     - COMMIT/ROLLBACK → txn_commit/txn_rollback.
     - autocommit reads → query proxy; autocommit writes → exec (real lastrowid).
 
+    A caller may bind one explicit client so an exact-task claim preserves its
+    selected socket and worker identity. Ordinary kanban_db connections keep
+    using the thread-local client.
+
     Exactly-once for the interactive path comes from the lifecycle transitions'
     own status-guard CAS (a re-run finds the new status and no-ops), NOT
-    applied_ops; the exactly-once-sensitive INSERT/claim ops are delegated
-    NATIVELY (add_comment/claim/… → kb_client, applied_ops). SAVEPOINT is the
-    one unsupported form (unused by write_txn) and raises loudly."""
+    applied_ops. SAVEPOINT is the one unsupported form (unused by write_txn) and
+    raises loudly."""
     row_factory = None
 
-    def __init__(self):
+    def __init__(self, client=None):
         self._txn = None  # open broker txn token, or None (autocommit)
+        self._bound_client = client
+
+    def _client(self):
+        return self._bound_client or _c()
 
     def execute(self, sql, params=()):
         s = (sql or "").strip()
@@ -344,31 +351,31 @@ class BrokerConnection:
             if self._txn is not None:
                 raise sqlite3.OperationalError(
                     "cannot start a transaction within a transaction")
-            self._txn = _x(_c().txn_begin)
+            self._txn = _x(self._client().txn_begin)
             return _Cursor()
         if first in ("commit", "end"):
             if self._txn is not None:
                 tok, self._txn = self._txn, None
-                _x(_c().txn_commit, tok)
+                _x(self._client().txn_commit, tok)
             return _Cursor()
         if first == "rollback":
             if self._txn is not None:
                 tok, self._txn = self._txn, None
-                _x(_c().txn_rollback, tok)
+                _x(self._client().txn_rollback, tok)
             return _Cursor()
         if first in ("savepoint", "release"):
             raise NotImplementedError(
                 "BrokerConnection: SAVEPOINT/RELEASE unsupported (unused by "
                 "write_txn). Route this call site through an op function.")
         if self._txn is not None:            # statement inside an open txn
-            r = _x(_c().txn_exec, self._txn, sql, list(params))
+            r = _x(self._client().txn_exec, self._txn, sql, list(params))
             return _Cursor(rows=r.get("rows") or [], rowcount=r.get("rowcount", -1),
                            lastrowid=r.get("lastrowid"))
         # autocommit
         if first in ("select", "with", "explain", "values", "pragma"):
-            return _Cursor(rows=_x(_c().query, sql, list(params)))
+            return _Cursor(rows=_x(self._client().query, sql, list(params)))
         if first in ("update", "insert", "delete"):
-            r = _x(_c().exec_write, sql, list(params))
+            r = _x(self._client().exec_write, sql, list(params))
             return _Cursor(rowcount=r.get("rowcount", -1),
                            lastrowid=r.get("lastrowid"))
         raise NotImplementedError(f"BrokerConnection: unsupported SQL {first!r}")
@@ -385,18 +392,18 @@ class BrokerConnection:
     def commit(self):
         if self._txn is not None:
             tok, self._txn = self._txn, None
-            _x(_c().txn_commit, tok)
+            _x(self._client().txn_commit, tok)
 
     def rollback(self):
         if self._txn is not None:
             tok, self._txn = self._txn, None
-            _x(_c().txn_rollback, tok)
+            _x(self._client().txn_rollback, tok)
 
     def close(self):
         # a dangling open txn (caller leaked the connection) — roll back.
         if self._txn is not None:
             try:
-                _c().txn_rollback(self._txn)
+                self._client().txn_rollback(self._txn)
             except Exception:
                 pass
             self._txn = None
@@ -410,10 +417,10 @@ class BrokerConnection:
         if self._txn is not None:
             tok, self._txn = self._txn, None
             if exc_type is None:
-                _x(_c().txn_commit, tok)
+                _x(self._client().txn_commit, tok)
             else:
                 try:
-                    _x(_c().txn_rollback, tok)
+                    _x(self._client().txn_rollback, tok)
                 except Exception:
                     pass
         return False
