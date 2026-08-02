@@ -53,13 +53,13 @@ class CardClassification:
 
     @property
     def mixed(self) -> bool:
-        """Return whether executable and authority markers occur together."""
-        return self.executor_marker and self.authority
+        """Return whether executor-shaped work and authority occur together."""
+        return self.executor and self.authority
 
     @property
     def pure_authority(self) -> bool:
-        """Return whether authority is explicit without an executable marker."""
-        return self.authority and not self.executor_marker
+        """Return whether authority is explicit without executor-shaped work."""
+        return self.authority and not self.executor
 
 
 def normalize_assignee(value: Optional[str]) -> Optional[str]:
@@ -100,9 +100,9 @@ def classify_card(title: str, body: Optional[str] = None) -> CardClassification:
     )
 
 
-def is_explicit_authority_card(title: str) -> bool:
-    """Return whether the title is explicit, unambiguously authority-only work."""
-    return classify_card(title).pure_authority
+def is_explicit_authority_card(title: str, body: Optional[str] = None) -> bool:
+    """Return whether title/body are explicit, unambiguously authority-only work."""
+    return classify_card(title, body).pure_authority
 
 
 def is_executor_shaped(title: str, body: Optional[str] = None) -> bool:
@@ -122,8 +122,8 @@ def resolve_transition_assignee(
     """Resolve transition custody without hiding a mixed review card.
 
     Omitted assignees normally preserve the current executor.  Review-state
-    callers set ``reject_implicit_mixed`` so a title containing both executor
-    and authority markers cannot silently cross the lifecycle boundary without
+    callers set ``reject_implicit_mixed`` so authority-tagged executor work in
+    either title or body cannot silently cross the lifecycle boundary without
     being split or explicitly routed back to an executor.
     """
     requested = normalize_assignee(requested_assignee)

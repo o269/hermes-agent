@@ -47,6 +47,139 @@ COMBINED_MIXED_TITLES = tuple(
     for parts in permutations(("operator-hold", "review"))
 )
 MIXED_TITLES = SEPARATED_MIXED_TITLES + COMBINED_MIXED_TITLES
+BROAD_EXECUTOR_AUTHORITY_CASES = (
+    pytest.param("[land] implement the migration", None, id="R6-P01"),
+    pytest.param("[LAND] implement the migration", None, id="R6-P02"),
+    pytest.param("[APPLY] implement the migration", None, id="R6-P03"),
+    pytest.param("[FABLE+LAND] implement the migration", None, id="R6-P04"),
+    pytest.param("[fable+land] implement the migration", None, id="R6-P05"),
+    pytest.param("[LAND+FABLE] implement the migration", None, id="R6-P06"),
+    pytest.param("[OPERATOR-GATE] implement the migration", None, id="R6-P07"),
+    pytest.param("[ACCEPTANCE] implement the migration", None, id="R6-P08"),
+    pytest.param("[MERGE] author the fix", None, id="R6-P09"),
+    pytest.param("[LAND] fix the bug", None, id="R6-P10"),
+    pytest.param("[LAND] review the PR", None, id="R6-P11"),
+    pytest.param("[LAND] build the package", None, id="R6-P12"),
+    pytest.param("[LAND] test the suite", None, id="R6-P13"),
+    pytest.param("[LAND] verify the result", None, id="R6-P14"),
+    pytest.param("[LAND] audit the surface", None, id="R6-P15"),
+    pytest.param("[LAND] rework the patch", None, id="R6-P16"),
+    pytest.param("[LAND] rebind the branch", None, id="R6-P17"),
+    pytest.param("[LAND] migrate the schema", None, id="R6-P18"),
+    pytest.param("[LAND] migration plan", None, id="R6-P19"),
+    pytest.param("[LAND] authoring notes", None, id="R6-P20"),
+    pytest.param("[LAND] source code changes", None, id="R6-P21"),
+    pytest.param("[LAND] source-code deliverable", None, id="R6-P22"),
+    pytest.param("[LAND] pull request ready", None, id="R6-P23"),
+    pytest.param("[LAND] PR #23 follow-up", None, id="R6-P24"),
+    pytest.param("[LAND] PR 23 follow-up", None, id="R6-P25"),
+    pytest.param(
+        "[fable+land] authority hold",
+        "Please implement the migration under Fable custody.",
+        id="R6-P26-body",
+    ),
+    pytest.param(
+        "[LAND] custody hold",
+        "Please author the fix.",
+        id="R6-P27-body",
+    ),
+    pytest.param(
+        "[APPLY] custody hold",
+        "Please review the diff.",
+        id="R6-P28-body",
+    ),
+    pytest.param(
+        "[LAND] custody hold",
+        "Open pull request when ready.",
+        id="R6-P29-body",
+    ),
+    pytest.param(
+        "[LAND] custody hold",
+        "Ship source-code changes.",
+        id="R6-P30-body",
+    ),
+)
+CLASSIFICATION_CONTROL_CASES = (
+    pytest.param("[LAND] ship after gates", None, False, False, True, id="C-AUTH-01"),
+    pytest.param(
+        "[FABLE][LAND] exact-head acceptance",
+        None,
+        False,
+        False,
+        True,
+        id="C-AUTH-02",
+    ),
+    pytest.param(
+        "[FABLE][LAND+INSTALL-GATE] reviewed exact-head acceptance",
+        None,
+        False,
+        False,
+        True,
+        id="C-AUTH-03",
+    ),
+    pytest.param(
+        "[APPLY] operator cutover",
+        "Waiting on operator signal only.",
+        False,
+        False,
+        True,
+        id="C-AUTH-04",
+    ),
+    pytest.param(
+        "[LAND+FIX] implement the reviewed repair",
+        None,
+        True,
+        True,
+        True,
+        id="C-MIX-01",
+    ),
+    pytest.param(
+        "[FIX][FABLE][LAND] implement the reviewed repair",
+        None,
+        True,
+        True,
+        True,
+        id="C-MIX-02",
+    ),
+    pytest.param("[FIX] repair the policy", None, True, True, False, id="C-EXEC-01"),
+    pytest.param(
+        "[REVIEW] exact-head security verdict",
+        None,
+        True,
+        True,
+        False,
+        id="C-EXEC-02",
+    ),
+    pytest.param(
+        "implement the migration", None, True, False, False, id="C-EXEC-03"
+    ),
+    pytest.param(
+        "Status update", "Waiting on operator.", False, False, False, id="C-NEUT-01"
+    ),
+    pytest.param(
+        "[AUTHOR][LANDING-PAGE] implement the review fixes",
+        None,
+        True,
+        True,
+        False,
+        id="C-EDGE-01",
+    ),
+    pytest.param("[LAND] fixed pricing display", None, False, False, True, id="C-EDGE-02"),
+    pytest.param("[LAND] prefix the column", None, False, False, True, id="C-EDGE-03"),
+    pytest.param(
+        "LAND the change after review", None, True, False, False, id="C-EDGE-04"
+    ),
+    pytest.param(
+        "implement the migration",
+        "Must [LAND] after review",
+        True,
+        False,
+        False,
+        id="C-EDGE-05",
+    ),
+    pytest.param("[LANDER-PREP] packet", None, False, False, False, id="C-EDGE-06"),
+    pytest.param("[LANDING-PAGE] ship copy", None, False, False, False, id="C-EDGE-07"),
+)
 
 
 class MemoryBroker:
@@ -230,6 +363,111 @@ def test_public_authority_helper_preserves_pure_semantics(
     assert policy.is_explicit_authority_card(title) is expected
 
 
+@pytest.mark.parametrize(("title", "body"), BROAD_EXECUTOR_AUTHORITY_CASES)
+def test_broad_executor_prose_is_mixed_not_pure_authority(
+    title: str, body: str | None
+):
+    classification = policy.classify_card(title, body)
+
+    assert classification.executor
+    assert not classification.executor_marker
+    assert classification.authority
+    assert classification.mixed
+    assert not classification.pure_authority
+
+
+@pytest.mark.parametrize(("title", "body"), BROAD_EXECUTOR_AUTHORITY_CASES)
+def test_public_authority_helper_rejects_broad_executor_prose(
+    title: str, body: str | None
+):
+    assert not policy.is_explicit_authority_card(title, body)
+
+
+@pytest.mark.parametrize(
+    ("title", "body", "executor", "executor_marker", "authority"),
+    CLASSIFICATION_CONTROL_CASES,
+)
+def test_control_matrix_preserves_classification_and_lifecycle_semantics(
+    title: str,
+    body: str | None,
+    executor: bool,
+    executor_marker: bool,
+    authority: bool,
+):
+    classification = policy.classify_card(title, body)
+    expected_mixed = executor and authority
+    expected_pure_authority = authority and not executor
+
+    assert classification.executor is executor
+    assert classification.executor_marker is executor_marker
+    assert classification.authority is authority
+    assert classification.mixed is expected_mixed
+    assert classification.pure_authority is expected_pure_authority
+    assert policy.is_explicit_authority_card(title, body) is expected_pure_authority
+
+    create_broker = MemoryBroker()
+    if expected_pure_authority:
+        result = bridge.create_task(
+            create_broker,
+            title=title,
+            body=body,
+            assignee="fable",
+            status="blocked",
+            created_by="orchestrator",
+            priority=0,
+            workspace_kind="scratch",
+        )
+        assert result["assignee"] == "fable"
+    else:
+        with pytest.raises(policy.AuthorityLaneError):
+            bridge.create_task(
+                create_broker,
+                title=title,
+                body=body,
+                assignee="fable",
+                status="blocked",
+                created_by="orchestrator",
+                priority=0,
+                workspace_kind="scratch",
+            )
+        assert create_broker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+    explicit_broker = MemoryBroker()
+    explicit_broker.seed(
+        task_id="t_executor",
+        title=title,
+        body=body,
+        assignee="engineer",
+    )
+    if expected_pure_authority:
+        result = _transition(explicit_broker, assignee="fable")
+        assert result["assignee"] == "fable"
+    else:
+        with pytest.raises(policy.AuthorityLaneError):
+            _transition(explicit_broker, assignee="fable")
+        row = explicit_broker.get_task("t_executor")
+        assert row["status"] == "running"
+        assert row["assignee"] == "engineer"
+
+    implicit_broker = MemoryBroker()
+    implicit_broker.seed(
+        task_id="t_executor",
+        title=title,
+        body=body,
+        assignee="engineer",
+    )
+    if expected_mixed:
+        with pytest.raises(policy.AuthorityLaneError, match="implicit assignee"):
+            _transition(implicit_broker)
+        row = implicit_broker.get_task("t_executor")
+        assert row["status"] == "running"
+        assert row["assignee"] == "engineer"
+    else:
+        result = _transition(implicit_broker)
+        assert result["assignee"] == "engineer"
+        assert result["to"] == "review"
+
+
 def test_omitted_review_assignee_preserves_current_executor_with_broker_readback():
     broker = MemoryBroker()
     broker.seed(
@@ -321,12 +559,52 @@ def test_mixed_transition_to_fable_fails_closed_without_mutation(title: str):
     assert row["assignee"] == "engineer"
 
 
+@pytest.mark.parametrize(("title", "body"), BROAD_EXECUTOR_AUTHORITY_CASES)
+def test_broad_executor_transition_to_fable_fails_closed_without_mutation(
+    title: str, body: str | None
+):
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title=title,
+        body=body,
+        assignee="engineer",
+    )
+
+    with pytest.raises(policy.AuthorityLaneError, match="executor-shaped work"):
+        _transition(broker, assignee="fable")
+
+    row = broker.get_task("t_executor")
+    assert row["status"] == "running"
+    assert row["assignee"] == "engineer"
+
+
 @pytest.mark.parametrize("title", MIXED_TITLES)
 def test_implicit_review_of_mixed_title_fails_closed_without_mutation(title: str):
     broker = MemoryBroker()
     broker.seed(
         task_id="t_executor",
         title=title,
+        assignee="engineer",
+    )
+
+    with pytest.raises(policy.AuthorityLaneError, match="implicit assignee"):
+        _transition(broker)
+
+    row = broker.get_task("t_executor")
+    assert row["status"] == "running"
+    assert row["assignee"] == "engineer"
+
+
+@pytest.mark.parametrize(("title", "body"), BROAD_EXECUTOR_AUTHORITY_CASES)
+def test_implicit_review_of_broad_executor_prose_fails_closed_without_mutation(
+    title: str, body: str | None
+):
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title=title,
+        body=body,
         assignee="engineer",
     )
 
@@ -441,6 +719,27 @@ def test_create_time_mixed_assignment_to_fable_is_rejected(title: str):
     assert broker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(("title", "body"), BROAD_EXECUTOR_AUTHORITY_CASES)
+def test_create_time_broad_executor_assignment_to_fable_is_rejected(
+    title: str, body: str | None
+):
+    broker = MemoryBroker()
+
+    with pytest.raises(policy.AuthorityLaneError, match="executor-shaped work"):
+        bridge.create_task(
+            broker,
+            title=title,
+            body=body,
+            assignee="fable",
+            status="blocked",
+            created_by="orchestrator",
+            priority=0,
+            workspace_kind="scratch",
+        )
+
+    assert broker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_create_cli_returns_guard_exit_without_broker_mutation(capsys):
     broker = MemoryBroker()
 
@@ -492,7 +791,7 @@ def test_create_time_explicit_fable_authority_card_is_allowed():
 
     result = bridge.create_task(
         broker,
-        title="[OPERATOR-GATE][FABLE][APPLY] reviewed migration",
+        title="[OPERATOR-GATE][FABLE][APPLY] reviewed exact-head acceptance",
         body="Apply only after exact-head acceptance.",
         assignee="fable",
         status="blocked",
