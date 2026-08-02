@@ -12,28 +12,29 @@ from typing import Optional
 
 AUTHORITY_PROFILE = "fable"
 
-# Authority custody must be explicit in a bracketed title marker.  A bare
-# ``[FABLE]`` identity marker is not enough: the action itself must be named.
-_AUTHORITY_TITLE_TAG = re.compile(
-    r"\[[^\]]*(?<![A-Z0-9])(?:LAND|APPLY|OPERATOR|ACCEPT|ACCEPTANCE|"
+# Title-marker classification is deliberately two-phase: first isolate bounded
+# bracket contents, then search each content block for complete marker tokens.
+# This keeps token order irrelevant (``[LAND+FIX]`` and ``[FIX+LAND]`` are both
+# mixed) without treating prose outside brackets as an authority declaration.
+_BRACKET_CONTENT = re.compile(r"\[([^\]]*)\]")
+_AUTHORITY_TITLE_TOKEN = re.compile(
+    r"(?<![A-Z0-9])(?:LAND|APPLY|OPERATOR|ACCEPT|ACCEPTANCE|"
     r"APPROVAL|APPROVE|AUTHORITY|INSTALL|DEPLOY|MERGE|CUTOVER|RELEASE|"
-    r"SUPERSESSION|RECOVERY|DECISION)(?![A-Z0-9])[^\]]*\]",
+    r"SUPERSESSION|RECOVERY|DECISION)(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+_EXECUTOR_TITLE_TOKEN = re.compile(
+    r"(?<![A-Z0-9])(?:AUTHOR|FIX|REVIEW|EXEC|IMPLEMENT|BUILD|TEST|VERIFY|"
+    r"AUDIT|REWORK|REBIND|MIGRAT(?:E|ION))(?![A-Z0-9])",
     re.IGNORECASE,
 )
 
-# Bracketed executable title markers take precedence over authority markers.
-_EXECUTOR_TITLE_TAG = re.compile(
-    r"\[(?:AUTHOR|FIX|REVIEW|EXEC|IMPLEMENT|BUILD|TEST|VERIFY|AUDIT|"
-    r"REWORK|REBIND|MIGRAT(?:E|ION))[^\]]*\]",
-    re.IGNORECASE,
-)
-# The broader shape also checks title + body so an authority-less neutral title
-# cannot hide an implementation deliverable in the opening post.
+# The broader prose shape also checks title + body so an authority-less neutral
+# title cannot hide an implementation deliverable in the opening post.
 _EXECUTOR_SHAPE = re.compile(
-    r"(?:\[(?:AUTHOR|FIX|REVIEW|EXEC|IMPLEMENT|BUILD|TEST|VERIFY|AUDIT|"
-    r"REWORK|REBIND|MIGRAT(?:E|ION))[^\]]*\]|\b(?:author(?:ing)?|implement(?:ation)?|"
+    r"\b(?:author(?:ing)?|implement(?:ation)?|"
     r"fix|review|rework|rebind|build|test|verify|audit|migrat(?:e|ion)|"
-    r"source[- ]?code|pull request|\bPR\s*#?\d+)\b)",
+    r"source[- ]?code|pull request|PR\s*#?\d+)\b",
     re.IGNORECASE,
 )
 
@@ -55,6 +56,11 @@ class CardClassification:
         """Return whether executable and authority markers occur together."""
         return self.executor_marker and self.authority
 
+    @property
+    def pure_authority(self) -> bool:
+        """Return whether authority is explicit without an executable marker."""
+        return self.authority and not self.executor_marker
+
 
 def normalize_assignee(value: Optional[str]) -> Optional[str]:
     """Return a canonical profile label while preserving an omitted assignee."""
@@ -62,6 +68,19 @@ def normalize_assignee(value: Optional[str]) -> Optional[str]:
         return None
     text = str(value).strip().lower()
     return text or None
+
+
+def _classify_title_markers(title: str) -> tuple[bool, bool]:
+    """Return ``(executor, authority)`` for complete tokens inside brackets."""
+    executor = False
+    authority = False
+    for match in _BRACKET_CONTENT.finditer(title or ""):
+        content = match.group(1)
+        executor = executor or bool(_EXECUTOR_TITLE_TOKEN.search(content))
+        authority = authority or bool(_AUTHORITY_TITLE_TOKEN.search(content))
+        if executor and authority:
+            break
+    return executor, authority
 
 
 def classify_card(title: str, body: Optional[str] = None) -> CardClassification:
@@ -72,16 +91,18 @@ def classify_card(title: str, body: Optional[str] = None) -> CardClassification:
     executable-marker-wins rule and fail closed when an automatic lifecycle
     transition would otherwise hide an ambiguous mixed card.
     """
+    executor_marker, authority = _classify_title_markers(title)
     return CardClassification(
-        executor=bool(_EXECUTOR_SHAPE.search(f"{title or ''}\n{body or ''}")),
-        executor_marker=bool(_EXECUTOR_TITLE_TAG.search(title or "")),
-        authority=bool(_AUTHORITY_TITLE_TAG.search(title or "")),
+        executor=executor_marker
+        or bool(_EXECUTOR_SHAPE.search(f"{title or ''}\n{body or ''}")),
+        executor_marker=executor_marker,
+        authority=authority,
     )
 
 
 def is_explicit_authority_card(title: str) -> bool:
-    """Return whether the title names an allowed authority action explicitly."""
-    return classify_card(title).authority
+    """Return whether the title is explicit, unambiguously authority-only work."""
+    return classify_card(title).pure_authority
 
 
 def is_executor_shaped(title: str, body: Optional[str] = None) -> bool:
@@ -135,9 +156,7 @@ def validate_assignment(
     """
     target = normalize_assignee(assignee)
     classification = classify_card(title, body)
-    if target == AUTHORITY_PROFILE and (
-        classification.executor_marker or not classification.authority
-    ):
+    if target == AUTHORITY_PROFILE and not classification.pure_authority:
         work_kind = "executor-shaped work" if classification.executor else (
             "work without an explicit authority action"
         )

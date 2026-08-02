@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from itertools import permutations
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,19 @@ def _load_module(name: str, path: Path):
 bridge = _load_module("authority_lane_bridge_test", ASSET_DIR / "kanban_bridge_state.py")
 policy = sys.modules["authority_lane_policy"]
 installer = _load_module("authority_lane_installer_test", ASSET_DIR / "install.py")
+
+SEPARATED_MIXED_TITLES = (
+    "[FIX][FABLE][LAND] implement the reviewed repair",
+    "[review][operator-hold] verify implementation",
+)
+COMBINED_MIXED_TITLES = tuple(
+    f"[{'+'.join(parts)}] implement the reviewed repair"
+    for parts in permutations(("fable", "land", "fix"))
+) + tuple(
+    f"[{'+'.join(parts)}] verify implementation"
+    for parts in permutations(("operator-hold", "review"))
+)
+MIXED_TITLES = SEPARATED_MIXED_TITLES + COMBINED_MIXED_TITLES
 
 
 class MemoryBroker:
@@ -186,13 +200,7 @@ def _transition(broker: MemoryBroker, **overrides):
     return bridge.transition_task(broker, **values)
 
 
-@pytest.mark.parametrize(
-    "title",
-    (
-        "[FIX][FABLE][LAND] implement the reviewed repair",
-        "[review][operator-hold] verify implementation",
-    ),
-)
+@pytest.mark.parametrize("title", MIXED_TITLES)
 def test_classifier_retains_mixed_dimensions_for_executable_precedence(title: str):
     classification = policy.classify_card(title)
 
@@ -200,6 +208,26 @@ def test_classifier_retains_mixed_dimensions_for_executable_precedence(title: st
     assert classification.executor_marker
     assert classification.authority
     assert classification.mixed
+    assert not classification.pure_authority
+
+
+@pytest.mark.parametrize("title", MIXED_TITLES)
+def test_public_authority_helper_rejects_mixed_title(title: str):
+    assert not policy.is_explicit_authority_card(title)
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    (
+        ("[FABLE][LAND] exact-head acceptance", True),
+        ("[review] exact-head security verdict", False),
+        ("[AUTHOR][LANDING-PAGE] implement the review fixes", False),
+    ),
+)
+def test_public_authority_helper_preserves_pure_semantics(
+    title: str, expected: bool
+):
+    assert policy.is_explicit_authority_card(title) is expected
 
 
 def test_omitted_review_assignee_preserves_current_executor_with_broker_readback():
@@ -276,13 +304,7 @@ def test_executor_transition_to_fable_fails_closed_without_mutation():
     assert row["assignee"] == "engineer"
 
 
-@pytest.mark.parametrize(
-    "title",
-    (
-        "[FIX][FABLE][LAND] implement the reviewed repair",
-        "[review][operator-hold] verify implementation",
-    ),
-)
+@pytest.mark.parametrize("title", MIXED_TITLES)
 def test_mixed_transition_to_fable_fails_closed_without_mutation(title: str):
     broker = MemoryBroker()
     broker.seed(
@@ -299,13 +321,7 @@ def test_mixed_transition_to_fable_fails_closed_without_mutation(title: str):
     assert row["assignee"] == "engineer"
 
 
-@pytest.mark.parametrize(
-    "title",
-    (
-        "[FIX][FABLE][LAND] implement the reviewed repair",
-        "[review][operator-hold] verify implementation",
-    ),
-)
+@pytest.mark.parametrize("title", MIXED_TITLES)
 def test_implicit_review_of_mixed_title_fails_closed_without_mutation(title: str):
     broker = MemoryBroker()
     broker.seed(
@@ -406,13 +422,7 @@ def test_create_time_executor_assignment_to_fable_is_rejected():
     assert count == 0
 
 
-@pytest.mark.parametrize(
-    "title",
-    (
-        "[FIX][FABLE][LAND] implement the reviewed repair",
-        "[review][operator-hold] verify implementation",
-    ),
-)
+@pytest.mark.parametrize("title", MIXED_TITLES)
 def test_create_time_mixed_assignment_to_fable_is_rejected(title: str):
     broker = MemoryBroker()
 
@@ -512,6 +522,10 @@ WRAPPERS = (
     "kanban_codex_service.sh",
     "kanban_subscription_acp_service.sh",
     "run_kanban_codex_service.sh",
+    "run_ef2_post_cursor_verify.sh",
+    "run_pr534_node22_verify.sh",
+)
+HISTORICAL_ONE_OFF_WRAPPERS = (
     "run_ef2_post_cursor_verify.sh",
     "run_pr534_node22_verify.sh",
 )
@@ -749,6 +763,48 @@ def test_wrapper_stops_before_executor_when_running_transition_is_rejected(
     assert not marker.exists()
     calls = [json.loads(line) for line in state_log.read_text().splitlines()]
     assert [call[1] for call in calls] == ["running"]
+
+
+@pytest.mark.parametrize("wrapper", HISTORICAL_ONE_OFF_WRAPPERS)
+def test_historical_wrapper_requires_task_before_state_bridge(
+    tmp_path: Path, wrapper: str
+):
+    state_marker = tmp_path / "state-invoked"
+    state = tmp_path / "state"
+    _write_executable(
+        state,
+        "#!/usr/bin/env sh\n: > \"$STATE_MARKER\"\nexit 99\n",
+    )
+    env = os.environ.copy()
+    env.pop("KANBAN_TASK", None)
+    env.update(
+        {
+            "KANBAN_BRIDGE_STATE": str(state),
+            "STATE_MARKER": str(state_marker),
+        }
+    )
+
+    completed = subprocess.run(
+        [str(ASSET_DIR / wrapper)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 64
+    assert "missing required KANBAN_TASK" in completed.stderr
+    assert not state_marker.exists()
+
+
+def test_installer_excludes_historical_one_off_wrappers():
+    installed_sources = {
+        source.name for source, _target, _mode in installer.INSTALL_MANIFEST
+    }
+
+    assert installed_sources.isdisjoint(HISTORICAL_ONE_OFF_WRAPPERS)
 
 
 def test_installer_dry_run_install_and_check_round_trip(tmp_path: Path):

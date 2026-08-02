@@ -2,7 +2,11 @@
 set -euo pipefail
 HERMES_HOME=${HERMES_HOME:-"$HOME/.hermes"}
 STATE=${KANBAN_BRIDGE_STATE:-"$HERMES_HOME/scripts/kanban_bridge_state.py"}
-TASK=${KANBAN_TASK:-t_ac57bb0f}
+if [ -z "${KANBAN_TASK:-}" ]; then
+ printf 'missing required KANBAN_TASK\n' >&2
+ exit 64
+fi
+TASK=$KANBAN_TASK
 WT=${KANBAN_WORKTREE:-/tmp/cfr-estimates-ef2-cursor}
 BRANCH=${KANBAN_BRANCH:-fix/rm-estimates-ef2-t-ac57bb0f-v2}
 LOG=${KANBAN_VERIFY_LOG:-/tmp/cfr-estimates-ef2-post-cursor-verify.log}

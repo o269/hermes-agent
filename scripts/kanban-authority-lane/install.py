@@ -36,16 +36,6 @@ INSTALL_MANIFEST = (
         0o755,
     ),
     (
-        SOURCE_DIR / "run_ef2_post_cursor_verify.sh",
-        Path("scripts/run_ef2_post_cursor_verify.sh"),
-        0o755,
-    ),
-    (
-        SOURCE_DIR / "run_pr534_node22_verify.sh",
-        Path("scripts/run_pr534_node22_verify.sh"),
-        0o755,
-    ),
-    (
         REPO_ROOT
         / "skills/devops/kanban-workflows/references/"
         "canonical-pr-rework-and-respawn-guards.md",

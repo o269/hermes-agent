@@ -2,7 +2,11 @@
 set -euo pipefail
 HERMES_HOME=${HERMES_HOME:-"$HOME/.hermes"}
 STATE=${KANBAN_BRIDGE_STATE:-"$HERMES_HOME/scripts/kanban_bridge_state.py"}
-TASK=${KANBAN_TASK:-t_3d9e8eb3}
+if [ -z "${KANBAN_TASK:-}" ]; then
+ printf 'missing required KANBAN_TASK\n' >&2
+ exit 64
+fi
+TASK=$KANBAN_TASK
 WT=${KANBAN_WORKTREE:-/tmp/omnia-pr534-verify}
 BRANCH=${KANBAN_BRANCH:-security/rm-auth-dbauth-t3d9e8eb3}
 PATH=${KANBAN_VERIFY_PATH:-"$HOME/.nvm/versions/node/v22.23.1/bin:/usr/local/bin:/usr/bin:/bin"}
