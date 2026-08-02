@@ -887,6 +887,10 @@ class Task:
     max_runtime_seconds: Optional[int] = None
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
+    # Queue lane that produced the current/latest dispatch attempt. Persisted
+    # across retries so review work never silently falls back to the generic
+    # ready/author lane after a crash, timeout, rate limit, or spawn failure.
+    dispatch_origin: Optional[str] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
@@ -994,6 +998,9 @@ class Task:
             current_run_id=(
                 row["current_run_id"] if "current_run_id" in keys else None
             ),
+            dispatch_origin=(
+                row["dispatch_origin"] if "dispatch_origin" in keys else None
+            ),
             workflow_template_id=(
                 row["workflow_template_id"] if "workflow_template_id" in keys else None
             ),
@@ -1040,6 +1047,7 @@ class Run:
     task_id: str
     profile: Optional[str]
     step_key: Optional[str]
+    dispatch_origin: Optional[str]
     status: str
     claim_lock: Optional[str]
     claim_expires: Optional[int]
@@ -1071,6 +1079,9 @@ class Run:
             task_id=row["task_id"],
             profile=row["profile"],
             step_key=row["step_key"],
+            dispatch_origin=(
+                row["dispatch_origin"] if "dispatch_origin" in keys else None
+            ),
             status=row["status"],
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1284,6 +1295,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
+    -- Queue lane that produced the latest dispatch attempt. ``review`` must
+    -- survive every retry/recovery path instead of falling back to ``ready``.
+    dispatch_origin      TEXT,
     -- Forward-compat for v2 workflow routing. In v1 the kernel writes
     -- these when the task is opted into a template but otherwise ignores
     -- them; the dispatcher doesn't consult them for routing yet.
@@ -1368,6 +1382,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     task_id             TEXT NOT NULL,
     profile             TEXT,
     step_key            TEXT,
+    dispatch_origin     TEXT,
     status              TEXT NOT NULL,
     -- status: running | done | blocked | crashed | timed_out | failed | released
     claim_lock          TEXT,
@@ -2423,6 +2438,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_run_id", "current_run_id INTEGER"
         )
+    if "dispatch_origin" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dispatch_origin", "dispatch_origin TEXT"
+        )
     if "workflow_template_id" not in cols:
         _add_column_if_missing(
             conn, "tasks", "workflow_template_id", "workflow_template_id TEXT"
@@ -2527,6 +2546,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
         }
         run_identity_columns = {
+            "dispatch_origin": "TEXT",
             "worker_pid_started": "INTEGER",
             "worker_pgid": "INTEGER",
             "worker_sid": "INTEGER",
@@ -2604,11 +2624,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 cur = conn.execute(
                     """
                     INSERT INTO task_runs (
-                        task_id, profile, status,
+                        task_id, profile, dispatch_origin, status,
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'ready', 'running', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
@@ -2623,7 +2643,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 # CAS fails we've got an orphan run_row — mark it
                 # reclaimed so it doesn't look in-flight.
                 upd = conn.execute(
-                    "UPDATE tasks SET current_run_id = ? "
+                    "UPDATE tasks SET current_run_id = ?, "
+                    "dispatch_origin = COALESCE(dispatch_origin, 'ready') "
                     "WHERE id = ? AND current_run_id IS NULL",
                     (cur.lastrowid, row["id"]),
                 )
@@ -2694,6 +2715,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_runs ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
+        " dispatch_origin TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, worker_pid_started INTEGER,"
         " worker_pgid INTEGER, worker_sid INTEGER, worker_boot_id TEXT,"
@@ -3816,60 +3838,86 @@ def _end_run(
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
 ) -> Optional[int]:
-    """Close the currently-active run for ``task_id`` and clear the pointer.
+    """Close every active run for ``task_id`` and clear task claim state.
 
-    ``outcome`` is the semantic result (completed / blocked / crashed /
-    timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
-    run-row status (usually just ``outcome``, but callers can pass it
-    explicitly). Returns the closed run_id or ``None`` if no active run
-    existed (e.g. a CLI user calling ``hermes kanban complete`` on a
-    task that was never claimed).
+    The task pointer is a denormalized convenience, not the lifecycle source of
+    truth. A stale or externally-cleared pointer must never let an open run
+    survive a terminal transition, so this function reconciles *all* open run
+    rows for the task in the caller's transaction. ``outcome`` is the semantic
+    result (completed / blocked / crashed / timed_out / spawn_failed / gave_up /
+    reclaimed); ``status`` is the run-row status. Returns the pointer-selected
+    run id (or newest open run id) and ``None`` only when no active run existed.
     """
     now = int(time.time())
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    if not row or not row["current_run_id"]:
+    if row is None:
         return None
-    run_id = int(row["current_run_id"])
+
+    open_rows = conn.execute(
+        "SELECT id FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NULL ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    open_ids = [int(run["id"]) for run in open_rows]
+    pointed_run_id = (
+        int(row["current_run_id"])
+        if row["current_run_id"] is not None
+        else None
+    )
+    run_id = (
+        pointed_run_id
+        if pointed_run_id in open_ids
+        else (open_ids[0] if open_ids else None)
+    )
+
+    if open_ids:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE task_id = ?
+               AND ended_at IS NULL
+            """,
+            (
+                status or outcome,
+                outcome,
+                summary,
+                error,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                now,
+                task_id,
+            ),
+        )
+
+    # Lifecycle transitions own both sides of the denormalized claim/run
+    # invariant. Clearing only current_run_id can leave an archived/done card
+    # looking claimed; clearing only the task row can leak a running run.
     conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (
-            status or outcome,
-            outcome,
+        "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+        (task_id,),
+    )
+    if run_id is not None:
+        # The closing run's own handoff text is the card's work product, so any
+        # PR it names is this card's custody rather than a coordination citation.
+        _record_task_pr_declaration(
+            conn,
+            task_id,
             summary,
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now,
-            run_id,
-        ),
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
-    )
-    # The closing run's own handoff text is the card's work product, so any PR
-    # it names is this card's custody rather than a coordination citation.
-    _record_task_pr_declaration(
-        conn,
-        task_id,
-        summary,
-        error,
-        json.dumps(metadata, ensure_ascii=False) if metadata else None,
-        observed_at=now,
-    )
+            observed_at=now,
+        )
     return run_id
 
 
@@ -3878,6 +3926,11 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+def _dispatch_retry_status(origin: object) -> str:
+    """Return the queue status a non-terminal run must recover into."""
+    return "review" if origin == "review" else "ready"
 
 
 def _synthesize_ended_run(
@@ -3906,22 +3959,24 @@ def _synthesize_ended_run(
     """
     now = int(time.time())
     trow = conn.execute(
-        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        "SELECT assignee, current_step_key, dispatch_origin "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    dispatch_origin = trow["dispatch_origin"] if trow else None
     cur = conn.execute(
         """
         INSERT INTO task_runs (
-            task_id, profile, step_key,
+            task_id, profile, step_key, dispatch_origin,
             status, outcome,
             summary, error, metadata,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, profile, step_key,
+            task_id, profile, step_key, dispatch_origin,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
@@ -4387,23 +4442,20 @@ def claim_task(
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
+        # Repair either side of a stale task/run invariant before opening a new
+        # attempt. ``_end_run`` also finds orphan open runs when the pointer is
+        # absent, which a pointer-only cleanup cannot do.
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'ready'",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
+        if stale:
+            _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="invariant recovery on re-claim",
             )
         cur = conn.execute(
             """
@@ -4411,7 +4463,8 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   dispatch_origin = 'ready'
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
@@ -4430,10 +4483,10 @@ def claim_task(
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
-                task_id, profile, step_key, status,
+                task_id, profile, step_key, dispatch_origin, status,
                 claim_lock, claim_expires, max_runtime_seconds,
                 started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'ready', 'running', ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4540,13 +4593,26 @@ def claim_review_task(
             expected_status="review",
         ):
             return None
+        stale = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if stale:
+            _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="invariant recovery on review re-claim",
+            )
         cur = conn.execute(
             """
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   dispatch_origin = 'review'
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
@@ -4563,10 +4629,10 @@ def claim_review_task(
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
-                task_id, profile, step_key, status,
+                task_id, profile, step_key, dispatch_origin, status,
                 claim_lock, claim_expires, max_runtime_seconds,
                 started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'review', 'running', ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4664,6 +4730,7 @@ def release_stale_claims(
     stale = conn.execute(
         "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
         "       t.last_heartbeat_at, t.current_run_id, "
+        "       COALESCE(r.dispatch_origin, t.dispatch_origin) AS dispatch_origin, "
         "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
         "       r.worker_started_at, r.worker_group_started_at "
         "FROM tasks t "
@@ -4782,12 +4849,13 @@ def release_stale_claims(
             continue
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
                 "AND current_run_id IS ?",
                 (
+                    _dispatch_retry_status(row["dispatch_origin"]),
                     row["id"], row["claim_lock"], now,
                     row["current_run_id"],
                 ),
@@ -4845,6 +4913,7 @@ def reclaim_task(
     """
     row = conn.execute(
         "SELECT t.status, t.claim_lock, t.worker_pid, t.current_run_id, "
+        "       COALESCE(r.dispatch_origin, t.dispatch_origin) AS dispatch_origin, "
         "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
         "       r.worker_started_at, r.worker_group_started_at "
         "FROM tasks t "
@@ -4907,11 +4976,16 @@ def reclaim_task(
         return False
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status IN ('running', 'ready', 'review', 'blocked') "
             "AND claim_lock IS ? AND current_run_id IS ?",
-            (task_id, prev_lock, row["current_run_id"]),
+            (
+                _dispatch_retry_status(row["dispatch_origin"]),
+                task_id,
+                prev_lock,
+                row["current_run_id"],
+            ),
         )
         if cur.rowcount != 1:
             return False
@@ -6140,7 +6214,7 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, dispatch_origin FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6172,11 +6246,16 @@ def promote_task(
     if dry_run:
         return True, None
 
+    new_status = (
+        "review"
+        if cur_status == "blocked" and row["dispatch_origin"] == "review"
+        else "ready"
+    )
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
+            "UPDATE tasks SET status = ? "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            (new_status, task_id),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
@@ -6184,7 +6263,12 @@ def promote_task(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {
+                "actor": actor,
+                "reason": reason,
+                "forced": force,
+                "status": new_status,
+            },
         )
 
     return True, None
@@ -6200,37 +6284,34 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
-    now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, dispatch_origin FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on unblock'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
+        if stale:
+            _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="invariant recovery on unblock",
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        # Re-gate on parent completion before flipping an author-lane block back
+        # to ready. Review-lane blockers already passed dependency gating and
+        # must return to review rather than silently restarting author work.
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        new_status = (
+            "review"
+            if stale and stale["dispatch_origin"] == "review"
+            else ("todo" if undone_parents else "ready")
+        )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -8369,6 +8450,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    forced_skill_blocked: list[str] = field(default_factory=list)
+    """Task ids fail-closed before claim because forced skills were unavailable."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -9726,6 +9809,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       COALESCE(r.dispatch_origin, t.dispatch_origin) AS dispatch_origin, "
         "       t.max_runtime_seconds, t.claim_lock, "
         "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
         "       r.worker_started_at, r.worker_group_started_at "
@@ -9778,13 +9862,19 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ? "
                 "  AND current_run_id IS ?",
-                (tid, pid, row["claim_lock"], row["current_run_id"]),
+                (
+                    _dispatch_retry_status(row["dispatch_origin"]),
+                    tid,
+                    pid,
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -9871,6 +9961,7 @@ def detect_stale_running(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
         "       t.current_run_id, r.worker_pgid, r.worker_sid, "
+        "       COALESCE(r.dispatch_origin, t.dispatch_origin) AS dispatch_origin, "
         "       r.worker_boot_id, r.worker_started_at, "
         "       r.worker_group_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
@@ -9925,12 +10016,17 @@ def detect_stale_running(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND current_run_id IS ?",
-                (tid, row["claim_lock"], row["current_run_id"]),
+                (
+                    _dispatch_retry_status(row["dispatch_origin"]),
+                    tid,
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -10100,6 +10196,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       COALESCE(r.dispatch_origin, t.dispatch_origin) AS dispatch_origin, "
         "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
         "       r.worker_started_at, r.worker_group_started_at "
         "FROM tasks t "
@@ -10291,13 +10388,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ? "
                 "  AND current_run_id IS ?",
                 (
-                    row["id"], pid, row["claim_lock"],
+                    _dispatch_retry_status(row["dispatch_origin"]),
+                    row["id"],
+                    pid,
+                    row["claim_lock"],
                     row["current_run_id"],
                 ),
             )
@@ -10500,13 +10600,14 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, dispatch_origin "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
+        retry_status = _dispatch_retry_status(row["dispatch_origin"])
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -10528,7 +10629,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -10538,7 +10639,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -10571,13 +10672,13 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: return to the persisted lane + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (retry_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
@@ -11117,6 +11218,174 @@ def record_respawn_guard_decision(
             )
 
 
+_FORCED_SKILL_PROBE = r"""
+import json
+import sys
+from tools.skills_tool import skill_view
+
+missing = []
+for name in json.loads(sys.argv[1]):
+    try:
+        result = json.loads(skill_view(name, preprocess=False))
+    except Exception:
+        missing.append(name)
+    else:
+        if not result.get("success"):
+            missing.append(name)
+print(json.dumps(missing))
+"""
+
+
+def _missing_forced_skills(profile: str, skills: Sequence[str]) -> list[str]:
+    """Resolve forced skills in the exact target profile before claim.
+
+    Skill discovery has module-level caches and profile-relative plugin roots.
+    A short subprocess gives the probe the same ``HERMES_HOME`` the worker will
+    receive without mutating the dispatcher's process-global environment.
+    """
+    names = list(skills)
+    if not names:
+        return []
+    from hermes_cli.profiles import get_profile_dir  # local import: avoids cycle
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(get_profile_dir(profile))
+    proc = subprocess.run(
+        [sys.executable, "-c", _FORCED_SKILL_PROBE, json.dumps(names)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "probe failed").strip().splitlines()
+        raise RuntimeError((detail[-1] if detail else "probe failed")[:300])
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("forced-skill probe returned no result")
+    try:
+        missing = json.loads(lines[-1])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("forced-skill probe returned invalid JSON") from exc
+    if not isinstance(missing, list) or any(
+        not isinstance(name, str) for name in missing
+    ):
+        raise RuntimeError("forced-skill probe returned an invalid shape")
+    return [name for name in names if name in set(missing)]
+
+
+def _block_forced_skill_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    source_status: str,
+    skills: Sequence[str],
+    probe_error: Optional[str] = None,
+) -> bool:
+    """Fail closed with an operator-visible, sticky capability blocker."""
+    blocker = (
+        "forced_skill_preflight_error"
+        if probe_error is not None
+        else "forced_skills_unavailable"
+    )
+    skill_text = ", ".join(skills) if skills else "<invalid skill declaration>"
+    reason = f"{blocker}: profile={profile}; skills={skill_text}"
+    if probe_error:
+        reason += f"; error={probe_error[:300]}"
+    payload = {
+        "blocker": blocker,
+        "kind": "capability",
+        "profile": profile,
+        "skills": list(skills),
+        "source_status": source_status,
+        "reason": reason,
+    }
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "dispatch_origin = ?, last_failure_error = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+            (source_status, reason[:500], task_id, source_status),
+        )
+        if cur.rowcount != 1:
+            return False
+        # Preflight normally runs on an unclaimed row, but fail closed even if
+        # an older lifecycle bug left an orphan run behind. Blocking must close
+        # both sides of the run/claim invariant in this same transaction.
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+        )
+        # ``blocked`` makes this sticky for recompute_ready; the dedicated event
+        # gives telemetry a stable machine-readable blocker name.
+        _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+        _append_event(
+            conn,
+            task_id,
+            "forced_skill_preflight_blocked",
+            payload,
+            run_id=run_id,
+        )
+    return True
+
+
+def _preflight_forced_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    source_status: str,
+    skills: object,
+    validator: Callable[[str, Sequence[str]], Sequence[str]],
+    dry_run: bool,
+) -> bool:
+    """Validate force-loaded skills before any claim or workspace mutation."""
+    try:
+        normalized = _normalize_spawn_skills(skills, task_id=task_id)
+    except (TypeError, ValueError) as exc:
+        if not dry_run:
+            _block_forced_skill_preflight(
+                conn,
+                task_id,
+                profile=profile,
+                source_status=source_status,
+                skills=(),
+                probe_error=str(exc),
+            )
+        return False
+    if not normalized:
+        return True
+    try:
+        missing = list(validator(profile, normalized))
+    except Exception as exc:
+        if not dry_run:
+            _block_forced_skill_preflight(
+                conn,
+                task_id,
+                profile=profile,
+                source_status=source_status,
+                skills=normalized,
+                probe_error=str(exc),
+            )
+        return False
+    if not missing:
+        return True
+    if not dry_run:
+        _block_forced_skill_preflight(
+            conn,
+            task_id,
+            profile=profile,
+            source_status=source_status,
+            skills=missing,
+        )
+    return False
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -11187,6 +11456,9 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    skill_validator: Optional[
+        Callable[[str, Sequence[str]], Sequence[str]]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11221,6 +11493,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            skill_validator=skill_validator,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -11237,6 +11510,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            skill_validator=skill_validator,
         )
 
 
@@ -11253,6 +11527,9 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    skill_validator: Optional[
+        Callable[[str, Sequence[str]], Sequence[str]]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -11287,6 +11564,7 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    validate_skills = skill_validator or _missing_forced_skills
     board_db, board_slug = _connection_worker_board_identity(conn)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
@@ -11495,6 +11773,20 @@ def _dispatch_once_locked(
                 (row["id"], row_assignee, len(active_cards))
             )
             continue
+        preflight_task = get_task(conn, row["id"])
+        if preflight_task is None:
+            continue
+        if not _preflight_forced_skills(
+            conn,
+            row["id"],
+            profile=row_assignee,
+            source_status="ready",
+            skills=preflight_task.skills,
+            validator=validate_skills,
+            dry_run=dry_run,
+        ):
+            result.forced_skill_blocked.append(row["id"])
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -11639,8 +11931,8 @@ def _dispatch_once_locked(
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # sdlc-review skill) that verifies the PR and reports a verdict. Landing
+    # remains outside worker custody.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
@@ -11670,6 +11962,17 @@ def _dispatch_once_locked(
             result.skipped_per_profile_capped.append(
                 (row["id"], row["assignee"], len(active_cards))
             )
+            continue
+        if not _preflight_forced_skills(
+            conn,
+            row["id"],
+            profile=row["assignee"],
+            source_status="review",
+            skills=["sdlc-review"],
+            validator=validate_skills,
+            dry_run=dry_run,
+        ):
+            result.forced_skill_blocked.append(row["id"])
             continue
         if _live_task_env_holders(
             row["id"],
@@ -11730,11 +12033,8 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
+        # Force-load the already-preflighted review skill. The mandatory
+        # kanban lifecycle is injected separately into every worker prompt.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:

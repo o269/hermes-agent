@@ -6497,7 +6497,11 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            skill_validator=lambda _profile, _skills: [],
+        )
     assert len(res.spawned) == 1
     assert res.spawned[0][0] == t
     # Dry run must NOT mutate status.
@@ -6518,7 +6522,11 @@ def test_dispatch_review_spawns_with_correct_skills(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=capture_spawn,
+            skill_validator=lambda _profile, _skills: [],
+        )
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills == ["sdlc-review"]
@@ -6569,7 +6577,11 @@ def test_dispatch_review_spawns_when_ready_empty(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            skill_validator=lambda _profile, _skills: [],
+        )
     assert len(res.spawned) == 1
     assert spawns[0] == t
 

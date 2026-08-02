@@ -1390,6 +1390,7 @@ def test_task_detail_includes_runs(client):
     run = d["runs"][0]
     assert run["outcome"] == "completed"
     assert run["profile"] == "worker"
+    assert run["dispatch_origin"] == "ready"
     assert run["summary"] == "tested on rate limiter"
     assert run["metadata"] == {"changed_files": ["limiter.py"]}
     assert run["ended_at"] is not None
@@ -1468,9 +1469,18 @@ def test_patch_status_archive_closes_running_run(client):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        kb.claim_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        review_task = kb.get_task(conn, tid)
+        assert review_task is not None
+        assert review_task.status == "review"
+        assert review_task.claim_lock is None
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
         open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
         assert open_run.ended_at is None
+        assert open_run.dispatch_origin == "review"
     finally:
         conn.close()
     r = client.patch(
@@ -1483,7 +1493,10 @@ def test_patch_status_archive_closes_running_run(client):
         task = kb.get_task(conn, tid)
         assert task.status == "archived"
         assert task.current_run_id is None
-        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.outcome == "reclaimed"
+        assert run.dispatch_origin == "review"
     finally:
         conn.close()
 

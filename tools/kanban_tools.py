@@ -352,6 +352,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "dispatch_origin": task.dispatch_origin,
         "model_override": task.model_override,
         "parents": parents,
         "children": children,
@@ -397,12 +398,14 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "dispatch_origin": t.dispatch_origin,
                     "model_override": t.model_override,
                 }
 
             def _run_dict(r):
                 return {
                     "id": r.id, "profile": r.profile,
+                    "dispatch_origin": r.dispatch_origin,
                     "status": r.status, "outcome": r.outcome,
                     "summary": r.summary, "error": r.error,
                     "metadata": r.metadata,

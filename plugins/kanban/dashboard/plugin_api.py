@@ -219,6 +219,7 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "task_id": r.task_id,
         "profile": r.profile,
         "step_key": r.step_key,
+        "dispatch_origin": r.dispatch_origin,
         "status": r.status,
         "claim_lock": r.claim_lock,
         "claim_expires": r.claim_expires,
