@@ -2039,6 +2039,23 @@ def _card_declaring_pr(conn, url: str, *, title: str = "companion") -> str:
     return owner
 
 
+def _requeue_after_completed_work_product(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Model an explicit post-completion retry without recent-success masking."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+            (task_id,),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "promoted",
+            {"source": "test_explicit_requeue"},
+        )
+
+
 def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
     """The live repro: a companion PR quoted in a comment must not freeze us.
 
@@ -2096,12 +2113,188 @@ def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
 
         assert kb.check_respawn_guard(conn, author_card) == "active_pr"
         # Both cards legitimately hold the PR; neither disowns the other.
-        assert kb.check_respawn_guard(conn, reviewer) is not None or True
+        _requeue_after_completed_work_product(conn, reviewer)
+        assert kb.check_respawn_guard(conn, reviewer) == "active_pr"
         owned, disowned = kb._active_pr_candidates(
             conn, author_card, cutoff=int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW
         )
         assert [o["ownership"] for o in owned] == ["declared"]
         assert disowned == ()
+
+
+@pytest.mark.parametrize("work_product_source", ["task_result", "run_summary"])
+def test_respawn_guard_work_product_only_custody_blocks_dispatch_and_direct_claim(
+    kanban_home, all_assignees_spawnable, work_product_source
+):
+    """A declaration needs no PR-bearing comment to retain one-writer custody."""
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"{work_product_source}-only custody",
+            assignee="alice",
+        )
+        if work_product_source == "task_result":
+            kb.complete_task(
+                conn,
+                task_id,
+                result=f"AUTHOR COMPLETE: {_OWN_PR}",
+                summary="result-only PR handoff",
+            )
+        else:
+            kb.complete_task(
+                conn,
+                task_id,
+                result="completed without a PR URL",
+                summary=f"AUTHOR COMPLETE: {_OWN_PR}",
+            )
+        _requeue_after_completed_work_product(conn, task_id)
+
+        comment_count = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert comment_count is not None
+        assert comment_count[0] == 0
+        task_row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT summary, metadata, error FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert task_row is not None
+        assert run_row is not None
+        if work_product_source == "task_result":
+            assert _OWN_PR in task_row["result"]
+            assert all(
+                _OWN_PR not in str(run_row[field] or "")
+                for field in ("summary", "metadata", "error")
+            )
+        else:
+            assert _OWN_PR not in str(task_row["result"] or "")
+            assert _OWN_PR in run_row["summary"]
+
+        ownership = conn.execute(
+            "SELECT declared, source_comment_id, last_seen_at "
+            "FROM task_pr_ownership WHERE task_id = ? AND canonical_url = ?",
+            (task_id, _OWN_PR),
+        ).fetchone()
+        assert ownership is not None
+        assert ownership["declared"] == 1
+        assert ownership["source_comment_id"] is None
+        assert ownership["last_seen_at"] >= (
+            int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW
+        )
+
+        owned, disowned = kb._active_pr_candidates(
+            conn,
+            task_id,
+            cutoff=int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW,
+        )
+        assert disowned == ()
+        assert len(owned) == 1
+        assert owned[0]["canonical_url"] == _OWN_PR
+        assert owned[0]["ownership"] == "declared"
+        assert owned[0]["source_comment_id"] is None
+        assert owned[0]["expires_at"] == (
+            ownership["last_seen_at"] + kb._RESPAWN_GUARD_PR_WINDOW
+        )
+
+        decision = kb.evaluate_respawn_guard(conn, task_id)
+        assert decision.reason == "active_pr"
+        assert decision.detail is not None
+        assert decision.detail["source_comment_id"] is None
+        assert decision.detail["pr_urls"] == [_OWN_PR]
+
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        assert (task_id, "active_pr") in dispatch.respawn_guarded
+        after_dispatch = kb.get_task(conn, task_id)
+        assert after_dispatch is not None
+        assert after_dispatch.status == "ready"
+
+        assert kb.claim_task(conn, task_id) is None
+        after_claim = kb.get_task(conn, task_id)
+        assert after_claim is not None
+        assert after_claim.status == "ready"
+        guarded = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "respawn_guarded"
+        ]
+        assert guarded[-1].payload is not None
+        assert guarded[-1].payload["source_comment_id"] is None
+
+        expired_at = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 1
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_pr_ownership SET last_seen_at = ? "
+                "WHERE task_id = ? AND canonical_url = ?",
+                (expired_at, task_id, _OWN_PR),
+            )
+        assert kb.evaluate_respawn_guard(conn, task_id).reason is None
+
+    assert spawned == []
+
+
+def test_respawn_guard_ownership_read_failure_does_not_fail_open(kanban_home):
+    """A ledger read failure cannot turn guarded work into a claimable card."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guard read failure", assignee="alice")
+        kb.complete_task(
+            conn,
+            task_id,
+            result=f"AUTHOR COMPLETE: {_OWN_PR}",
+            summary="result-only PR handoff",
+        )
+        _requeue_after_completed_work_product(conn, task_id)
+
+        def deny_ownership_read(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_READ and table == "task_pr_ownership":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_ownership_read)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                kb.claim_task(conn, task_id)
+        finally:
+            conn.set_authorizer(None)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_respawn_guard_active_pr_is_recent_custody_lease_not_remote_state(
+    kanban_home, monkeypatch
+):
+    """Ordinary ``active_pr`` stays local even for a known merged PR URL."""
+    monkeypatch.setattr(
+        kb,
+        "_default_github_pr_verifier",
+        lambda _pr: pytest.fail("ordinary active_pr must not probe GitHub"),
+    )
+    merged_pr = "https://github.com/o269/hermes-agent/pull/3"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="merged PR lease", assignee="alice")
+        kb.add_comment(
+            conn,
+            task_id,
+            "alice",
+            f"MERGED upstream; retaining recent custody evidence: {merged_pr}",
+        )
+
+        decision = kb.evaluate_respawn_guard(conn, task_id)
+
+    assert decision.reason == "active_pr"
+    assert decision.detail is not None
+    assert decision.detail["pr_url"] == merged_pr
 
 
 def test_respawn_guard_frees_cross_posted_pr_but_not_self_authored(kanban_home):
@@ -3353,19 +3546,30 @@ def test_claim_rechecks_late_active_pr_under_writer_lock(kanban_home, monkeypatc
         task_id = kb.create_task(conn, title="late PR", assignee="engineer")
         calls = 0
 
-        def active_after_precheck(_conn, _task_id, *, cutoff):
+        def custody_after_precheck(_conn, _task_id, *, cutoff):
             nonlocal calls
             calls += 1
             if calls == 1:
-                return ()
-            return ("https://github.com/o269/omnia/pull/568",)
+                return (), ()
+            return (
+                (
+                    {
+                        "canonical_url": "https://github.com/o269/omnia/pull/568",
+                        "source_comment_id": None,
+                        "last_seen_at": cutoff,
+                        "expires_at": cutoff + kb._RESPAWN_GUARD_PR_WINDOW,
+                        "ownership": "declared",
+                    },
+                ),
+                (),
+            )
 
-        monkeypatch.setattr(
-            kb,
-            "_canonical_pr_urls_from_comments",
-            active_after_precheck,
-        )
+        # The unlocked precheck sees no custody. A declaration appears before
+        # BEGIN IMMEDIATE is acquired, and the in-transaction recheck denies
+        # the claim rather than opening a second writer.
+        monkeypatch.setattr(kb, "_active_pr_candidates", custody_after_precheck)
         assert kb.claim_task(conn, task_id) is None
+        assert calls == 2
         assert kb.get_task(conn, task_id).status == "ready"
         denial = [
             event.payload
@@ -4303,18 +4507,26 @@ def test_respawn_guard_live_worker_snapshot_is_structured(kanban_home):
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
-    """A GitHub PR URL in a comment older than the PR window does not block."""
+    """Integer and legacy-text timestamps older than the PR window do not block."""
+    old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+    old_created_ats = (
+        old_ts,
+        time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(old_ts)),
+    )
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="old-pr", assignee="alice")
-        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
-            (t, old_ts),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason is None
+        for index, old_created_at in enumerate(old_created_ats):
+            task_id = kb.create_task(
+                conn,
+                title=f"old-pr-{index}",
+                assignee="alice",
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'worker', "
+                "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
+                (task_id, old_created_at),
+            )
+            assert kb.check_respawn_guard(conn, task_id) is None
 
 
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(

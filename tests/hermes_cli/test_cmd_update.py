@@ -10,11 +10,37 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
-def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
+def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0", fork_remote=None):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+
+        # git remote get-url fork
+        if "remote get-url fork" in joined:
+            if fork_remote is not None:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{fork_remote}\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd,
+                128,
+                stdout="",
+                stderr="error: No such remote 'fork'\n",
+            )
+
+        # git remote get-url origin
+        if "remote get-url origin" in joined:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="https://github.com/example/hermes-agent.git\n",
+                stderr="",
+            )
+
+        # git log {remote}/main..HEAD (committed-work guard)
+        if "log" in joined and "..HEAD" in joined and "--format=%H" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -359,9 +385,11 @@ class TestCmdUpdateBranchFallback:
 
         # rev-list should use origin/main, not origin/fix/stoicneko
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
+        assert len(rev_list_cmds) >= 1
+        update_rev_list = next((c for c in rev_list_cmds if "HEAD.." in c), None)
+        assert update_rev_list is not None
+        assert "origin/main" in update_rev_list
+        assert "origin/fix/stoicneko" not in update_rev_list
 
         # pull should use main, not fix/stoicneko
         pull_cmds = [c for c in commands if "pull" in c]
@@ -382,8 +410,10 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        assert len(rev_list_cmds) >= 1
+        update_rev_list = next((c for c in rev_list_cmds if "HEAD.." in c), None)
+        assert update_rev_list is not None
+        assert "origin/main" in update_rev_list
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
@@ -424,17 +454,13 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        with patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT, update_remote="origin")
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -733,8 +759,8 @@ class TestCmdUpdateBranchFlag:
         - ``current_branch``  what ``git rev-parse --abbrev-ref HEAD`` returns
         - ``target_branch``   passed via --branch; what we expect the code to switch to
         - ``checkout_fails``  if True, ``git checkout <target>`` returns non-zero
-                              (simulates branch absent locally; code should retry with -B)
-        - ``track_fails``     if True, ``git checkout -B <target> origin/<target>`` ALSO fails
+                              (simulates branch absent locally; code should create it)
+        - ``track_fails``     if True, ``git checkout --track -b ...`` ALSO fails
                               (simulates branch absent on origin too)
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
@@ -742,17 +768,45 @@ class TestCmdUpdateBranchFlag:
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
+            # Remote resolution for the fork-remote fence.
+            if "remote get-url fork" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    128,
+                    stdout="",
+                    stderr="error: No such remote 'fork'\n",
+                )
+            if "remote get-url origin" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="https://github.com/example/hermes-agent.git\n",
+                    stderr="",
+                )
+
+            # Committed-work guard: pretend there are no local-only commits.
+            if "log" in joined and "..HEAD" in joined and "--format=%H" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
 
-            if "checkout" in joined and "-B" in joined:
+            if "branch --list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "checkout" in joined and "--track" in joined and "-b" in joined:
                 rc = 128 if track_fails else 0
                 err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
-                rc = 128 if checkout_fails else 0
-                err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
+            if "checkout" in joined and "--track" not in joined and "rev-parse" not in joined:
+                is_target_checkout = str(cmd[-1]) == target_branch
+                rc = 128 if checkout_fails and is_target_checkout else 0
+                err = (
+                    f"error: pathspec '{target_branch}' did not match\n"
+                    if rc != 0
+                    else ""
+                )
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
@@ -822,12 +876,12 @@ class TestCmdUpdateBranchFlag:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_tracks_remote_when_branch_absent_locally(self, mock_run, _mock_which, capsys):
-        """If local lacks the branch but origin has it, fall back to ``checkout -B``."""
+        """If local lacks the branch, create a tracking branch without resetting one."""
         mock_run.side_effect = self._branch_side_effect(
             current_branch="main",
             target_branch="bb/gui",
             checkout_fails=True,  # plain checkout fails
-            track_fails=False,    # -B from origin/bb/gui succeeds
+            track_fails=False,    # --track -b from origin/bb/gui succeeds
             commit_count="2",
         )
         args = SimpleNamespace(branch="bb/gui")
@@ -835,9 +889,10 @@ class TestCmdUpdateBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have BOTH a failed `checkout bb/gui` AND a successful `checkout -B bb/gui origin/bb/gui`
-        track_cmds = [c for c in commands if "checkout" in c and "-B" in c]
+        # A failed plain checkout is followed by non-destructive branch creation.
+        track_cmds = [c for c in commands if "checkout" in c and "--track" in c]
         assert len(track_cmds) == 1
+        assert "-b" in track_cmds[0]
         assert "bb/gui" in track_cmds[0]
         assert "origin/bb/gui" in track_cmds[0]
 
@@ -881,6 +936,8 @@ class TestCmdUpdateCheckBranchFlag:
         verify_ok: bool = True,
         commit_count: str = "0",
         upstream_fetch_ok: bool = True,
+        origin_url: str = "https://github.com/example/hermes-agent.git",
+        upstream_url: str | None = "https://github.com/NousResearch/hermes-agent.git",
     ):
         """Mock side-effect for the _cmd_update_check git pipeline.
 
@@ -890,11 +947,31 @@ class TestCmdUpdateCheckBranchFlag:
                                  on origin)
         - ``commit_count``       rev-list count (0 = up-to-date)
         - ``upstream_fetch_ok``  if False, ``git fetch upstream`` fails
-                                 (forces fallback to origin on branch==main)
+                                 (falls back to the validated apply remote)
+        - ``origin_url``         URL used by the apply/check remote resolver
+        - ``upstream_url``       configured URL, or None when absent
         """
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+
+            if "remote get-url fork" in joined:
+                return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="")
+
+            if "remote get-url origin" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=f"{origin_url}\n",
+                    stderr="",
+                )
+
+            if "remote get-url upstream" in joined:
+                if upstream_url is None:
+                    return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{upstream_url}\n", stderr=""
+                )
 
             if "fetch" in joined and "upstream" in joined:
                 rc = 0 if upstream_fetch_ok else 128
@@ -989,6 +1066,43 @@ class TestCmdUpdateCheckBranchFlag:
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_never_fetches_untrusted_upstream(
+        self, mock_run, _mock_method, capsys
+    ):
+        """An attacker-controlled upstream name cannot bypass URL validation."""
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="main",
+            upstream_url="https://github.com/attacker/hermes-agent.git",
+        )
+
+        cmd_update(SimpleNamespace(check=True, branch=None))
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        assert any("fetch" in c and "origin" in c for c in commands), commands
+        assert any("origin/main" in c for c in commands if "rev-list" in c), commands
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_refuses_unsafe_apply_remote_before_fetch(
+        self, mock_run, _mock_method
+    ):
+        """The read-only check path uses the same fail-closed resolver as apply."""
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="main",
+            origin_url="ext::sh -c echo-owned",
+            upstream_url=None,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(SimpleNamespace(check=True, branch=None))
+
+        assert exc_info.value.code == 1
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("fetch" in command for command in commands), commands
+
     @patch("hermes_cli.config.detect_install_method", return_value="pip")
     @patch("hermes_cli.banner.check_via_pypi", return_value=0)
     @patch("subprocess.run")
@@ -1027,6 +1141,27 @@ class TestCmdUpdateZipBranchRefusal:
         assert "not supported" in out
         # No actual download attempted.
         assert "Downloading latest version" not in out
+
+    def test_zip_fallback_skips_git_remote_resolution(self, tmp_path, monkeypatch):
+        """A ZIP-managed Windows install must not require nonexistent Git remotes."""
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm.sys, "platform", "win32")
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+        monkeypatch.setattr(
+            hm,
+            "_resolve_update_remote",
+            lambda *_args: pytest.fail("ZIP fallback must not resolve Git remotes"),
+        )
+        calls = []
+        monkeypatch.setattr(hm, "_update_via_zip", lambda args: calls.append(args))
+
+        args = SimpleNamespace(branch=None, force_venv=True)
+        hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert calls == [args]
 
 
 def test_is_termux_env_true_for_termux_prefix():
@@ -1242,3 +1377,642 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+class TestCmdUpdateForkRemoteFence:
+    """Reproduce the fleet-down topology and verify the fence."""
+
+    @staticmethod
+    def _git(repo, *args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    def _init_repo(self, repo):
+        self._git(repo, "init", "--initial-branch=main")
+        self._git(repo, "config", "user.email", "test@example.com")
+        self._git(repo, "config", "user.name", "Test")
+        (repo / "base.txt").write_text("base")
+        self._git(repo, "add", "base.txt")
+        self._git(repo, "commit", "-m", "base")
+
+    def test_resolve_update_remote_prefers_fork_when_origin_is_upstream(self, tmp_path):
+        """Topology: origin=upstream, fork=ours. Update must target fork."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/Hermes-Agent.git",
+        )
+        self._git(
+            repo, "remote", "add", "fork", "https://github.com/o269/hermes-agent.git"
+        )
+
+        remote, url = hm._resolve_update_remote(["git"], repo)
+        assert remote == "fork"
+        assert "o269" in url
+
+    def test_resolve_update_remote_allows_official_origin_without_fork(self, tmp_path):
+        """A normal public checkout with only official origin remains updatable."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/Hermes-Agent.git",
+        )
+
+        remote, url = hm._resolve_update_remote(["git"], repo)
+        assert remote == "origin"
+        assert hm._is_fork(url) is False
+
+    def test_resolve_update_remote_allows_origin_when_it_is_a_fork(self, tmp_path):
+        """A plain fork checkout (origin=fork, no fork remote) is allowed."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo, "remote", "add", "origin", "https://github.com/example/hermes-agent.git"
+        )
+
+        remote, url = hm._resolve_update_remote(["git"], repo)
+        assert remote == "origin"
+        assert "example" in url
+
+    def test_is_fork_case_insensitive(self):
+        """The URL comparison must be case-insensitive (this was the banner bug)."""
+        from hermes_cli import main as hm
+
+        assert hm._is_fork("https://github.com/NousResearch/Hermes-Agent.git") is False
+        assert hm._is_fork("https://github.com/nousresearch/hermes-agent") is False
+        assert hm._is_fork("git@github.com:NousResearch/Hermes-Agent.git") is False
+        assert hm._is_fork("https://github.com/o269/hermes-agent.git") is True
+
+    def test_count_local_commits_ahead_counts_commits_only_on_branch(self, tmp_path):
+        """The committed-work guard must count commits absent from the remote."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        remote_sha = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+        self._git(
+            repo, "remote", "add", "origin", "https://github.com/example/hermes-agent.git"
+        )
+        # Simulate fetched origin/main
+        self._git(repo, "update-ref", "refs/remotes/origin/main", remote_sha)
+
+        (repo / "local.txt").write_text("local")
+        self._git(repo, "add", "local.txt")
+        self._git(repo, "commit", "-m", "local-only")
+
+        assert hm._count_local_commits_ahead(["git"], repo, "origin/main") == 1
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///tmp/hermes-agent",
+            "ext::sh -c id",
+            "http://github.com/example/hermes-agent.git",
+            "https://evil.example/example/hermes-agent.git",
+            "https://github.com/example/not-hermes.git",
+            "https://user@github.com/example/hermes-agent.git",
+            "https://github.com:444/example/hermes-agent.git",
+            "ssh://git@github.com:23/example/hermes-agent.git",
+        ],
+    )
+    def test_resolve_update_remote_refuses_unsafe_origin_urls(self, tmp_path, url):
+        """Only unambiguous GitHub HTTPS/SSH Hermes remotes may drive reset."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(repo, "remote", "add", "origin", url)
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._resolve_update_remote(["git"], repo)
+        assert exc_info.value.code == 1
+
+    def test_valid_checkout_without_origin_is_refused(self, tmp_path):
+        """A real repository never inherits the synthetic-checkout fallback."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._resolve_update_remote(["git"], repo)
+
+        assert exc_info.value.code == 1
+
+    def test_remote_refusal_does_not_echo_credentials(self, tmp_path, capsys):
+        """Unsafe remote diagnostics must redact credentials and control payloads."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://sekret-token@github.com/example/hermes-agent.git",
+        )
+
+        with pytest.raises(SystemExit):
+            hm._resolve_update_remote(["git"], repo)
+        output = capsys.readouterr().out
+        assert "sekret-token" not in output
+        assert "https://github.com/<redacted>" in output
+
+    def test_resolve_update_remote_accepts_github_ssh_origin(self, tmp_path):
+        """The strict URL fence preserves the standard GitHub SSH topology."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        url = "git@github.com:example/hermes-agent.git"
+        self._git(repo, "remote", "add", "origin", url)
+
+        assert hm._resolve_update_remote(["git"], repo) == ("origin", url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com:443/example/hermes-agent.git",
+            "ssh://git@github.com:22/example/hermes-agent.git",
+        ],
+    )
+    def test_remote_identity_accepts_explicit_default_ports(self, url):
+        """Canonical HTTPS/SSH default ports remain compatibility-safe."""
+        from hermes_cli import main as hm
+
+        assert hm._github_repo_identity(url) == ("example", "hermes-agent")
+
+    @pytest.mark.parametrize("control", ["\x07", "\x1b", "\x7f", "\x85"])
+    def test_remote_summary_omits_control_bearing_hosts(self, control):
+        """Refusal diagnostics never emit terminal-control payload bytes."""
+        from hermes_cli import main as hm
+
+        url = f"https://evil{control}.example/example/hermes-agent.git"
+        summary = hm._remote_url_summary(url)
+
+        assert summary == "<unsafe URL omitted>"
+        assert control not in summary
+
+    def test_resolve_update_remote_refuses_ambiguous_origin_urls(self, tmp_path):
+        """Multiple fetch URLs must never collapse silently to Git's first URL."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/hermes-agent.git",
+        )
+        self._git(
+            repo,
+            "config",
+            "--add",
+            "remote.origin.url",
+            "https://github.com/example/hermes-agent.git",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._resolve_update_remote(["git"], repo)
+        assert exc_info.value.code == 1
+
+    def test_untrusted_upstream_is_never_fetched(self, tmp_path, monkeypatch):
+        """The optional fork-sync path must validate upstream before networking."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(repo, "remote", "add", "upstream", "ext::sh -c echo-owned")
+
+        real_run = subprocess.run
+        commands = []
+
+        def guarded_run(cmd, **kwargs):
+            commands.append([str(part) for part in cmd])
+            if "fetch" in cmd:
+                pytest.fail("untrusted upstream must not be fetched")
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(hm.subprocess, "run", guarded_run)
+        hm._sync_with_upstream_if_needed(["git"], repo, update_remote="origin")
+
+        assert not any("fetch" in command for command in commands)
+
+    def test_official_upstream_url_is_accepted(self, tmp_path):
+        """Strict upstream validation preserves the official public topology."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/NousResearch/hermes-agent.git",
+        )
+
+        assert hm._official_upstream_remote_is_safe(["git"], repo) is True
+
+    def test_resolve_update_remote_refuses_official_repo_named_fork(self, tmp_path):
+        """A fork-named official remote is ambiguous and must not shadow origin."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/hermes-agent.git",
+        )
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "fork",
+            "https://github.com/NousResearch/hermes-agent.git",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._resolve_update_remote(["git"], repo)
+        assert exc_info.value.code == 1
+
+    def test_linked_worktree_checkout_does_not_reset_owned_branch(self, tmp_path):
+        """A branch owned by another worktree fails closed; no ``-B`` rewrite."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        linked = tmp_path / "linked"
+        repo.mkdir()
+        self._init_repo(repo)
+        main_sha = self._git(repo, "rev-parse", "main").stdout.strip()
+        self._git(repo, "worktree", "add", "-b", "feature", str(linked))
+
+        result, local_existed = hm._checkout_update_branch(
+            ["git"], linked, "main", "origin"
+        )
+
+        assert result.returncode != 0
+        assert local_existed is True
+        assert "already used by worktree" in result.stderr
+        assert self._git(repo, "rev-parse", "main").stdout.strip() == main_sha
+        assert self._git(linked, "branch", "--show-current").stdout.strip() == "feature"
+
+    def test_detached_commit_is_counted_and_restored_exactly(self, tmp_path):
+        """Detached local commits are fenced and exact detached HEAD is restorable."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        remote_sha = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+        self._git(repo, "update-ref", "refs/remotes/origin/main", remote_sha)
+        self._git(repo, "checkout", "--detach", remote_sha)
+        (repo / "detached.txt").write_text("local detached work")
+        self._git(repo, "add", "detached.txt")
+        self._git(repo, "commit", "-m", "detached-only")
+        detached_sha = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        assert (
+            hm._count_local_commits_ahead(
+                ["git"], repo, "origin/main", detached_sha
+            )
+            == 1
+        )
+
+        self._git(repo, "checkout", "main")
+        assert hm._restore_original_checkout(
+            ["git"], repo, "HEAD", detached_sha, "main"
+        )
+        assert self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "HEAD"
+        assert self._git(repo, "rev-parse", "HEAD").stdout.strip() == detached_sha
+
+    def test_failed_pull_refuses_reset_when_local_commits_exist(
+        self, tmp_path, monkeypatch, mock_args
+    ):
+        """Integrated fallback path must stop before reset when ancestry is unsafe."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/hermes-agent.git",
+        )
+        monkeypatch.setattr(hm, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_discard_lockfile_churn", lambda *_args: None)
+        monkeypatch.setattr(hm, "_stash_local_changes_if_needed", lambda *_args: None)
+        monkeypatch.setattr(hm, "_count_local_commits_ahead", lambda *_args, **_kwargs: 2)
+
+        base_side_effect = _make_run_side_effect(branch="main", commit_count="3")
+        commands = []
+
+        def failed_pull_side_effect(cmd, **kwargs):
+            commands.append(list(cmd))
+            joined = " ".join(str(part) for part in cmd)
+            if "pull --ff-only" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="fatal: Not possible to fast-forward"
+                )
+            return base_side_effect(cmd, **kwargs)
+
+        monkeypatch.setattr(hm.subprocess, "run", failed_pull_side_effect)
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm.cmd_update(mock_args)
+        assert exc_info.value.code == 1
+        assert not any("reset" in command and "--hard" in command for command in commands)
+
+    @pytest.mark.parametrize("failure_stage", ["status", "stash", "stash-ref"])
+    def test_windows_pre_switch_git_failures_never_run_zip(
+        self, tmp_path, monkeypatch, capsys, failure_stage
+    ):
+        """Pre-switch Git failures preserve feature work instead of ZIP-overlaying it."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/hermes-agent.git",
+        )
+        self._git(repo, "checkout", "-b", "feature/review")
+        (repo / "base.txt").write_text("feature work")
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(hm.sys, "platform", "win32")
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+
+        real_run = subprocess.run
+        commands = []
+
+        def fail_before_switch(cmd, **kwargs):
+            commands.append([str(part) for part in cmd])
+            if "fetch" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            stage = None
+            if cmd[-2:] == ["status", "--porcelain"]:
+                stage = "status"
+            elif "stash" in cmd and "push" in cmd:
+                stage = "stash"
+            elif cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
+                stage = "stash-ref"
+            if stage == failure_stage:
+                raise subprocess.CalledProcessError(
+                    1, cmd, stderr=f"injected {failure_stage} failure"
+                )
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(hm.subprocess, "run", fail_before_switch)
+        zip_calls = []
+        monkeypatch.setattr(hm, "_update_via_zip", lambda _args: zip_calls.append(1))
+
+        args = SimpleNamespace(branch=None, force=True, force_venv=True, yes=True)
+        with pytest.raises(SystemExit) as exc_info:
+            hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert exc_info.value.code == 1
+        assert zip_calls == []
+        assert not any(" checkout main" in f" {' '.join(command)}" for command in commands)
+        branch = real_run(
+            ["git", "branch", "--show-current"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert branch == "feature/review"
+
+        if failure_stage == "stash-ref":
+            preserved = real_run(
+                ["git", "show", "refs/stash:base.txt"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert preserved == "feature work"
+        else:
+            assert (repo / "base.txt").read_text() == "feature work"
+            status = real_run(
+                ["git", "status", "--porcelain", "--", "base.txt"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert status.strip() == "M base.txt"
+
+        assert "Refusing ZIP fallback to preserve the original checkout" in capsys.readouterr().out
+
+    def _prepare_post_pull_failure(
+        self, tmp_path, monkeypatch, failure, current_branch="main"
+    ):
+        """Wire a Windows update that fails after pulling on the target checkout."""
+        from hermes_cli import main as hm
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        self._git(
+            repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/hermes-agent.git",
+        )
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(hm.sys, "platform", "win32")
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(hm, "_discard_lockfile_churn", lambda *_args: None)
+        monkeypatch.setattr(
+            hm, "_stash_local_changes_if_needed", lambda *_args: "stash-commit"
+        )
+        monkeypatch.setattr(
+            hm,
+            "_validate_critical_files_syntax",
+            lambda *_args: (_ for _ in ()).throw(failure),
+        )
+
+        events = []
+        stash_restore_calls = []
+        monkeypatch.setattr(
+            hm,
+            "_restore_original_checkout",
+            lambda *_args: events.append("restore") or True,
+        )
+        monkeypatch.setattr(
+            hm,
+            "_restore_stashed_changes",
+            lambda *_args, **_kwargs: stash_restore_calls.append(1) or True,
+        )
+        monkeypatch.setattr(
+            hm.subprocess,
+            "run",
+            _make_run_side_effect(branch=current_branch, commit_count="3"),
+        )
+
+        args = SimpleNamespace(
+            branch=None,
+            force=True,
+            force_venv=True,
+            yes=True,
+        )
+        return hm, args, events, stash_restore_calls
+
+    def test_windows_git_failure_runs_zip_before_single_checkout_restore(
+        self, tmp_path, monkeypatch
+    ):
+        """ZIP fallback modifies the target checkout, then the finalizer restores."""
+        failure = subprocess.CalledProcessError(1, ["git", "status"])
+        hm, args, events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure
+        )
+        monkeypatch.setattr(
+            hm, "_update_via_zip", lambda _args: events.append("zip")
+        )
+
+        hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert events == ["zip", "restore"]
+        assert stash_restore_calls == []
+
+    def test_windows_git_failure_after_branch_switch_can_run_zip(
+        self, tmp_path, monkeypatch
+    ):
+        """A successful target switch establishes custody for later ZIP fallback."""
+        failure = subprocess.CalledProcessError(1, ["git", "status"])
+        hm, args, events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure, current_branch="feature/review"
+        )
+        monkeypatch.setattr(
+            hm,
+            "_checkout_update_branch",
+            lambda *_args: (
+                events.append("checkout")
+                or subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                True,
+            ),
+        )
+        monkeypatch.setattr(
+            hm, "_update_via_zip", lambda _args: events.append("zip")
+        )
+
+        hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert events == ["checkout", "zip", "restore"]
+        assert stash_restore_calls == []
+
+    def test_windows_non_git_subprocess_failure_never_runs_zip(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Dependency/build failures cannot trigger destructive ZIP replacement."""
+        failure = subprocess.CalledProcessError(
+            1, ["python", "-m", "py_compile"]
+        )
+        hm, args, events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure
+        )
+        zip_calls = []
+        monkeypatch.setattr(hm, "_update_via_zip", lambda _args: zip_calls.append(1))
+
+        with pytest.raises(SystemExit) as exc_info:
+            hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert exc_info.value.code == 1
+        assert zip_calls == []
+        assert events == ["restore"]
+        assert stash_restore_calls == []
+        assert capsys.readouterr().out.count("preserved in stash") == 1
+
+    @pytest.mark.parametrize("failure", [RuntimeError("boom"), KeyboardInterrupt()])
+    def test_unexpected_failures_restore_once_and_preserve_stash(
+        self, tmp_path, monkeypatch, capsys, failure
+    ):
+        """Runtime errors and interrupts share one fail-safe cleanup path."""
+        hm, args, events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure
+        )
+        monkeypatch.setattr(
+            hm,
+            "_update_via_zip",
+            lambda _args: pytest.fail("non-subprocess failures must not run ZIP"),
+        )
+
+        with pytest.raises(type(failure)):
+            hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert events == ["restore"]
+        assert stash_restore_calls == []
+        assert capsys.readouterr().out.count("preserved in stash") == 1
+
+    def test_restore_error_does_not_mask_original_failure_or_stash_receipt(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A broken Git executable during cleanup cannot hide the root failure."""
+        failure = RuntimeError("original update failure")
+        hm, args, _events, stash_restore_calls = self._prepare_post_pull_failure(
+            tmp_path, monkeypatch, failure
+        )
+
+        def fail_restore(*_args):
+            raise OSError("git unavailable during cleanup")
+
+        monkeypatch.setattr(hm, "_restore_original_checkout", fail_restore)
+
+        with pytest.raises(RuntimeError, match="original update failure"):
+            hm._cmd_update_impl(args, gateway_mode=False)
+
+        assert stash_restore_calls == []
+        output = capsys.readouterr().out
+        assert output.count("preserved in stash") == 1
+        assert "Could not restore the pre-update checkout" in output
