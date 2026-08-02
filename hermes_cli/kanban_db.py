@@ -1646,9 +1646,11 @@ def _cross_process_init_lock(path: Path):
 def _dispatch_tick_lock(db_path: Path):
     """Non-blocking single-writer guard around one dispatcher tick.
 
-    Yields ``True`` when this process holds the board's dispatch lock and
-    may proceed with the tick, or ``False`` when another process already
-    holds it (the caller should skip the tick this round).
+    Yields ``True`` when this process holds the board's dispatch lock,
+    ``False`` when another process already holds it, or ``None`` when the
+    lock file cannot be opened. The tri-state result lets exact-target
+    callers fail closed on both contention and lock-mechanism failure while
+    preserving the legacy generic-dispatch fallback for unavailable locks.
 
     Motivation (issue #35240): a ``hermes gateway run --replace`` /
     ``gateway restart`` invoked from a shell on a systemd/launchd host can
@@ -1675,7 +1677,7 @@ def _dispatch_tick_lock(db_path: Path):
     """
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
-    acquired = False
+    acquired: Optional[bool] = False
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
@@ -1700,9 +1702,15 @@ def _dispatch_tick_lock(db_path: Path):
             except (BlockingIOError, OSError):
                 acquired = False
     except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Lock unavailability is strictly less safe than contention: without
+        # a file handle we cannot know whether another dispatcher is active.
+        # Return a distinct state so exact-target callers can fail closed, and
+        # make the broken locking mechanism operator-visible.
+        _log.error(
+            "kanban dispatch lock unavailable: exclusive ownership cannot be "
+            "established; check permissions for the board data directory"
+        )
+        acquired = None
         handle = None
     try:
         yield acquired
@@ -5049,9 +5057,10 @@ def _verify_created_cards(
     return verified, phantom
 
 
-# Task-id pattern used both by ``kanban_create`` (``t_<12 hex>``) and
-# ``_new_task_id`` below. Kept permissive on length for forward compat:
-# accept 8+ hex chars after the ``t_`` prefix.
+# Task-id patterns used by ``kanban_create`` (``t_<8 hex>``), exact-target
+# dispatch, and the prose phantom-id guard below. Kept permissive on length for
+# forward compatibility: accept 8+ lowercase hex chars after the ``t_`` prefix.
+_TASK_ID_EXACT_RE = re.compile(r"t_[a-f0-9]{8,}")
 _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
 
 
@@ -8332,6 +8341,18 @@ def authorize_continuation(
 
 
 @dataclass
+class RequestedDispatchOutcome:
+    """Exact disposition of one id from a targeted dispatch request."""
+
+    task_id: str
+    outcome: str
+    assignee: Optional[str] = None
+    workspace: Optional[str] = None
+    detail: Optional[str] = None
+    current: Optional[int] = None
+
+
+@dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
@@ -8394,10 +8415,42 @@ class DispatchResult:
     window just makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
-    the board's dispatch lock (issue #35240). A losing dispatcher does no
-    DB writes this tick — the lock holder is making progress on the same
-    board. This is the steady-state signal that a single-writer guard is
-    actively preventing two dispatchers from racing on ``kanban.db``."""
+    the board's dispatch lock, or because an exact-target tick found the lock
+    mechanism unavailable (issue #35240). A skipped dispatcher does no DB writes
+    this tick. Lock-file open failures are logged as errors because no dispatcher
+    can safely prove exclusive ownership in that state."""
+    targeted: bool = False
+    """True when an explicit exact-task filter was supplied.
+
+    ``False`` means the legacy generic Ready/review selection path. ``True``
+    with an empty ``requested_outcomes`` list is intentionally meaningful: an
+    explicit empty target set fails closed and can never fall back to generic
+    queue selection."""
+    requested_outcomes: list[RequestedDispatchOutcome] = field(default_factory=list)
+    """One terminal outcome per distinct requested id, preserving request order."""
+
+
+def _unavailable_targeted_dispatch_result(
+    task_ids: Sequence[str],
+) -> DispatchResult:
+    """Fail an exact-target tick closed when its board lock is unavailable."""
+
+    result = DispatchResult(skipped_locked=True, targeted=True)
+    seen: set[str] = set()
+    for raw_task_id in task_ids:
+        task_id = raw_task_id if isinstance(raw_task_id, str) else str(raw_task_id)
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        outcome = (
+            "malformed"
+            if _TASK_ID_EXACT_RE.fullmatch(task_id) is None
+            else "locked"
+        )
+        result.requested_outcomes.append(
+            RequestedDispatchOutcome(task_id=task_id, outcome=outcome)
+        )
+    return result
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11187,6 +11240,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    task_ids: Optional[Sequence[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11195,20 +11249,29 @@ def dispatch_once(
     dispatchers pointed at the same ``kanban.db`` — e.g. the service-
     managed gateway and a shell-spawned orphan that escaped the service
     cgroup — can never run a reclaim/spawn/write tick concurrently and
-    race on WAL frames. The losing dispatcher returns an empty
-    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board.
+    race on WAL frames. A contender returns an empty ``DispatchResult`` with
+    ``skipped_locked=True`` and does no DB writes. Exact-target dispatch also
+    fails closed this way when the lock file cannot be opened; generic dispatch
+    retains its legacy degraded fallback. Lock-file open failures are logged as
+    errors because exclusive ownership cannot be established.
 
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
+
+    ``task_ids is None`` preserves generic Ready/review selection. Any explicit
+    sequence, including an empty one, enables exact-target mode. Exact-target
+    mode never falls back to generic selection and fails closed if the board
+    lock cannot be resolved or acquired.
     """
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
+        if task_ids is not None:
+            return _unavailable_targeted_dispatch_result(task_ids)
+        # Preserve the legacy generic fallback. Exact-target dispatch above
+        # cannot take this path because its filter must be enforced under the
+        # board-scoped lock.
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -11221,10 +11284,17 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            task_ids=task_ids,
         )
     with _dispatch_tick_lock(db_path) as held:
-        if not held:
-            return DispatchResult(skipped_locked=True)
+        if held is not True:
+            if task_ids is not None:
+                return _unavailable_targeted_dispatch_result(task_ids)
+            if held is False:
+                return DispatchResult(skipped_locked=True)
+            # ``None`` means the lock mechanism itself is unavailable. Keep
+            # the pre-existing generic-dispatch fallback, but exact-target
+            # dispatch above must never enter this unguarded path.
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -11237,6 +11307,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            task_ids=task_ids,
         )
 
 
@@ -11253,6 +11324,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    task_ids: Optional[Sequence[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -11282,35 +11354,105 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    targeted = task_ids is not None
+    read_only_target_preview = targeted and dry_run
 
-    result = DispatchResult()
+    # Targeted dry-runs are intentionally side-effect-free: no process reaping,
+    # reconciliation writes, claims, events, workspaces, or spawns. Real targeted
+    # ticks still run the same global reconciliation as generic ticks before the
+    # exact filter is applied under this board lock.
+    if not read_only_target_preview:
+        # Reap zombie children from previously spawned workers. See
+        # reap_worker_zombies() for the full rationale.
+        reap_worker_zombies()
+
+    result = DispatchResult(targeted=targeted)
     board_db, board_slug = _connection_worker_board_identity(conn)
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if not read_only_target_preview:
+        result.reclaimed = release_stale_claims(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        # Rate-limited requeues (quota wall, no failure counted) — surface for
+        # telemetry / tests. These tasks went back to ``ready`` and the respawn
+        # guard will defer them until the quota window clears.
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    requested_by_id: dict[str, RequestedDispatchOutcome] = {}
+    if targeted:
+        # Build the complete target disposition table while the board-scoped
+        # dispatch lock is held. ``None`` means generic selection; every actual
+        # sequence — even [] or an all-invalid list — stays on this fail-closed
+        # path and can never reach the unfiltered Ready query below.
+        seen: set[str] = set()
+        for raw_task_id in task_ids or ():
+            task_id = raw_task_id if isinstance(raw_task_id, str) else str(raw_task_id)
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            outcome = RequestedDispatchOutcome(task_id=task_id, outcome="pending")
+            requested_by_id[task_id] = outcome
+            result.requested_outcomes.append(outcome)
+            if _TASK_ID_EXACT_RE.fullmatch(task_id) is None:
+                outcome.outcome = "malformed"
+
+        ready_rows = []
+        for task_id, outcome in requested_by_id.items():
+            if outcome.outcome != "pending":
+                continue
+            row = conn.execute(
+                "SELECT id, assignee, status, claim_lock, priority, created_at "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                outcome.outcome = "not_found"
+            elif row["claim_lock"] is not None:
+                outcome.outcome = "claimed"
+                outcome.assignee = row["assignee"]
+                outcome.detail = row["status"]
+            elif row["status"] != "ready":
+                outcome.outcome = "status_not_ready"
+                outcome.assignee = row["assignee"]
+                outcome.detail = row["status"]
+            else:
+                ready_rows.append(row)
+        ready_rows.sort(
+            key=lambda row: (
+                -int(row["priority"] or 0),
+                int(row["created_at"] or 0),
+            )
+        )
+        if any(
+            item.outcome == "malformed" for item in result.requested_outcomes
+        ):
+            # Syntax errors invalidate the whole target set. Report every id,
+            # but never partially execute the well-formed subset of a malformed
+            # operator request.
+            for row in ready_rows:
+                requested_by_id[row["id"]].outcome = "target_set_invalid"
+            return result
+    else:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -11326,12 +11468,6 @@ def _dispatch_once_locked(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
             ).fetchone()[0]
         )
-
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -11341,6 +11477,9 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
+            if targeted:
+                for row in ready_rows:
+                    requested_by_id[row["id"]].outcome = "ceiling_reached"
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -11418,6 +11557,9 @@ def _dispatch_once_locked(
             _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            if targeted:
+                requested_by_id[row["id"]].outcome = "ceiling_reached"
+                continue
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -11457,11 +11599,17 @@ def _dispatch_once_locked(
                             _default_assignee, row["id"], exc_info=True,
                         )
                         result.skipped_unassigned.append(row["id"])
+                        if targeted:
+                            outcome = requested_by_id[row["id"]]
+                            outcome.outcome = "unassigned"
+                            outcome.detail = "default_assignment_failed"
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                if targeted:
+                    requested_by_id[row["id"]].outcome = "unassigned"
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
@@ -11485,6 +11633,10 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            if targeted:
+                outcome = requested_by_id[row["id"]]
+                outcome.outcome = "nonspawnable"
+                outcome.assignee = row_assignee
             continue
         # A live owner for THIS card is left to the same-card respawn guard
         # below. Only a distinct active card profile-caps this candidate.
@@ -11494,6 +11646,11 @@ def _dispatch_once_locked(
             result.skipped_per_profile_capped.append(
                 (row["id"], row_assignee, len(active_cards))
             )
+            if targeted:
+                outcome = requested_by_id[row["id"]]
+                outcome.outcome = "profile_capped"
+                outcome.assignee = row_assignee
+                outcome.current = len(active_cards)
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -11519,9 +11676,18 @@ def _dispatch_once_locked(
             record_respawn_guard_decision(conn, row["id"], guard_decision)
         if guard_decision.reason is not None:
             result.respawn_guarded.append((row["id"], guard_decision.reason))
+            if targeted:
+                outcome = requested_by_id[row["id"]]
+                outcome.outcome = "respawn_guarded"
+                outcome.assignee = row_assignee
+                outcome.detail = guard_decision.reason
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            if targeted:
+                outcome = requested_by_id[row["id"]]
+                outcome.outcome = "spawned"
+                outcome.assignee = row_assignee
             _per_profile_active_cards.setdefault(row_assignee, set()).add(
                 row["id"]
             )
@@ -11547,6 +11713,11 @@ def _dispatch_once_locked(
                 continuation_denial=exc.code,
             )
             result.respawn_guarded.append((row["id"], "active_pr"))
+            if targeted:
+                outcome = requested_by_id[row["id"]]
+                outcome.outcome = "respawn_guarded"
+                outcome.assignee = row_assignee
+                outcome.detail = "active_pr"
             record_respawn_guard_decision(
                 conn,
                 row["id"],
@@ -11555,6 +11726,28 @@ def _dispatch_once_locked(
             )
             continue
         if claimed is None:
+            if targeted:
+                current = conn.execute(
+                    "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                outcome = requested_by_id[row["id"]]
+                outcome.assignee = (
+                    current["assignee"] if current is not None else row_assignee
+                )
+                if current is None:
+                    outcome.outcome = "not_found"
+                elif current["claim_lock"] is not None:
+                    outcome.outcome = "claimed"
+                    outcome.detail = current["status"]
+                elif current["status"] != "ready":
+                    outcome.outcome = "status_not_ready"
+                    outcome.detail = current["status"]
+                else:
+                    # A direct claimer can win the Ready CAS without using the
+                    # dispatch lock. Fail closed and expose the lost claim race.
+                    outcome.outcome = "claimed"
+                    outcome.detail = "claim_race"
             continue
         if _release_post_claim_live_worker_guard(
             conn,
@@ -11568,6 +11761,11 @@ def _dispatch_once_locked(
             result.respawn_guarded.append(
                 (claimed.id, "live_worker_process")
             )
+            if targeted:
+                outcome = requested_by_id[claimed.id]
+                outcome.outcome = "respawn_guarded"
+                outcome.assignee = claimed.assignee
+                outcome.detail = "live_worker_process"
             continue
         try:
             resolved_branch_name = None
@@ -11582,6 +11780,11 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if targeted:
+                outcome = requested_by_id[claimed.id]
+                outcome.outcome = "spawn_failed"
+                outcome.assignee = claimed.assignee
+                outcome.detail = f"workspace: {exc}"
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -11623,6 +11826,11 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            if targeted:
+                outcome = requested_by_id[claimed.id]
+                outcome.outcome = "spawned"
+                outcome.assignee = claimed.assignee
+                outcome.workspace = str(workspace)
             spawned += 1
             if claimed.assignee:
                 _per_profile_active_cards.setdefault(claimed.assignee, set()).add(
@@ -11635,6 +11843,16 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if targeted:
+                outcome = requested_by_id[claimed.id]
+                outcome.outcome = "spawn_failed"
+                outcome.assignee = claimed.assignee
+                outcome.detail = str(exc)
+
+    if targeted:
+        # Exact-target dispatch is Ready-only. In particular, an empty/all-bad
+        # target set must not fall through into the unfiltered review queue.
+        return result
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
