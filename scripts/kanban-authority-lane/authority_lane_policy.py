@@ -7,6 +7,7 @@ and its installer can use the same policy before any board mutation occurs.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Optional
 
 AUTHORITY_PROFILE = "fable"
@@ -20,9 +21,14 @@ _AUTHORITY_TITLE_TAG = re.compile(
     re.IGNORECASE,
 )
 
-# These markers describe work an executor/reviewer performs.  They are checked
-# across title + body because a neutral-looking title must not hide an
-# implementation deliverable in the opening post.
+# Bracketed executable title markers take precedence over authority markers.
+_EXECUTOR_TITLE_TAG = re.compile(
+    r"\[(?:AUTHOR|FIX|REVIEW|EXEC|IMPLEMENT|BUILD|TEST|VERIFY|AUDIT|"
+    r"REWORK|REBIND|MIGRAT(?:E|ION))[^\]]*\]",
+    re.IGNORECASE,
+)
+# The broader shape also checks title + body so an authority-less neutral title
+# cannot hide an implementation deliverable in the opening post.
 _EXECUTOR_SHAPE = re.compile(
     r"(?:\[(?:AUTHOR|FIX|REVIEW|EXEC|IMPLEMENT|BUILD|TEST|VERIFY|AUDIT|"
     r"REWORK|REBIND|MIGRAT(?:E|ION))[^\]]*\]|\b(?:author(?:ing)?|implement(?:ation)?|"
@@ -36,6 +42,20 @@ class AuthorityLaneError(ValueError):
     """Raised before a forbidden executor-to-authority assignment is written."""
 
 
+@dataclass(frozen=True)
+class CardClassification:
+    """Canonical title/body classification used before custody decisions."""
+
+    executor: bool
+    executor_marker: bool
+    authority: bool
+
+    @property
+    def mixed(self) -> bool:
+        """Return whether executable and authority markers occur together."""
+        return self.executor_marker and self.authority
+
+
 def normalize_assignee(value: Optional[str]) -> Optional[str]:
     """Return a canonical profile label while preserving an omitted assignee."""
     if value is None:
@@ -44,24 +64,58 @@ def normalize_assignee(value: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def classify_card(title: str, body: Optional[str] = None) -> CardClassification:
+    """Classify executable and authority markers before choosing custody.
+
+    The two dimensions are intentionally retained instead of collapsing mixed
+    cards into authority work.  Callers can therefore apply the fleet's
+    executable-marker-wins rule and fail closed when an automatic lifecycle
+    transition would otherwise hide an ambiguous mixed card.
+    """
+    return CardClassification(
+        executor=bool(_EXECUTOR_SHAPE.search(f"{title or ''}\n{body or ''}")),
+        executor_marker=bool(_EXECUTOR_TITLE_TAG.search(title or "")),
+        authority=bool(_AUTHORITY_TITLE_TAG.search(title or "")),
+    )
+
+
 def is_explicit_authority_card(title: str) -> bool:
     """Return whether the title names an allowed authority action explicitly."""
-    return bool(_AUTHORITY_TITLE_TAG.search(title or ""))
+    return classify_card(title).authority
 
 
 def is_executor_shaped(title: str, body: Optional[str] = None) -> bool:
     """Return whether the card asks for implementation/review executor work."""
-    return bool(_EXECUTOR_SHAPE.search(f"{title or ''}\n{body or ''}"))
+    return classify_card(title, body).executor
 
 
 def resolve_transition_assignee(
     current_assignee: Optional[str],
     requested_assignee: Optional[str],
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    operation: str = "transition",
+    reject_implicit_mixed: bool = False,
 ) -> Optional[str]:
-    """Preserve current executor custody when ``--assignee`` is omitted."""
+    """Resolve transition custody without hiding a mixed review card.
+
+    Omitted assignees normally preserve the current executor.  Review-state
+    callers set ``reject_implicit_mixed`` so a title containing both executor
+    and authority markers cannot silently cross the lifecycle boundary without
+    being split or explicitly routed back to an executor.
+    """
     requested = normalize_assignee(requested_assignee)
     if requested is not None:
         return requested
+    if reject_implicit_mixed:
+        classification = classify_card(title or "", body)
+        if classification.mixed:
+            raise AuthorityLaneError(
+                f"{operation} rejected: mixed executor/authority work cannot "
+                "use an implicit assignee; keep the executor card explicit and "
+                "create a distinct authority card"
+            )
     return normalize_assignee(current_assignee)
 
 
@@ -74,19 +128,18 @@ def validate_assignment(
 ) -> Optional[str]:
     """Validate and return the normalized assignee.
 
-    No work may target the Fable authority lane unless the title carries an
-    explicit authority action tag such as ``[LAND]``, ``[APPLY]``,
-    ``[OPERATOR-GATE]``, or ``[ACCEPTANCE]``.  This allow-list removes
-    classifier false negatives; executor classification is retained so the
-    incident-shaped rejection is unambiguous.  Authority tags win when a land
-    gate legitimately references review evidence.
+    No executor-shaped work may target the Fable authority lane, even when an
+    authority marker is also present.  For non-executor cards, Fable custody
+    additionally requires an explicit authority action tag such as ``[LAND]``,
+    ``[APPLY]``, ``[OPERATOR-GATE]``, or ``[ACCEPTANCE]``.
     """
     target = normalize_assignee(assignee)
-    if target == AUTHORITY_PROFILE and not is_explicit_authority_card(title):
-        work_kind = (
-            "executor-shaped work"
-            if is_executor_shaped(title, body)
-            else "work without an explicit authority action"
+    classification = classify_card(title, body)
+    if target == AUTHORITY_PROFILE and (
+        classification.executor_marker or not classification.authority
+    ):
+        work_kind = "executor-shaped work" if classification.executor else (
+            "work without an explicit authority action"
         )
         raise AuthorityLaneError(
             f"{operation} rejected: {work_kind} cannot target "

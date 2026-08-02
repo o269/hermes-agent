@@ -186,6 +186,22 @@ def _transition(broker: MemoryBroker, **overrides):
     return bridge.transition_task(broker, **values)
 
 
+@pytest.mark.parametrize(
+    "title",
+    (
+        "[FIX][FABLE][LAND] implement the reviewed repair",
+        "[review][operator-hold] verify implementation",
+    ),
+)
+def test_classifier_retains_mixed_dimensions_for_executable_precedence(title: str):
+    classification = policy.classify_card(title)
+
+    assert classification.executor
+    assert classification.executor_marker
+    assert classification.authority
+    assert classification.mixed
+
+
 def test_omitted_review_assignee_preserves_current_executor_with_broker_readback():
     broker = MemoryBroker()
     broker.seed(
@@ -216,6 +232,20 @@ def test_explicit_non_fable_review_route_is_honored():
     assert broker.get_task("t_executor")["assignee"] == "security"
 
 
+def test_explicit_non_fable_review_route_wins_for_mixed_title():
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title="[FIX][FABLE][LAND] implement the reviewed repair",
+        assignee="engineer",
+    )
+
+    result = _transition(broker, assignee="security")
+
+    assert result["assignee"] == "security"
+    assert broker.get_task("t_executor")["status"] == "review"
+
+
 def test_explicit_fable_authority_transition_remains_allowed():
     broker = MemoryBroker()
     broker.seed(
@@ -244,6 +274,66 @@ def test_executor_transition_to_fable_fails_closed_without_mutation():
     row = broker.get_task("t_executor")
     assert row["status"] == "running"
     assert row["assignee"] == "engineer"
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "[FIX][FABLE][LAND] implement the reviewed repair",
+        "[review][operator-hold] verify implementation",
+    ),
+)
+def test_mixed_transition_to_fable_fails_closed_without_mutation(title: str):
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title=title,
+        assignee="engineer",
+    )
+
+    with pytest.raises(policy.AuthorityLaneError, match="executor-shaped work"):
+        _transition(broker, assignee="fable")
+
+    row = broker.get_task("t_executor")
+    assert row["status"] == "running"
+    assert row["assignee"] == "engineer"
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "[FIX][FABLE][LAND] implement the reviewed repair",
+        "[review][operator-hold] verify implementation",
+    ),
+)
+def test_implicit_review_of_mixed_title_fails_closed_without_mutation(title: str):
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title=title,
+        assignee="engineer",
+    )
+
+    with pytest.raises(policy.AuthorityLaneError, match="implicit assignee"):
+        _transition(broker)
+
+    row = broker.get_task("t_executor")
+    assert row["status"] == "running"
+    assert row["assignee"] == "engineer"
+
+
+def test_implicit_review_of_pure_authority_title_preserves_current_assignee():
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title="[FABLE][LAND] exact-head acceptance gate",
+        assignee="lander-prep",
+    )
+
+    result = _transition(broker)
+
+    assert result["assignee"] == "lander-prep"
+    assert broker.get_task("t_executor")["status"] == "review"
 
 
 def test_bare_gate_marker_does_not_grant_fable_authority():
@@ -316,6 +406,31 @@ def test_create_time_executor_assignment_to_fable_is_rejected():
     assert count == 0
 
 
+@pytest.mark.parametrize(
+    "title",
+    (
+        "[FIX][FABLE][LAND] implement the reviewed repair",
+        "[review][operator-hold] verify implementation",
+    ),
+)
+def test_create_time_mixed_assignment_to_fable_is_rejected(title: str):
+    broker = MemoryBroker()
+
+    with pytest.raises(policy.AuthorityLaneError, match="executor-shaped work"):
+        bridge.create_task(
+            broker,
+            title=title,
+            body="Open and verify a pull request.",
+            assignee="fable",
+            status="blocked",
+            created_by="orchestrator",
+            priority=0,
+            workspace_kind="scratch",
+        )
+
+    assert broker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_create_cli_returns_guard_exit_without_broker_mutation(capsys):
     broker = MemoryBroker()
 
@@ -335,6 +450,31 @@ def test_create_cli_returns_guard_exit_without_broker_mutation(capsys):
     assert rc == 3
     assert "authority-lane guard" in capsys.readouterr().err
     assert broker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_review_cli_returns_guard_exit_for_implicit_mixed_title(capsys):
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title="[REVIEW][OPERATOR-HOLD] verify implementation",
+        assignee="security",
+    )
+
+    rc = bridge.main(
+        [
+            "t_executor",
+            "review",
+            "--bridge",
+            "test-executor",
+        ],
+        client=broker,
+    )
+
+    assert rc == 3
+    assert "implicit assignee" in capsys.readouterr().err
+    row = broker.get_task("t_executor")
+    assert row["status"] == "running"
+    assert row["assignee"] == "security"
 
 
 def test_create_time_explicit_fable_authority_card_is_allowed():

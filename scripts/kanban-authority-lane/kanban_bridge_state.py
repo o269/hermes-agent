@@ -107,7 +107,12 @@ def transition_task(
             after = before
         else:
             resolved_assignee = resolve_transition_assignee(
-                row.get("assignee"), assignee
+                row.get("assignee"),
+                assignee,
+                title=row.get("title") or "",
+                body=row.get("body"),
+                operation=f"{state} transition for {task_id}",
+                reject_implicit_mixed=state == "review",
             )
             resolved_assignee = validate_assignment(
                 title=row.get("title") or "",
