@@ -208,26 +208,6 @@ class Client:
             "run_id": claimed.current_run_id,
         }
 
-    def claim_with_custody(self, assignee, task_id=None, host_identity=None,
-                           ttl_seconds=7200, op_id=None):
-        """Claim through boardd's peer-authenticated host-custody endpoint.
-
-        ``host_identity`` is carried for wire/API compatibility only. boardd
-        derives authoritative custody from SO_PEERCRED and ``/proc`` rather
-        than trusting this caller-supplied value.
-        """
-        return self._request("claim_with_custody", {
-            "assignee": assignee, "task_id": task_id,
-            "host_identity": host_identity, "ttl_seconds": ttl_seconds,
-            "worker_id": self.worker_id}, mutation=True, op_id=op_id)["result"]
-
-    def record_worker_pid(self, task_id, run_id, worker_pid, claim_lock,
-                          op_id=None):
-        return self._request("record_worker_pid", {
-            "task_id": task_id, "run_id": run_id,
-            "worker_pid": worker_pid, "claim_lock": claim_lock,
-        }, mutation=True, op_id=op_id)["result"]
-
     def exec_write(self, sql, params=None, *, op_id=None):
         # returns {"rowcount":..., "lastrowid":...}
         return self._request("exec", {"sql": sql, "params": params or []},
