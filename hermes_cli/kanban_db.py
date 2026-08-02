@@ -4072,6 +4072,68 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _reject_claim_while_profile_running(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+) -> bool:
+    """Reject a claim when another Running row owns the same profile.
+
+    Callers must invoke this inside the same ``write_txn`` that performs the
+    status CAS. ``BEGIN IMMEDIATE`` serializes competing writers, so a second
+    caller observes the first caller's committed Running row even when both
+    passed an earlier dispatcher snapshot. This is the fail-closed authority;
+    the dispatcher's in-memory profile map remains a fast-path and telemetry
+    aid, not the concurrency control.
+    """
+    candidate = conn.execute(
+        "SELECT assignee FROM tasks "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (task_id, expected_status),
+    ).fetchone()
+    if candidate is None:
+        return False
+
+    assignee = candidate["assignee"]
+    try:
+        canonical_assignee = _canonical_assignee(assignee)
+    except (TypeError, ValueError):
+        canonical_assignee = None
+    if not assignee or canonical_assignee != assignee:
+        _append_event(
+            conn,
+            task_id,
+            "claim_rejected",
+            {
+                "reason": "assignee_required",
+                "source_status": expected_status,
+            },
+        )
+        return True
+
+    owner = conn.execute(
+        "SELECT id AS running_task_id FROM tasks "
+        "WHERE assignee = ? AND status = 'running' AND id != ? "
+        "ORDER BY started_at ASC, created_at ASC, id ASC LIMIT 1",
+        (canonical_assignee, task_id),
+    ).fetchone()
+    if owner is None:
+        return False
+    _append_event(
+        conn,
+        task_id,
+        "claim_rejected",
+        {
+            "reason": "profile_running",
+            "profile": canonical_assignee,
+            "running_task_id": owner["running_task_id"],
+            "source_status": expected_status,
+        },
+    )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4317,6 +4379,12 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        if _reject_claim_while_profile_running(
+            conn,
+            task_id,
+            expected_status="ready",
+        ):
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4466,6 +4534,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _reject_claim_while_profile_running(
+            conn,
+            task_id,
+            expected_status="review",
+        ):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks

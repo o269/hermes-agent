@@ -2032,7 +2032,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
-        b = kb.create_task(conn, title="b", assignee="worker")
+        b = kb.create_task(conn, title="b", assignee="worker-b")
         kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
@@ -2063,7 +2063,7 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
-        b = kb.create_task(conn, title="b", assignee="worker")
+        b = kb.create_task(conn, title="b", assignee="worker-b")
         kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
@@ -4002,10 +4002,10 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         # shapes without status interference.
         parent_a = kb.create_task(conn, title="retry-empty", assignee="alice")
         kb.claim_task(conn, parent_a)
-        parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
+        parent_b = kb.create_task(conn, title="retry-corrected", assignee="bob")
         kb.claim_task(conn, parent_b)
         real = kb.create_task(
-            conn, title="real-child", assignee="x", created_by="alice",
+            conn, title="real-child", assignee="x", created_by="bob",
         )
 
         # First attempt: phantom in the list rejects, task stays running.

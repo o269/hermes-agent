@@ -177,9 +177,36 @@ class Client:
                              mutation=True, op_id=op_id)["result"]
 
     def claim(self, task_id, *, claimer=None, ttl_seconds=7200, op_id=None):
-        return self._request("claim", {
-            "task_id": task_id, "claimer": claimer, "ttl_seconds": ttl_seconds,
-            "worker_id": self.worker_id}, mutation=True, op_id=op_id)["result"]
+        """Claim one exact task through kanban_db's policy-complete authority.
+
+        The broker's legacy native ``claim`` mutation performs only a same-task
+        CAS. It cannot enforce continuation policy or the per-profile Running
+        fence, so callers execute the real claim transaction over this client's
+        broker connection instead. ``op_id`` remains accepted for source
+        compatibility; the canonical status CAS makes transaction replay a
+        no-op rather than relying on the legacy applied-ops entry.
+        """
+        del op_id
+        from hermes_cli import boardd_shim, kanban_db
+
+        conn = boardd_shim.BrokerConnection(client=self)
+        try:
+            claimed = kanban_db.claim_task(
+                conn,
+                task_id,
+                claimer=claimer,
+                ttl_seconds=ttl_seconds,
+            )
+        finally:
+            conn.close()
+        if claimed is None:
+            return {"won": False, "task_id": task_id}
+        return {
+            "won": True,
+            "task_id": task_id,
+            "claim_lock": claimed.claim_lock,
+            "run_id": claimed.current_run_id,
+        }
 
     def exec_write(self, sql, params=None, *, op_id=None):
         # returns {"rowcount":..., "lastrowid":...}
