@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -64,6 +65,120 @@ def _claim_review(
     assert claimed.dispatch_origin == "review"
     assert run.dispatch_origin == "review"
     return task_id, run
+
+
+@pytest.mark.parametrize(
+    ("existing_run", "current_source_status", "expected_origin"),
+    [
+        (True, "review", "review"),
+        (False, "review", "review"),
+        # A task-only ready claim predating source_status must not inherit the
+        # older review attempt's provenance.
+        (False, None, "ready"),
+    ],
+)
+def test_legacy_review_run_upgrade_backfills_origin_before_stale_recovery(
+    isolated_board: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_run: bool,
+    current_source_status: str | None,
+    expected_origin: str,
+) -> None:
+    """Upgrade a real legacy on-disk review attempt before reclaiming it.
+
+    ``existing_run=False`` covers the older task-only lifecycle shape whose
+    missing run must be synthesized during migration. Both legacy shapes carry
+    their review provenance only in the durable ``claimed`` event.
+    """
+    db_path = kb.kanban_db_path()
+    now = int(time.time())
+    with sqlite3.connect(str(db_path)) as legacy:
+        legacy.execute("ALTER TABLE tasks DROP COLUMN dispatch_origin")
+        legacy.execute("ALTER TABLE task_runs DROP COLUMN dispatch_origin")
+        legacy.execute(
+            "INSERT INTO tasks ("
+            "id, title, assignee, status, created_at, started_at, "
+            "claim_lock, claim_expires"
+            ") VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+            (
+                "legacy-review",
+                "legacy review attempt",
+                "default",
+                now - 120,
+                now - 120,
+                "legacy-host:reviewer",
+                now - 60,
+            ),
+        )
+        legacy_run_id = 987654
+        if existing_run:
+            cursor = legacy.execute(
+                "INSERT INTO task_runs ("
+                "task_id, profile, status, claim_lock, claim_expires, started_at"
+                ") VALUES (?, ?, 'running', ?, ?, ?)",
+                (
+                    "legacy-review",
+                    "default",
+                    "legacy-host:reviewer",
+                    now - 60,
+                    now - 120,
+                ),
+            )
+            assert cursor.lastrowid is not None
+            legacy_run_id = int(cursor.lastrowid)
+            legacy.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (legacy_run_id, "legacy-review"),
+            )
+        elif current_source_status is None:
+            legacy.execute(
+                "INSERT INTO task_events ("
+                "task_id, run_id, kind, payload, created_at"
+                ") VALUES (?, NULL, 'claimed', ?, ?)",
+                (
+                    "legacy-review",
+                    json.dumps({
+                        "run_id": legacy_run_id - 1,
+                        "source_status": "review",
+                    }),
+                    now - 180,
+                ),
+            )
+        current_payload: dict[str, object] = {"run_id": legacy_run_id}
+        if current_source_status is not None:
+            current_payload["source_status"] = current_source_status
+        legacy.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'claimed', ?, ?)",
+            (
+                "legacy-review",
+                legacy_run_id if existing_run else None,
+                json.dumps(current_payload),
+                now - 120,
+            ),
+        )
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as migrated:
+        task = kb.get_task(migrated, "legacy-review")
+        run = kb.latest_run(migrated, "legacy-review")
+        assert task is not None
+        assert run is not None
+        assert task.dispatch_origin == expected_origin
+        assert run.dispatch_origin == expected_origin
+        assert task.current_run_id == run.id
+
+        assert kb.release_stale_claims(migrated, signal_fn=lambda *_args: None) == 1
+        recovered = kb.get_task(migrated, "legacy-review")
+        closed_run = kb.latest_run(migrated, "legacy-review")
+        assert recovered is not None
+        assert closed_run is not None
+        assert recovered.status == expected_origin
+        assert recovered.current_run_id is None
+        assert closed_run.outcome == "reclaimed"
+        assert closed_run.dispatch_origin == expected_origin
 
 
 @pytest.mark.parametrize(

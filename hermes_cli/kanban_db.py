@@ -2364,6 +2364,50 @@ def _backfill_task_pr_declarations(conn: sqlite3.Connection) -> None:
         )
 
 
+def _claimed_event_dispatch_origin(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+) -> Optional[str]:
+    """Return durable queue provenance from the newest matching claim event.
+
+    Claim events written before ``task_events.run_id`` existed still carry the
+    run id in their JSON payload. For an existing run, only an event associated
+    with that exact run is authoritative; for task-only legacy attempts, the
+    newest claim event is the only available provenance.
+    """
+    query = (
+        "SELECT run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed' ORDER BY id DESC"
+    )
+    if run_id is None:
+        # A task-only attempt has no run key that can distinguish generations.
+        # Only its newest claim may describe the current attempt; walking back
+        # to an older review claim would leak stale provenance into a newer
+        # ready claim whose legacy payload has no source_status field.
+        query += " LIMIT 1"
+    rows = conn.execute(query, (task_id,)).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if run_id is not None:
+            associated_ids = (row["run_id"], payload.get("run_id"))
+            if not any(
+                value is not None and str(value) == str(run_id)
+                for value in associated_ids
+            ):
+                continue
+        source_status = payload.get("source_status")
+        if source_status in {"ready", "review"}:
+            return str(source_status)
+    return None
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2601,26 +2645,100 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
-    # One-shot backfill: any task that is 'running' before runs existed
-    # had its claim_lock / claim_expires / worker_pid on the task row.
-    # Synthesize a matching task_runs row so subsequent end-run / heartbeat
-    # calls have something to write to. Wrapped in write_txn to serialize
-    # against any concurrent dispatcher, and the per-row UPDATE uses
-    # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
-    # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
+    # Transactionally repair active attempt provenance before any caller can
+    # obtain the upgraded connection and run recovery. The run-associated
+    # claimed event is authoritative when present: this also repairs boards
+    # that briefly ran the original additive migration, which wrote ``ready``
+    # during missing-run synthesis even when the durable event said ``review``.
+    # Only attempts without durable or already-valid provenance default ready.
+    #
+    # A still older task-only lifecycle shape has no task_runs row at all.
+    # Synthesize one in the same transaction so subsequent end-run / heartbeat
+    # calls have something to write to. The per-row UPDATE uses
+    # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't produce
+    # an orphaned row if it interleaves with the backfill pass.
+    runs_exist = (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+        ).fetchone()
+        is not None
+    )
     if runs_exist:
         with write_txn(conn):
-            inflight = conn.execute(
-                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-                "       max_runtime_seconds, last_heartbeat_at, started_at "
-                "FROM tasks "
-                "WHERE status = 'running' AND current_run_id IS NULL"
-            ).fetchall()
+            current_run_cols = {
+                row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+            }
+            if {"id", "ended_at", "dispatch_origin"}.issubset(current_run_cols):
+                active_runs = conn.execute(
+                    "SELECT t.id AS task_id, t.current_run_id, "
+                    "       t.dispatch_origin AS task_origin, "
+                    "       r.dispatch_origin AS run_origin "
+                    "FROM tasks t "
+                    "JOIN task_runs r ON r.id = t.current_run_id "
+                    "WHERE t.status = 'running' AND r.ended_at IS NULL"
+                ).fetchall()
+            else:
+                # The separate drift-rebuild pass below handles pre-v1 run
+                # tables that do not yet have the lifecycle columns required
+                # for an active-attempt join.
+                active_runs = []
+            for row in active_runs:
+                run_id = int(row["current_run_id"])
+                origin = _claimed_event_dispatch_origin(
+                    conn,
+                    str(row["task_id"]),
+                    run_id=run_id,
+                )
+                if origin is None and row["run_origin"] in {"ready", "review"}:
+                    origin = str(row["run_origin"])
+                if origin is None and row["task_origin"] in {"ready", "review"}:
+                    origin = str(row["task_origin"])
+                if origin is None:
+                    origin = "ready"
+                conn.execute(
+                    "UPDATE task_runs SET dispatch_origin = ? "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (origin, run_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET dispatch_origin = ? "
+                    "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                    (origin, row["task_id"], run_id),
+                )
+
+            synthesis_columns = {
+                "task_id",
+                "profile",
+                "dispatch_origin",
+                "status",
+                "claim_lock",
+                "claim_expires",
+                "worker_pid",
+                "max_runtime_seconds",
+                "last_heartbeat_at",
+                "started_at",
+            }
+            if synthesis_columns.issubset(current_run_cols):
+                inflight = conn.execute(
+                    "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                    "       max_runtime_seconds, last_heartbeat_at, started_at, "
+                    "       dispatch_origin "
+                    "FROM tasks "
+                    "WHERE status = 'running' AND current_run_id IS NULL"
+                ).fetchall()
+            else:
+                inflight = []
             for row in inflight:
                 started = row["started_at"] or int(time.time())
+                origin = _claimed_event_dispatch_origin(
+                    conn,
+                    str(row["id"]),
+                    run_id=None,
+                )
+                if origin is None and row["dispatch_origin"] in {"ready", "review"}:
+                    origin = str(row["dispatch_origin"])
+                if origin is None:
+                    origin = "ready"
                 cur = conn.execute(
                     """
                     INSERT INTO task_runs (
@@ -2628,12 +2746,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'ready', 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["id"], row["assignee"], row["claim_lock"],
-                        row["claim_expires"], row["worker_pid"],
-                        row["max_runtime_seconds"], row["last_heartbeat_at"],
+                        row["id"],
+                        row["assignee"],
+                        origin,
+                        row["claim_lock"],
+                        row["claim_expires"],
+                        row["worker_pid"],
+                        row["max_runtime_seconds"],
+                        row["last_heartbeat_at"],
                         started,
                     ),
                 )
@@ -2644,9 +2767,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 # reclaimed so it doesn't look in-flight.
                 upd = conn.execute(
                     "UPDATE tasks SET current_run_id = ?, "
-                    "dispatch_origin = COALESCE(dispatch_origin, 'ready') "
+                    "dispatch_origin = ? "
                     "WHERE id = ? AND current_run_id IS NULL",
-                    (cur.lastrowid, row["id"]),
+                    (cur.lastrowid, origin, row["id"]),
                 )
                 if upd.rowcount != 1:
                     conn.execute(
