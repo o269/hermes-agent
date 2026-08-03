@@ -466,12 +466,34 @@ def connect_closing(db_path=None, *, board=None):
             pass
 
 
-def add_comment(conn, task_id, author, body):
+def add_comment(
+    conn,
+    task_id,
+    author,
+    body,
+    *,
+    expected_authority_revision=None,
+):
     if not isinstance(conn, BrokerConnection):
         return _require_original("add_comment", _ORIG_ADD_COMMENT)(
-            conn, task_id, author, body
+            conn,
+            task_id,
+            author,
+            body,
+            expected_authority_revision=expected_authority_revision,
         )
     _cov("add_comment")
+    if expected_authority_revision is not None:
+        # CAS comments must execute the real kanban_db transaction over the
+        # BrokerConnection. The legacy native endpoint cannot carry the
+        # reviewed revision and would reopen the final-read/write race.
+        return _require_original("add_comment", _ORIG_ADD_COMMENT)(
+            conn,
+            task_id,
+            author,
+            body,
+            expected_authority_revision=expected_authority_revision,
+        )
     return _c().add_comment(task_id, author, body)["comment_id"]
 
 
