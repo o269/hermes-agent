@@ -473,6 +473,68 @@ def test_manual_promote_preserves_review_origin(
         assert review_retry.dispatch_origin == "review"
 
 
+def test_dashboard_direct_running_to_ready_preserves_review_origin(
+    isolated_board: Path,
+) -> None:
+    """Dashboard running->ready recovery must not leak review work to authors.
+
+    Operator yank via dashboard requests ``ready``, but review-origin custody
+    must return to ``review``: one run closed as reclaimed, zero open runs,
+    generic claim_task refused, claim_review_task succeeds.
+    """
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    with kb.connect() as conn:
+        task_id, review_run = _claim_review(conn)
+        # Assigned orphan-pointer corruption class from the security canary.
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+        assert _set_status_direct(conn, task_id, "ready") is True
+
+        recovered = kb.get_task(conn, task_id)
+        closed = kb.latest_run(conn, task_id)
+        open_runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()
+        status_event = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'status' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+        assert recovered is not None
+        assert recovered.status == "review"
+        assert recovered.dispatch_origin == "review"
+        assert recovered.current_run_id is None
+        assert recovered.claim_lock is None
+        assert closed is not None
+        assert closed.id == review_run.id
+        assert closed.outcome == "reclaimed"
+        assert closed.ended_at is not None
+        assert closed.dispatch_origin == "review"
+        assert closed.summary == "status changed to review (dashboard/direct)"
+        assert open_runs is not None and int(open_runs["n"]) == 0
+        assert status_event is not None
+        assert status_event["run_id"] == review_run.id
+        assert json.loads(status_event["payload"]) == {"status": "review"}
+
+        assert kb.claim_task(conn, task_id, claimer="test-host:author") is None
+        review_retry = kb.claim_review_task(
+            conn,
+            task_id,
+            claimer="test-host:reviewer",
+        )
+        assert review_retry is not None
+        assert review_retry.status == "running"
+        assert review_retry.dispatch_origin == "review"
+
+
 @pytest.mark.parametrize(
     ("transition", "expected_status", "expected_outcome"),
     [

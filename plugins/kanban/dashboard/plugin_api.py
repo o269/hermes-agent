@@ -991,20 +991,48 @@ def _set_status_direct(
     active run with outcome='reclaimed' so attempt history isn't
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
+
+    Review-origin recoveries must not spill into the author queue: when the
+    caller requests ``running -> ready``, derive the effective queue from the
+    open run / task ``dispatch_origin`` (same rule as reclaim/stale recovery)
+    and write ``review`` for review-origin work. Recovery is not a
+    reviewer-to-author handoff.
     """
     with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run.
+        # Snapshot current state so we know whether to close a run and which
+        # queue a running->ready recovery must return to.
         prev = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, dispatch_origin, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
             return False
 
+        was_running = prev["status"] == "running"
+        effective_status = new_status
+        if was_running and new_status == "ready":
+            # Prefer the open run's origin (covers orphaned pointer clears),
+            # then fall back to the task row — matching reclaim/stale recovery.
+            open_run = conn.execute(
+                "SELECT dispatch_origin FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            origin = None
+            if open_run is not None and open_run["dispatch_origin"] is not None:
+                origin = open_run["dispatch_origin"]
+            elif prev["dispatch_origin"] is not None:
+                origin = prev["dispatch_origin"]
+            effective_status = kanban_db._dispatch_retry_status(origin)
+
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
         # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if new_status == "ready":
+        # Review-lane recovery is not an author ready promotion — skip this
+        # gate when the effective queue is review.
+        if effective_status == "ready":
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -1016,10 +1044,9 @@ def _set_status_direct(
             ):
                 return False
 
-        was_running = prev["status"] == "running"
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
+            and effective_status not in {"done", "archived"}
         )
 
         cur = conn.execute(
@@ -1028,21 +1055,34 @@ def _set_status_direct(
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
+            (
+                effective_status,
+                effective_status,
+                effective_status,
+                effective_status,
+                task_id,
+            ),
         )
         if cur.rowcount != 1:
             return False
         run_id = None
-        if was_running and new_status != "running":
+        if was_running and effective_status != "running":
             run_id = kanban_db._end_run(
                 conn, task_id,
                 outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {new_status} (dashboard/direct)",
+                summary=(
+                    f"status changed to {effective_status} (dashboard/direct)"
+                ),
             )
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (
+                task_id,
+                run_id,
+                json.dumps({"status": effective_status}),
+                int(time.time()),
+            ),
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that
