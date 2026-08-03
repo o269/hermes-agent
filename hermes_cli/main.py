@@ -13450,6 +13450,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",

@@ -373,7 +373,7 @@ class Broker:
             if not ("malformed" in msg or "corrupt" in msg or "integrity" in msg
                     or "not a database" in msg):
                 raise
-            _log.error("boardd: board damaged at open (%s) — attempting in-place "
+            _log.error("boardd: board damaged while opening (%s) — attempting in-place "
                        "REINDEX recovery on a raw handle", exc)
             raw = sqlite3.connect(self.db_realpath, isolation_level=None,
                                   timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0)

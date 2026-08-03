@@ -151,6 +151,7 @@ def build_top_level_parser():
         parser,
         "--reasoning",
         choices=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+        metavar="EFFORT",
         default=None,
         help=(
             "Reasoning-effort override for this invocation. "
