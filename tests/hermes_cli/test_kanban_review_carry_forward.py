@@ -357,6 +357,56 @@ def test_forced_skill_failure_then_review_retry_delivers_verdict(
         assert run.summary == verdict
 
 
+def test_review_dependency_wait_recovers_to_review_lane(
+    isolated_board: Path,
+) -> None:
+    """A satisfied review-origin dependency must not restart author work."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn,
+            title="review dependency",
+            assignee="default",
+        )
+        task_id, review_run = _claim_review(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=task_id)
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason=f"waiting on {parent}",
+            kind="dependency",
+            expected_run_id=review_run.id,
+        )
+        waiting = kb.get_task(conn, task_id)
+        ended_review_run = kb.latest_run(conn, task_id)
+        assert waiting is not None
+        assert waiting.status == "todo"
+        assert waiting.dispatch_origin == "review"
+        assert waiting.current_run_id is None
+        assert ended_review_run is not None
+        assert ended_review_run.outcome == "blocked"
+        assert ended_review_run.ended_at is not None
+
+        claimed_parent = kb.claim_task(conn, parent, claimer="test-host:author")
+        assert claimed_parent is not None
+        assert kb.complete_task(conn, parent, result="dependency satisfied")
+
+        recovered = kb.get_task(conn, task_id)
+        assert recovered is not None
+        assert recovered.status == "review"
+        assert recovered.dispatch_origin == "review"
+        assert kb.claim_task(conn, task_id, claimer="test-host:author") is None
+
+        review_retry = kb.claim_review_task(
+            conn,
+            task_id,
+            claimer="test-host:reviewer",
+        )
+        assert review_retry is not None
+        assert review_retry.status == "running"
+        assert review_retry.dispatch_origin == "review"
+
+
 @pytest.mark.parametrize(
     ("transition", "expected_status", "expected_outcome"),
     [

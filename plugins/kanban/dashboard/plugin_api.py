@@ -995,7 +995,7 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1033,7 +1033,7 @@ def _set_status_direct(
         if cur.rowcount != 1:
             return False
         run_id = None
-        if was_running and new_status != "running" and prev["current_run_id"]:
+        if was_running and new_status != "running":
             run_id = kanban_db._end_run(
                 conn, task_id,
                 outcome="reclaimed", status="reclaimed",

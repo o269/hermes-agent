@@ -1559,6 +1559,49 @@ def test_patch_status_archive_closes_running_run(client):
         conn.close()
 
 
+def test_patch_status_ready_closes_orphaned_running_run(client):
+    """A direct running -> ready move must reconcile an open orphaned run."""
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="orphaned direct move",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
+        run_id = open_run.id
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                (tid,),
+            )
+
+        assert plugin._set_status_direct(conn, tid, "ready")
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        status_event = conn.execute(
+            "SELECT run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert run is not None
+        assert run.id == run_id
+        assert run.outcome == "reclaimed"
+        assert run.ended_at is not None
+        assert status_event is not None
+        assert status_event["run_id"] == run_id
+    finally:
+        conn.close()
+
+
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})

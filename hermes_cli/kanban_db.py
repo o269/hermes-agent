@@ -4509,7 +4509,7 @@ def _synthesize_ended_run(
 
 
 # ---------------------------------------------------------------------------
-# Dependency resolution (todo -> ready)
+# Dependency resolution (todo -> dispatch-origin queue)
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4553,7 +4553,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote dependency-held tasks when all parents are ``done`` or ``archived``.
+
+    Author-origin work returns to ``ready``. Review-origin work returns to
+    ``review`` so a dependency wait cannot silently restart author execution.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -4586,7 +4589,8 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, title, body, assignee, status, consecutive_failures, max_retries "
+            "SELECT id, title, body, assignee, status, dispatch_origin, "
+            "consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4605,12 +4609,13 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                recovery_status = _dispatch_retry_status(row["dispatch_origin"])
                 assignment_denial = _assignment_guard_reason(
                     conn,
                     title=row["title"],
                     body=row["body"],
                     assignee=row["assignee"],
-                    status="ready",
+                    status=recovery_status,
                     has_open_parent=False,
                     task_id=task_id,
                 )
@@ -4637,14 +4642,14 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
+                        "UPDATE tasks SET status = ? "
                         "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
+                        (recovery_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
+                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        (recovery_status, task_id),
                     )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
