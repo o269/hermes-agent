@@ -485,9 +485,13 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     the limit, and never a live-transport / running / mid-build one."""
 
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": 2})
-    evicted: list[str] = []
+    evicted: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
-        server, "_close_session_by_id", lambda sid, end_reason=None: evicted.append(sid)
+        server,
+        "_teardown_popped_session",
+        lambda session, end_reason=None: evicted.append(
+            (session["_sid"], end_reason)
+        ),
     )
 
     def _ready() -> threading.Event:
@@ -509,15 +513,36 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
                 "running": True,
                 "agent_ready": _ready(),
             },
+            "queued_detached": {
+                "transport": detached,
+                "last_active": 25.0,
+                "queued_prompt": {"text": "next"},
+                "agent_ready": _ready(),
+            },
+            "inflight_detached": {
+                "transport": detached,
+                "last_active": 20.0,
+                "inflight_turn": {"text": "now"},
+                "agent_ready": _ready(),
+            },
+            "slash_inflight_detached": {
+                "transport": detached,
+                "last_active": 10.0,
+                "_slash_worker_inflight": 1,
+                "agent_ready": _ready(),
+            },
             "focused_live": {"transport": live, "last_active": 200.0, "agent_ready": _ready()},
         }
     )
 
     server._enforce_session_cap()
 
-    # 4 sessions, cap 2 -> evict 2. Only detached+idle+built are eligible, oldest
-    # first; the running one and the live-transport one are exempt.
-    assert evicted == ["old_detached", "new_detached"]
+    # 7 sessions, cap 2 -> evict every eligible session. Queued/in-flight work,
+    # the running session, and the live-transport session are exempt.
+    assert evicted == [
+        ("old_detached", "lru_evict"),
+        ("new_detached", "lru_evict"),
+    ]
 
 
 def test_enforce_session_cap_disabled_is_noop(server, monkeypatch):
@@ -537,6 +562,26 @@ def test_enforce_session_cap_disabled_is_noop(server, monkeypatch):
     server._enforce_session_cap()
 
     assert evicted == []
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, 16),
+        ({"max_live_sessions": None}, 0),
+        ({"max_live_sessions": 0}, 0),
+        ({"gateway": {"max_live_sessions": 7}}, 7),
+        (
+            {"max_live_sessions": 5, "gateway": {"max_live_sessions": 7}},
+            5,
+        ),
+    ],
+)
+def test_max_live_sessions_defaults_and_legacy_fallback(
+    server, monkeypatch, config, expected
+):
+    monkeypatch.setattr(server, "_load_cfg", lambda: config)
+    assert server._max_live_sessions() == expected
 
 
 def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
@@ -1221,7 +1266,7 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     assert "error" not in resp
     assert resp["result"]["session_id"] == sid
     assert server._sessions[sid]["transport"] is new_transport
-    assert not server._ws_session_is_orphaned(server._sessions[sid])
+    assert not server._ws_session_is_quiescent(sid, server._sessions[sid])
 
 
 def test_session_branch_persists_branched_from_marker(server, monkeypatch):

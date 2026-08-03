@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -139,7 +139,11 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
-_session_resume_lock = threading.Lock()
+# One lifecycle lock serializes transport ownership, resume/activate rebinds,
+# timer claims, and registry removal.  It is reentrant because helpers such as
+# ``_pop_session_by_id`` are also used by callers that already own the lifecycle
+# transaction.  Slow agent/worker teardown still happens after releasing it.
+_session_resume_lock = threading.RLock()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -153,9 +157,10 @@ _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
 # ``session.create`` (new sid + a fresh _SlashWorker via _deferred_build) and
 # never reattaches the OLD sid, so the old session's slash-worker subprocess
 # lingers forever — one leaked python process per refresh (#38591 fallout).
-# After this grace window, an orphaned (transport-detached, not-running) WS
-# session is reaped: its _SlashWorker is closed and the session finalized.
-# Set to 0 to disable (park forever, pre-fix behaviour).
+# After this grace window, a positively quiescent detached session is SOFT
+# parked: its _SlashWorker and active-session lease are released, while its
+# agent/history/durable row remain resumable.  The legacy environment-variable
+# name is retained for compatibility.  Set to 0 to disable soft parking.
 try:
     _ws_orphan_reap_grace = float(
         os.environ.get("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S") or "20"
@@ -163,6 +168,47 @@ try:
 except (ValueError, TypeError):
     _ws_orphan_reap_grace = 20.0
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
+_SESSION_LIFECYCLE_ACTIONS = (
+    "detach",
+    "soft_park",
+    "resume",
+    "explicit_close",
+    "empty_discard",
+    "idle_timeout",
+    "lru_evict",
+    "cleanup_exception",
+)
+_session_lifecycle_counters = {action: 0 for action in _SESSION_LIFECYCLE_ACTIONS}
+_session_lifecycle_counter_lock = threading.Lock()
+_ws_soft_park_timers: dict[str, Any] = {}
+
+
+def _record_session_lifecycle(action: str, count: int = 1, **fields: Any) -> None:
+    """Increment and emit a structured TUI-session lifecycle counter."""
+    with _session_lifecycle_counter_lock:
+        total = _session_lifecycle_counters.get(action, 0) + count
+        _session_lifecycle_counters[action] = total
+    suffix = " ".join(
+        f"{key}={value}" for key, value in sorted(fields.items()) if value is not None
+    )
+    logger.info(
+        "tui_session_lifecycle action=%s count=%d total=%d%s",
+        action,
+        count,
+        total,
+        f" {suffix}" if suffix else "",
+    )
+
+
+def _record_cleanup_exception(phase: str, exc: BaseException, *, sid: str = "") -> None:
+    _record_session_lifecycle("cleanup_exception", phase=phase, sid=sid or None)
+    logger.warning(
+        "tui_session_lifecycle cleanup_exception phase=%s sid=%s error=%s",
+        phase,
+        sid or "-",
+        exc,
+        exc_info=True,
+    )
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
@@ -294,7 +340,7 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 
 # Detached websocket sessions use a drop sink instead of stdio. Desktop embeds
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
-# must not fall through there while the session waits for resume or reap.
+# must not fall through there while the detached session waits for resume.
 _detached_ws_transport = _DropTransport()
 
 
@@ -456,8 +502,10 @@ def _notify_session_boundary(
             session_id=session_id,
             platform=_resolve_agent_platform(platform),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_cleanup_exception(
+            f"session_boundary_{event_type}", exc, sid=str(session_id or "")
+        )
 
 
 def _claim_active_session_slot(
@@ -488,8 +536,12 @@ def _release_active_session_slot(session: dict | None) -> None:
         return
     try:
         lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+    except Exception as exc:
+        _record_cleanup_exception(
+            "active_session_lease_release",
+            exc,
+            sid=str(session.get("_sid") or ""),
+        )
 
 
 def _transfer_active_session_slot(
@@ -623,8 +675,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         if snapshot:
             try:
                 agent._persist_session(snapshot)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_cleanup_exception(
+                    "finalize_persist", exc, sid=str(session.get("_sid") or "")
+                )
 
     # ── Plugin hook: on_session_end ────────────────────────────────────
     # Signals every plugin that the session is closing, with
@@ -645,14 +699,20 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                 model=getattr(agent, "model", "unknown"),
                 platform=getattr(agent, "platform", None) or "tui",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_cleanup_exception(
+                "finalize_on_session_end_hook",
+                exc,
+                sid=str(session.get("_sid") or ""),
+            )
 
     if agent is not None and history and hasattr(agent, "commit_memory_session"):
         try:
             agent.commit_memory_session(history)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_cleanup_exception(
+                "finalize_memory_commit", exc, sid=str(session.get("_sid") or "")
+            )
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
@@ -679,8 +739,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                 _tui_owns_lifecycle = not _is_gateway_owned_source(source)
                 if _tui_owns_lifecycle:
                     db.end_session(session_id, end_reason)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_cleanup_exception(
+                "finalize_db_end", exc, sid=str(session.get("_sid") or "")
+            )
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -700,15 +762,24 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                         if _cand is session:
                             _own_sid = _cand_sid
                             break
-            except Exception:
+            except Exception as exc:
+                _record_cleanup_exception(
+                    "finalize_session_id_lookup",
+                    exc,
+                    sid=str(session.get("_sid") or ""),
+                )
                 _own_sid = ""
         interrupt_for_session(
             session_key=str(session_key or "") if _tui_owns_lifecycle else "",
             origin_ui_session_id=_own_sid,
             reason=end_reason,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_cleanup_exception(
+            "finalize_delegation_interrupt",
+            exc,
+            sid=str(session.get("_sid") or ""),
+        )
 
     # Close the slash-worker subprocess as part of finalize itself, not just
     # in the callers. Defense-in-depth: every session-end path goes through
@@ -722,14 +793,16 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         worker = session.get("slash_worker")
         if worker:
             worker.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_cleanup_exception(
+            "finalize_worker_close", exc, sid=str(session.get("_sid") or "")
+        )
 
 
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
-    Shared by ``session.close`` and the orphaned-WS-session reaper. The
+    Shared by explicit close plus TTL/LRU/empty-shell eviction. The
     slash-worker subprocess is closed inside ``_finalize_session`` (the single
     finalize chokepoint); this still unregisters the approval notifier and
     closes the in-process agent. Idempotent: the ``_finalized`` guard in
@@ -744,32 +817,66 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
 
         if key := session.get("session_key"):
             unregister_gateway_notify(key)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_cleanup_exception(
+            "teardown_approval_unregister",
+            exc,
+            sid=str(session.get("_sid") or ""),
+        )
     try:
         agent = session.get("agent")
         if agent is not None and hasattr(agent, "close"):
             agent.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_cleanup_exception(
+            "teardown_agent_close", exc, sid=str(session.get("_sid") or "")
+        )
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
     # finalize is unregistering the notifier and closing the in-process agent.
 
 
-def _attach_worker(sid: str, session: dict, worker) -> None:
+def _attach_worker(sid: str, session: dict, worker) -> bool:
     """Store worker on session iff sid still maps to it, else close it — a
     concurrent teardown already popped the session and would orphan the
-    worker. Closes the create/close race at every slash-worker spawn site."""
-    with _sessions_lock:
-        if _sessions.get(sid) is session:
-            session["slash_worker"] = worker
-            return
-    worker.close()
+    worker. A worker also cannot attach after soft parking won the lifecycle
+    transaction. Closes the create/close/park race at every spawn site."""
+    with _session_resume_lock:
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is session
+                and not session.get("_active_session_lease_parked")
+                and session.get("slash_worker") is None
+            ):
+                session["slash_worker"] = worker
+                return True
+    try:
+        worker.close()
+    except Exception as exc:
+        _record_cleanup_exception("rejected_worker_close", exc, sid=sid)
+    return False
 
 
-def _pop_session_by_id(sid: str) -> dict | None:
+def _cancel_ws_soft_park_timer_locked(sid: str) -> None:
+    """Cancel and forget ``sid``'s grace timer while owning the lifecycle lock."""
+    timer = _ws_soft_park_timers.pop(sid, None)
+    if timer is None:
+        return
+    try:
+        cancel = getattr(timer, "cancel", None)
+        if callable(cancel):
+            cancel()
+    except Exception as exc:
+        _record_cleanup_exception("soft_park_timer_cancel", exc, sid=sid)
+
+
+def _pop_session_by_id(
+    sid: str,
+    *,
+    expected_session: dict | None = None,
+    predicate: Callable[[dict], bool] | None = None,
+) -> dict | None:
     """Atomically detach one live session from the registry.
 
     Detaching is the ownership claim for teardown: once the record is no
@@ -779,8 +886,17 @@ def _pop_session_by_id(sid: str) -> dict | None:
     and close agents/workers.  None of that slow external work belongs under
     the global ``_session_resume_lock``.
     """
-    with _sessions_lock:
-        session = _sessions.pop(sid, None)
+    with _session_resume_lock:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if session is None:
+                return None
+            if expected_session is not None and session is not expected_session:
+                return None
+            if predicate is not None and not predicate(session):
+                return None
+            _sessions.pop(sid, None)
+            _cancel_ws_soft_park_timer_locked(sid)
     if session is None:
         return None
     # The session is already out of _sessions here, so downstream teardown
@@ -813,87 +929,279 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     )
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session has no live transport and no in-flight turn.
+def _session_has_inflight_work(sid: str, session: dict) -> bool:
+    """Return whether destructive cleanup must preserve this live session."""
+    return bool(
+        session.get("running")
+        or _session_pending_kind(sid)
+        or session.get("queued_prompt") is not None
+        or session.get("inflight_turn") is not None
+        or int(session.get("_slash_worker_inflight") or 0) > 0
+    )
 
-    After ``handle_ws`` detaches a disconnected client it points the session at
-    ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
-    """
+
+def _ws_session_is_quiescent(sid: str, session: dict | None) -> bool:
+    """Positive proof that a detached session has no active lifecycle work."""
     if not session or session.get("_finalized"):
         return False
-    if session.get("running"):
+    if session.get("transport") is not _detached_ws_transport:
         return False
-    return session.get("transport") is _detached_ws_transport
+    if _session_has_inflight_work(sid, session):
+        return False
+    ready = session.get("agent_ready")
+    if (
+        ready is not None
+        and not ready.is_set()
+        and session.get("agent_build_started")
+    ):
+        return False
+    return True
 
 
-def _schedule_ws_orphan_reap(sid: str) -> None:
-    """After a grace window, reap session ``sid`` iff it's still orphaned.
+def _empty_shell_candidate(sid: str, session: dict) -> bool:
+    """True only for a valueless detached draft eligible for full discard."""
+    if not _ws_session_is_quiescent(sid, session):
+        return False
+    if session.get("history") or session.get("display_history_prefix"):
+        return False
+    if session.get("parent_session_id") or session.get("pending_title"):
+        return False
+    if session.get("attached_images"):
+        return False
+    agent = session.get("agent")
+    if agent is not None and getattr(agent, "_session_messages", None):
+        return False
+    return True
+
+
+def _session_has_persisted_row(session: dict) -> bool | None:
+    """Return durable-row presence, or None when absence cannot be proven."""
+    if session.get("_db_row_persisted"):
+        return True
+    key = str(session.get("session_key") or "")
+    if not key:
+        return None
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return None
+            persisted = db.get_session(key) is not None
+    except Exception as exc:
+        _record_cleanup_exception("empty_shell_db_probe", exc)
+        return None
+    if persisted:
+        session["_db_row_persisted"] = True
+    return persisted
+
+
+def _soft_park_session_after_grace(sid: str, expected_session: dict) -> bool:
+    """Park runtime-only resources, preserving every resumable session value."""
+    with _session_resume_lock:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if (
+                session is None
+                or session is not expected_session
+                or not _ws_session_is_quiescent(sid, session)
+            ):
+                return False
+            empty_candidate = _empty_shell_candidate(sid, session)
+
+    # DB I/O does not belong under the lifecycle lock.  Absence must be proven;
+    # an unavailable/failing store yields None and therefore preserves the shell.
+    persisted = _session_has_persisted_row(expected_session) if empty_candidate else True
+    popped = None
+    worker = None
+    lease = None
+    release_failed = False
+    with _session_resume_lock:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if (
+                session is None
+                or session is not expected_session
+                or not _ws_session_is_quiescent(sid, session)
+            ):
+                return False
+            if (
+                empty_candidate
+                and persisted is False
+                and not session.get("_db_row_persisted")
+                and _empty_shell_candidate(sid, session)
+            ):
+                popped = _pop_session_by_id(sid, expected_session=session)
+            else:
+                worker = session.get("slash_worker")
+                session["slash_worker"] = None
+                lease = session.pop("active_session_lease", None)
+                session["_active_session_lease_parked"] = True
+                session["_soft_parked_at"] = time.time()
+
+        # Keep resume/activate behind the lifecycle lock until the old lease has
+        # actually left the cross-process registry.  Worker.close() is slower and
+        # deliberately runs after every lock is released.
+        if popped is None and lease is not None:
+            try:
+                lease.release()
+            except Exception as exc:
+                _record_cleanup_exception("soft_park_lease_release", exc, sid=sid)
+                # ActiveSessionLease.release() marks the handle released even
+                # when registry I/O raises. Make it retryable and roll back the
+                # whole park: retaining the worker + bound lease is safer than
+                # either leaking an unreferenced registry row or double-claiming
+                # a slot on resume. The timer will retry after another grace.
+                if hasattr(lease, "released"):
+                    lease.released = False
+                with _sessions_lock:
+                    if _sessions.get(sid) is expected_session:
+                        expected_session["slash_worker"] = worker
+                        expected_session["active_session_lease"] = lease
+                        expected_session.pop("_active_session_lease_parked", None)
+                        expected_session.pop("_soft_parked_at", None)
+                        worker = None
+                        release_failed = True
+
+    if release_failed:
+        return False
+
+    if popped is not None:
+        try:
+            _teardown_popped_session(popped, end_reason="empty_shell_discard")
+        except Exception as exc:
+            _record_cleanup_exception("empty_shell_teardown", exc, sid=sid)
+        _record_session_lifecycle("empty_discard", sid=sid)
+        return True
+
+    if worker is not None:
+        try:
+            worker.close()
+        except Exception as exc:
+            _record_cleanup_exception("soft_park_worker_close", exc, sid=sid)
+    _record_session_lifecycle("soft_park", sid=sid)
+    return True
+
+
+def _schedule_ws_soft_park(sid: str, expected_session: dict | None = None) -> None:
+    """After the legacy grace window, soft-park ``sid`` iff still detached.
 
     Called from the WS-disconnect path. The grace window lets a transient
-    reconnect (or a ``session.resume`` that reattaches the transport) cancel
-    the reap by re-binding a live transport. Disabled when the grace is 0.
+    reconnect, ``session.activate``, or ``session.resume`` cancel the timer by
+    rebinding a live transport. Disabled when the grace is 0.
     """
     if _WS_ORPHAN_REAP_GRACE_S <= 0:
         return
 
-    def _reap() -> None:
-        # Serialize the orphan re-check against session.resume (which re-binds a
-        # live transport under _session_resume_lock and would make this session
-        # non-orphaned). Claim teardown by popping under both lifecycle locks,
-        # then release the global resume lock before the slow finalization work.
-        # The dict mutation still happens under _sessions_lock — consistent
-        # with every other _sessions mutator
-        # (#39591: _reap previously popped under _session_resume_lock, giving no
-        # mutual exclusion against _init_session / _close_session_by_id, which
-        # guard with _sessions_lock). _sessions_lock is an RLock and the global
-        # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
-                return
-            session = _pop_session_by_id(sid)
-        _teardown_popped_session(session, end_reason="ws_orphan_reap")
+    timer_ref: dict[str, Any] = {}
 
-    timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
+    def _park() -> None:
+        parked = False
+        try:
+            parked = _soft_park_session_after_grace(
+                sid, timer_ref["timer_session"]
+            )
+        except Exception as exc:
+            _record_cleanup_exception("soft_park_callback", exc, sid=sid)
+        finally:
+            retry = False
+            with _session_resume_lock:
+                if _ws_soft_park_timers.get(sid) is timer_ref.get("timer"):
+                    _ws_soft_park_timers.pop(sid, None)
+                    with _sessions_lock:
+                        current = _sessions.get(sid)
+                        retry = (
+                            not parked
+                            and current is not None
+                            and current is timer_ref.get("timer_session")
+                            and not current.get("_finalized")
+                            and current.get("transport") is _detached_ws_transport
+                        )
+            # A disconnect can happen mid-turn or mid-build. Keep exactly one
+            # bounded timer alive until that detached session becomes positively
+            # quiescent; reattach/shutdown removes the timer and stops retries.
+            if retry:
+                _schedule_ws_soft_park(
+                    sid, expected_session=timer_ref["timer_session"]
+                )
+
+    timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _park)
     timer.daemon = True
-    timer.start()
+    with _session_resume_lock:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if expected_session is not None and session is not expected_session:
+                return
+            if (
+                session is None
+                or session.get("_finalized")
+                or session.get("transport") is not _detached_ws_transport
+            ):
+                return
+            _cancel_ws_soft_park_timer_locked(sid)
+            timer_ref["timer"] = timer
+            timer_ref["timer_session"] = session
+            _ws_soft_park_timers[sid] = timer
+        try:
+            timer.start()
+        except Exception as exc:
+            _ws_soft_park_timers.pop(sid, None)
+            _record_cleanup_exception("soft_park_timer_start", exc, sid=sid)
 
 
 def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
-    """On transport disconnect, reap the sessions that opted into
+    """Atomically detach exact transport owners and close opted-in sessions.
+
+    The expected-old-transport check and mutation run under the same lifecycle
+    lock used by activate/resume.  A stale socket teardown therefore cannot
+    overwrite or close a replacement transport that already won the rebind.
+
+    Sessions that opted into
     close_on_disconnect (sidecar/dashboard) immediately via the unified
-    ``_close_session_by_id`` path, and re-point the rest back to stdio so later
+    teardown path; all others are re-pointed to the drop transport so later
     emits don't hit a dead socket.
 
-    Non-flagged detached sessions are handed to the grace-windowed WS-orphan
-    reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
-    that re-binds a live transport cancels the reap, otherwise the orphan is
-    torn down through the same idempotent ``_teardown_session`` path. This is
-    the single WS-disconnect teardown entry point — there is no second
-    independent reap loop in ``handle_ws``.
+    Non-flagged sessions get a grace-windowed soft-park timer. A quick reconnect
+    cancels it; otherwise only the worker and lease are released. Durable
+    session state remains registered and resumable.
 
-    Returns ``(reaped, detached)`` counts for disconnect-path observability."""
-    with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
-    reaped = 0
-    detached = 0
-    for sid, session in owned:
-        if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
-        else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            detached += 1
-            try:
-                _schedule_ws_orphan_reap(sid)
-            except Exception:
-                pass
-    return reaped, detached
+    Returns ``(explicitly_closed, detached)`` counts."""
+    to_close: list[tuple[str, dict]] = []
+    to_park: list[tuple[str, dict]] = []
+    with _session_resume_lock:
+        with _sessions_lock:
+            for sid, session in list(_sessions.items()):
+                # This identity comparison is the transport CAS: no snapshot is
+                # ever mutated after a replacement transport wins.
+                if session.get("transport") is not transport:
+                    continue
+                if session.get("close_on_disconnect"):
+                    _sessions.pop(sid, None)
+                    _cancel_ws_soft_park_timer_locked(sid)
+                    session["_sid"] = sid
+                    to_close.append((sid, session))
+                else:
+                    session["transport"] = _detached_ws_transport
+                    to_park.append((sid, session))
+
+    if to_close:
+        _record_session_lifecycle(
+            "explicit_close", count=len(to_close), reason=end_reason
+        )
+    if to_park:
+        _record_session_lifecycle("detach", count=len(to_park))
+
+    for sid, session in to_close:
+        try:
+            _teardown_popped_session(session, end_reason=end_reason)
+        except Exception as exc:
+            _record_cleanup_exception("disconnect_explicit_teardown", exc, sid=sid)
+    for sid, session in to_park:
+        try:
+            _schedule_ws_soft_park(sid, expected_session=session)
+        except Exception as exc:
+            _record_cleanup_exception("soft_park_schedule", exc, sid=sid)
+    return len(to_close), len(to_park)
 
 
 def _shutdown_sessions() -> None:
@@ -901,6 +1209,11 @@ def _shutdown_sessions() -> None:
         sids = list(_sessions)
     for sid in sids:
         _close_session_by_id(sid, end_reason="tui_shutdown")
+    # Defensive sweep for a timer whose session vanished through an extension or
+    # test hook instead of the registry helpers.
+    with _session_resume_lock:
+        for sid in list(_ws_soft_park_timers):
+            _cancel_ws_soft_park_timer_locked(sid)
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -925,7 +1238,7 @@ def _transport_is_dead(transport) -> bool:
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
-    if session.get("running") or _session_pending_kind(sid):
+    if _session_has_inflight_work(sid, session):
         return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
@@ -942,9 +1255,29 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 def _reap_idle_sessions() -> None:
     now = time.time()
     with _sessions_lock:
-        victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
-    for sid in victims:
-        _close_session_by_id(sid, end_reason="idle_timeout")
+        victims = [
+            (sid, session)
+            for sid, session in _sessions.items()
+            if _session_is_evictable(sid, session, now)
+        ]
+    reaped = 0
+    for sid, expected in victims:
+        session = _pop_session_by_id(
+            sid,
+            expected_session=expected,
+            predicate=lambda current, _sid=sid: _session_is_evictable(
+                _sid, current, time.time()
+            ),
+        )
+        if session is None:
+            continue
+        try:
+            _teardown_popped_session(session, end_reason="idle_timeout")
+            reaped += 1
+        except Exception as exc:
+            _record_cleanup_exception("idle_timeout_teardown", exc, sid=sid)
+    if reaped:
+        _record_session_lifecycle("idle_timeout", count=reaped)
     _enforce_session_cap()
 
 
@@ -961,11 +1294,21 @@ def _max_live_sessions() -> int:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
 
         cfg = _load_cfg() or {}
-        raw = cfg.get("max_live_sessions")
-        if raw is None:
+        raw = None
+        configured = False
+        if "max_live_sessions" in cfg:
+            raw = cfg.get("max_live_sessions")
+            configured = True
+        else:
             gateway_cfg = cfg.get("gateway")
-            if isinstance(gateway_cfg, dict):
+            if isinstance(gateway_cfg, dict) and "max_live_sessions" in gateway_cfg:
                 raw = gateway_cfg.get("max_live_sessions")
+                configured = True
+        if not configured:
+            # Match hermes_cli.config.DEFAULT_CONFIG without importing the large
+            # config module into the gateway hot path. Explicit 0/null still
+            # disables through the backward-compatible coercion contract.
+            raw = 16
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
@@ -976,7 +1319,7 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # Same hard exemptions as the TTL reaper (never evict a session mid-turn,
     # awaiting input, or still building), but WITHOUT the hours-scale age gate:
     # a detached session is eligible the moment it loses its client.
-    if session.get("running") or _session_pending_kind(sid):
+    if _session_has_inflight_work(sid, session):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
@@ -999,8 +1342,24 @@ def _enforce_session_cap() -> None:
     # a live transport are never eligible, so we may stop short of the cap).
     evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
     overflow = total - cap
-    for sid, _s in evictable[:overflow]:
-        _close_session_by_id(sid, end_reason="lru_evict")
+    evicted = 0
+    for sid, expected in evictable[:overflow]:
+        session = _pop_session_by_id(
+            sid,
+            expected_session=expected,
+            predicate=lambda current, _sid=sid: _session_is_lru_evictable(
+                _sid, current
+            ),
+        )
+        if session is None:
+            continue
+        try:
+            _teardown_popped_session(session, end_reason="lru_evict")
+            evicted += 1
+        except Exception as exc:
+            _record_cleanup_exception("lru_evict_teardown", exc, sid=sid)
+    if evicted:
+        _record_session_lifecycle("lru_evict", count=evicted)
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -1009,8 +1368,8 @@ def _schedule_session_cap_enforcement() -> None:
     def _run():
         try:
             _enforce_session_cap()
-        except Exception:
-            logger.debug("session cap enforcement failed", exc_info=True)
+        except Exception as exc:
+            _record_cleanup_exception("session_cap_enforcement", exc)
 
     timer = threading.Timer(0.1, _run)
     timer.daemon = True
@@ -1023,8 +1382,8 @@ def _start_idle_reaper() -> None:
             time.sleep(_REAPER_SCAN_S)
             try:
                 _reap_idle_sessions()
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_cleanup_exception("idle_reaper_loop", exc)
 
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -1708,8 +2067,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             # _attach_worker already closed the worker if this session was
-            # reaped mid-build; only the late notify registration can still
-            # leak (session.close unregistered before _build registered it).
+            # removed or soft-parked mid-build; only the late notify registration
+            # can still leak (session.close unregistered before _build registered it).
             with _sessions_lock:
                 replaced = _sessions.get(sid) is not current
             if replaced and notify_registered:
@@ -2026,6 +2385,7 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
         )
+        session["_db_row_persisted"] = True
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -3127,6 +3487,13 @@ def _tool_progress_enabled(sid: str) -> bool:
 
 def _restart_slash_worker(sid: str, session: dict):
     worker = session.get("slash_worker")
+    with _session_resume_lock:
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is session
+                and session.get("slash_worker") is worker
+            ):
+                session["slash_worker"] = None
     if worker:
         try:
             worker.close()
@@ -3139,12 +3506,10 @@ def _restart_slash_worker(sid: str, session: dict):
             profile_home=session.get("profile_home"),
         )
     except Exception:
-        session["slash_worker"] = None
         return
-    # Route through the same store-iff-still-mapped guard as the spawn sites:
-    # the post-turn restart runs as `running` flips false, exactly when a
-    # close_on_disconnect reap can pop this session — a bare store would orphan
-    # the fresh worker (it self-heals only on gateway exit via the watchdog).
+    # Route through the same store-iff-still-mapped-and-not-parked guard as the
+    # spawn sites: the post-turn restart runs as `running` flips false, exactly
+    # when disconnect cleanup can park/pop this session.
     _attach_worker(sid, session, new_worker)
 
 
@@ -5202,6 +5567,10 @@ def _init_session(
     db = session_db if session_db is not None else _get_db()
     if db is not None:
         row = db.get_session(key)
+        if row:
+            with _sessions_lock:
+                if sid in _sessions:
+                    _sessions[sid]["_db_row_persisted"] = True
         if row and row.get("cwd"):
             with _sessions_lock:
                 if sid in _sessions:
@@ -5590,14 +5959,14 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(session: dict, text: Any) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
     slot is kept; a second arrival is merged (lossless, mirroring the
     consecutive-user merge in ``repair_message_sequence``) so nothing the user
-    typed is dropped. ``transport`` is pinned so the drained turn streams back to
-    the client that sent it even if the session transport is rebound meanwhile.
+    typed is dropped. Transport ownership stays on the live session record, so a
+    later activate/resume binding cannot be overwritten when this prompt drains.
     """
     existing = session.get("queued_prompt")
     if (
@@ -5607,7 +5976,7 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    session["queued_prompt"] = {"text": text}
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -5645,9 +6014,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any
-) -> dict | None:
+def _handle_busy_submit(rid, sid: str, session: dict, text: Any) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
@@ -5683,7 +6050,7 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(session, text)
         session["last_active"] = time.time()
 
     if mode != "queue":
@@ -5704,8 +6071,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return False
         session["queued_prompt"] = None
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
@@ -5837,6 +6203,7 @@ def _(rid, params: dict) -> dict:
             "attached_images": [],
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
+            "_db_row_persisted": False,
             "cols": cols,
             "created_at": now,
             "edit_snapshots": {},
@@ -6090,6 +6457,7 @@ def _deferred_session_record(
         "attached_images": [],
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
+        "_db_row_persisted": True,
         "cols": cols,
         "created_at": now,
         "cwd": cwd,
@@ -6221,14 +6589,18 @@ def _(rid, params: dict) -> dict:
         profile_home
     )
 
-    def _reuse_live_payload(sid: str, session: dict) -> dict:
-        payload = _live_session_payload(
+    def _reuse_live_response(sid: str, session: dict) -> dict:
+        payload, attach_error = _reattach_live_session_payload(
             sid,
             session,
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
         )
+        if attach_error is not None:
+            code, message = attach_error
+            return _err(rid, code, message)
+        assert payload is not None
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
         # flag is always False — overlay the child-run registry so a reconnecting
@@ -6236,13 +6608,13 @@ def _(rid, params: dict) -> dict:
         if session.get("agent") is None and _child_run_active(target):
             payload["running"] = True
             payload["status"] = "streaming"
-        return payload
+        return _ok(rid, payload)
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -6285,7 +6657,7 @@ def _(rid, params: dict) -> dict:
             lazy=True,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -6367,7 +6739,7 @@ def _(rid, params: dict) -> dict:
             resume_runtime_overrides=overrides or None,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
 
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -6464,13 +6836,17 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             other_sid, other_session = live
-            payload = _live_session_payload(
+            payload, attach_error = _reattach_live_session_payload(
                 other_sid,
                 other_session,
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
             )
+            if attach_error is not None:
+                code, message = attach_error
+                return _err(rid, code, message)
+            assert payload is not None
             payload["resumed"] = target
             return _ok(rid, payload)
         try:
@@ -6661,16 +7037,10 @@ def _live_session_payload(
     session: dict,
     *,
     cols: int | None = None,
-    touch: bool = False,
-    transport: Transport | None = None,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
-        if touch:
-            session["last_active"] = time.time()
         history = list(session.get("display_history_prefix") or []) + list(
             session.get("history") or []
         )
@@ -6694,6 +7064,114 @@ def _live_session_payload(
     return payload
 
 
+def _bind_live_session_transport_locked(
+    sid: str,
+    session: dict,
+    transport: Transport,
+    *,
+    touch: bool = True,
+) -> tuple[tuple[int, str] | None, bool]:
+    """Bind *transport* while the caller owns ``_session_resume_lock``.
+
+    Disconnect, activate/resume, and direct prompt submission must all mutate
+    transport ownership through the same lifecycle lock. Reacquire a released
+    active-session lease before exposing the replacement transport.
+    """
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("_finalized"):
+            return (4007, "session no longer active"), False
+        parked_lease = bool(session.get("_active_session_lease_parked"))
+
+    new_lease = None
+    if parked_lease:
+        new_lease, limit_message = _claim_active_session_slot(
+            _session_lookup_key(session, fallback=sid),
+            live_session_id=sid,
+            surface=_session_source(session),
+        )
+        if limit_message is not None:
+            return (4090, limit_message), False
+
+    with _sessions_lock:
+        stale = _sessions.get(sid) is not session or session.get("_finalized")
+        if not stale:
+            if parked_lease:
+                session["active_session_lease"] = new_lease
+                session.pop("_active_session_lease_parked", None)
+                session.pop("_soft_parked_at", None)
+            resumed = session.get("transport") is _detached_ws_transport
+            session["transport"] = transport
+            _cancel_ws_soft_park_timer_locked(sid)
+
+    if stale:
+        if new_lease is not None:
+            try:
+                new_lease.release()
+            except Exception as exc:
+                _record_cleanup_exception("stale_rebind_lease_release", exc, sid=sid)
+        return (4007, "session no longer active"), False
+
+    if touch:
+        with session["history_lock"]:
+            session["last_active"] = time.time()
+    return None, resumed
+
+
+def _bind_live_session_transport(
+    sid: str,
+    session: dict,
+    transport: Transport,
+    *,
+    touch: bool = True,
+) -> tuple[int, str] | None:
+    with _session_resume_lock:
+        lease_reacquired = bool(session.get("_active_session_lease_parked"))
+        attach_error, resumed = _bind_live_session_transport_locked(
+            sid, session, transport, touch=touch
+        )
+    if resumed:
+        _record_session_lifecycle(
+            "resume", sid=sid, lease_reacquired=lease_reacquired
+        )
+    return attach_error
+
+
+def _reattach_live_session_payload(
+    sid: str,
+    session: dict,
+    *,
+    cols: int | None = None,
+    touch: bool = True,
+    transport: Transport,
+) -> tuple[dict | None, tuple[int, str] | None]:
+    """CAS-bind a live transport and atomically reacquire a parked lease."""
+    resumed = False
+    with _session_resume_lock:
+        lease_reacquired = bool(session.get("_active_session_lease_parked"))
+        attach_error, resumed = _bind_live_session_transport_locked(
+            sid,
+            session,
+            transport,
+            touch=touch,
+        )
+        if attach_error is not None:
+            return None, attach_error
+
+        payload = _live_session_payload(
+            sid,
+            session,
+            cols=cols,
+        )
+
+    if resumed:
+        _record_session_lifecycle(
+            "resume",
+            sid=sid,
+            lease_reacquired=lease_reacquired,
+        )
+    return payload, None
+
+
 @method("session.active_list")
 def _(rid, params: dict) -> dict:
     """Return live TUI sessions in this gateway process.
@@ -6709,16 +7187,12 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
 
-    # Liveness filter (#38950): a session whose teardown has begun (``_finalized``)
-    # is dead — its agent/worker are being released and it is no longer
-    # attachable — but it can briefly remain in ``_sessions`` until the reaper
-    # pops it (the WS grace-reap and idle reaper both set ``_finalized`` inside
-    # ``_teardown_session`` before the pop). Counting these inflated the footer's
-    # "N sessions" count, which only ever went up until a gateway restart. Drop
-    # them here so the count reflects genuinely attachable sessions. We do NOT
+    # Liveness filter (#38950): teardown normally pops before finalizing, but this
+    # snapshot can still hold that removed dict while teardown marks it finalized
+    # on another thread. Do not render such a stale row as attachable. We do NOT
     # filter on ``transport is _detached_ws_transport`` (the WS-detached drop
-    # sentinel): a detached session is still attachable via a quick reconnect /
-    # session.resume until the grace-reap finalizes it, and a standalone
+    # sentinel): a detached session remains attachable after grace soft-parks
+    # runtime-only resources, and a standalone
     # ``hermes --tui`` session legitimately rides the real stdio transport and
     # must stay visible.
     # Keep the natural creation/insertion order from ``_sessions``.  The
@@ -6745,15 +7219,17 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
-    return _ok(
-        rid,
-        _live_session_payload(
-            sid,
-            session,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
-        ),
+    payload, attach_error = _reattach_live_session_payload(
+        sid,
+        session,
+        touch=True,
+        transport=current_transport() or _stdio_transport,
     )
+    if attach_error is not None:
+        code, message = attach_error
+        return _err(rid, code, message)
+    assert payload is not None
+    return _ok(rid, payload)
 
 
 @method("session.delete")
@@ -8967,12 +9443,14 @@ def _(rid, params: dict) -> dict:
 @method("session.close")
 def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
-    # Serialize only the ownership claim against session.resume / the orphan
-    # reaper. Finalization may run arbitrary plugin/agent cleanup and must not
+    # Serialize only the ownership claim against session.resume / lifecycle
+    # cleanup. Finalization may run arbitrary plugin/agent cleanup and must not
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
         session = _pop_session_by_id(sid)
     closed = _teardown_popped_session(session, end_reason="tui_close")
+    if closed:
+        _record_session_lifecycle("explicit_close", sid=sid, reason="tui_close")
     return _ok(rid, {"closed": closed})
 
 
@@ -9400,23 +9878,22 @@ def _(rid, params: dict) -> dict:
         return err
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # Re-bind through the same lifecycle lock used by disconnect and
+    # activate/resume. This also reacquires a lease released by soft parking.
+    t = current_transport()
+    if t is not None:
+        attach_error = _bind_live_session_transport(sid, session, t)
+        if attach_error is not None:
+            return _err(rid, *attach_error)
     while True:
-        busy_transport = None
         with session["history_lock"]:
-            if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
+            if not session.get("running"):
                 break
-        busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
+        # Don't reject a mid-turn prompt — queue it (and, by default,
+        # interrupt the live turn) so it runs as the next turn. The provider
+        # interrupt itself must happen outside history_lock: a
+        # non-interruptible tool may keep it waiting.
+        busy_response = _handle_busy_submit(rid, sid, session, text)
         if busy_response is not None:
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
@@ -14702,32 +15179,67 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
 
-    worker = session.get("slash_worker")
-    if not worker:
-        try:
-            worker = _SlashWorker(
-                session["session_key"],
-                getattr(session.get("agent"), "model", _resolve_model()),
-                profile_home=session.get("profile_home"),
+    sid = str(params.get("session_id") or "")
+    with _session_resume_lock:
+        with _sessions_lock:
+            if _sessions.get(sid) is not session or session.get("_finalized"):
+                return _err(rid, 4007, "session no longer active")
+            session["_slash_worker_inflight"] = (
+                int(session.get("_slash_worker_inflight") or 0) + 1
             )
-            _attach_worker(params.get("session_id", ""), session, worker)
+    worker = None
+    try:
+        try:
+            worker = session.get("slash_worker")
+            if not worker:
+                worker = _SlashWorker(
+                    session["session_key"],
+                    getattr(session.get("agent"), "model", _resolve_model()),
+                    profile_home=session.get("profile_home"),
+                )
+                if not _attach_worker(sid, session, worker):
+                    return _err(rid, 4007, "session no longer active")
         except Exception as e:
             return _err(rid, 5030, f"slash worker start failed: {e}")
 
-    try:
-        output = worker.run(cmd)
-        warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
-        payload = {"output": output or "(no output)"}
-        if warning:
-            payload["warning"] = warning
-        return _ok(rid, payload)
-    except Exception as e:
         try:
-            worker.close()
-        except Exception:
-            pass
-        session["slash_worker"] = None
-        return _err(rid, 5030, str(e))
+            output = worker.run(cmd)
+            warning = _mirror_slash_side_effects(sid, session, cmd)
+            payload = {"output": output or "(no output)"}
+            if warning:
+                payload["warning"] = warning
+            return _ok(rid, payload)
+        except Exception as e:
+            try:
+                worker.close()
+            except Exception:
+                pass
+            with _session_resume_lock:
+                with _sessions_lock:
+                    if (
+                        _sessions.get(sid) is session
+                        and session.get("slash_worker") is worker
+                    ):
+                        session["slash_worker"] = None
+            return _err(rid, 5030, str(e))
+    finally:
+        detached = False
+        with _session_resume_lock:
+            with _sessions_lock:
+                if _sessions.get(sid) is session:
+                    inflight = max(
+                        0, int(session.get("_slash_worker_inflight") or 0) - 1
+                    )
+                    if inflight:
+                        session["_slash_worker_inflight"] = inflight
+                    else:
+                        session.pop("_slash_worker_inflight", None)
+                    detached = (
+                        session.get("transport") is _detached_ws_transport
+                        and not session.get("_finalized")
+                    )
+        if detached:
+            _schedule_ws_soft_park(sid, expected_session=session)
 
 
 # ── Methods: voice ───────────────────────────────────────────────────

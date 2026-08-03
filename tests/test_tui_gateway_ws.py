@@ -45,12 +45,10 @@ def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
 def _run_disconnect(monkeypatch, seed):
     """Drive handle_ws to its disconnect `finally`, seeding sessions against the
     live WSTransport the moment it exists. Returns nothing; inspect _sessions."""
-    # Disable the grace-reap Timer: detached sessions normally schedule a
-    # threading.Timer via _schedule_ws_orphan_reap, which would outlive the test
-    # and fire _reap during interpreter teardown — touching _sessions/DB and
-    # producing spurious post-run errors under the per-file CI runner. Grace=0
-    # short-circuits the Timer (see _schedule_ws_orphan_reap) so the test leaves
-    # no lingering thread.
+    # Disable the soft-park Timer: detached sessions normally schedule a
+    # threading.Timer via _schedule_ws_soft_park, which would outlive the test
+    # and touch _sessions/DB during interpreter teardown. Grace=0 short-circuits
+    # the Timer so the test leaves no lingering thread.
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
 
     # Mirror the real _finalize_session chokepoint: it is the single place that

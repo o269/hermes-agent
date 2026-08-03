@@ -1713,7 +1713,11 @@ max_concurrent_sessions: null  # null/0 = unlimited; positive integer = active s
 ```
 
 When the cap is reached, Hermes returns a direct limit message for new sessions.
-Existing active sessions keep their normal behavior.
+A TUI/dashboard session disconnected for more than 20 seconds releases its active
+lease while preserving the in-memory agent, history, and durable row. Activating
+or resuming that parked session atomically reacquires a lease; if other work has
+filled the cap meanwhile, the reattach returns the same direct limit message
+instead of exceeding the cap.
 
 The canonical key is top-level `max_concurrent_sessions`. Hermes also accepts
 `gateway.max_concurrent_sessions` as a fallback, but the top-level key wins when
@@ -1723,6 +1727,33 @@ The cap is enforced with a local runtime lease file and is best-effort: Hermes
 fails open if the registry cannot be read or locked so users are not stranded.
 It is intended for a single host/profile runtime, not a shared `$HERMES_HOME`
 mounted across multiple machines.
+
+### TUI/dashboard live-session retention
+
+```yaml
+max_live_sessions: 16  # 0/null = unlimited; positive integer = detached-session LRU cap
+```
+
+`max_live_sessions` bounds the gateway's in-memory registry. The default is 16.
+Only detached, idle, fully built sessions are eligible for least-recently-used
+eviction; attached, running, waiting-for-input, queued, and building sessions are
+never selected. Hermes also fully evicts a detached session after six idle hours
+by default. Both full-eviction paths preserve their durable transcript for a cold
+`session.resume`.
+
+The canonical key is top-level `max_live_sessions`. The legacy
+`gateway.max_live_sessions` fallback is still accepted when the top-level key is
+absent. Explicit `0` or `null` disables the LRU cap.
+
+After a WebSocket disconnect, Hermes waits 20 seconds before soft-parking a
+quiescent session. Soft parking closes only its slash worker and active-session
+lease; the agent, history, durable row, and live session key remain available to
+`session.activate` and `session.resume`. Set
+`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S=0` to retain the former park-forever behavior.
+The environment-variable name is kept for compatibility even though the action
+is now non-destructive. `HERMES_TUI_SESSION_TTL_S` changes the full idle-eviction
+TTL (default `21600`, or six hours; `0` makes every otherwise-eligible detached
+session immediately TTL-eligible).
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

@@ -423,25 +423,22 @@ async def handle_ws(ws: Any) -> None:
                 )
                 break
     finally:
-        reaped_sessions = 0
+        explicit_closed_sessions = 0
         detached_sessions = 0
         if transport is not None:
             transport.close()
 
-            # Reap sessions this transport owned (close_on_disconnect sidecar
-            # sessions) or detach the rest to the drop sentinel so later emits
-            # don't crash into a closed socket or fall through to desktop stdout
-            # logs. Detached sessions are handed to the grace-windowed WS-orphan
-            # reaper inside _close_sessions_for_transport (a quick reconnect /
-            # session.resume cancels it). This is the single WS-disconnect
-            # teardown path.
+            # Close exact transport owners that opted in (close_on_disconnect),
+            # or CAS-detach the rest to the drop sentinel. Detached sessions get
+            # a bounded soft-park timer: reconnect/activate/resume cancels it;
+            # otherwise only their worker + active lease are released.
             #
             # Offloaded: _close_session_by_id does a blocking worker.close()
             # (terminate + waits) plus a synchronous DB write — inline that
             # would freeze the uvicorn event loop for every other live
             # connection.
             try:
-                reaped_sessions, detached_sessions = await asyncio.to_thread(
+                explicit_closed_sessions, detached_sessions = await asyncio.to_thread(
                     server._close_sessions_for_transport,
                     transport,
                     end_reason="ws_disconnect",
@@ -454,13 +451,14 @@ async def handle_ws(ws: Any) -> None:
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
         _log.info(
             "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
-            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d",
+            "dispatch_crashes=%d send_failures=%d explicit_closed_sessions=%d "
+            "detached_sessions=%d",
             peer,
             disconnect_reason,
             messages,
             parse_errors,
             dispatch_crashes,
             send_failures,
-            reaped_sessions,
+            explicit_closed_sessions,
             detached_sessions,
         )

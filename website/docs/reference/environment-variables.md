@@ -789,6 +789,8 @@ Unset the variable or remove it from `.env` to restore normal writes (still subj
 | `HERMES_TUI_DIR` | Path to a prebuilt `ui-tui/` directory (must contain `dist/entry.js` and populated `node_modules`). Used by distros and Nix to skip the first-launch `npm install`. |
 | `HERMES_TUI_RESUME` | Resume a specific TUI session by ID on launch. When set, `hermes --tui` skips forging a fresh session and picks up the named session instead — useful for re-attaching after a disconnect or terminal crash. |
 | `HERMES_TUI_THEME` | Force the TUI color theme: `light`, `dark`, or a raw 6-character background hex (e.g. `ffffff` or `1a1a2e`). When unset, Hermes auto-detects using `COLORFGBG` and terminal background queries; this variable overrides detection on terminals (Ghostty, Warp, iTerm2, etc.) that don't set `COLORFGBG`. |
+| `HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` | Seconds after WebSocket disconnect before a quiescent TUI/dashboard session is soft-parked (default: `20`). Soft parking releases its slash worker and active-session lease but preserves its agent, history, durable row, and resumable key. `0` disables soft parking. The legacy variable name is retained for compatibility. |
+| `HERMES_TUI_SESSION_TTL_S` | Full-eviction idle TTL in seconds for detached TUI/dashboard sessions (default: `21600`, or six hours). Attached, running, waiting, queued, and building sessions are exempt. |
 | `HERMES_INFERENCE_MODEL` | Force the model for `hermes -z` / `hermes chat` without mutating `config.yaml`. Pairs with the `--provider` flag. Useful for scripted callers (sweeper, CI, batch runners) that need to override the default model per run. |
 
 ## Session Settings
