@@ -6258,6 +6258,12 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+# Statuses at which a task is finished with its workspace. Mirrors the
+# NOT IN (...) sets used by the deferred-cleanup queries below; named so the
+# "is this task done with its scratch dir" question has exactly one answer.
+_TERMINAL_WORKSPACE_CLEANUP_STATUSES = ("done", "archived", "failed", "cancelled")
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -6342,10 +6348,51 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT t.workspace_kind, t.workspace_path, t.status, "
+                "       t.worker_pid, "
+                "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+                "       r.worker_started_at "
+                "FROM tasks t "
+                "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+                "WHERE t.id = ?",
                 (parent_id,),
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+                continue
+            # A parent is only eligible for deferred cleanup once it has
+            # itself finished. The deferral exists for the case where the
+            # parent COMPLETED while children still needed its handoff
+            # artifacts (#33774) — it was never meant to fire against a
+            # parent that is still working.
+            #
+            # Without this guard, a decomposition parent that is still
+            # ``running`` gets its scratch workspace rmtree'd the moment its
+            # last child goes terminal — deleting the live worker's working
+            # directory mid-write. That is not hypothetical: it destroyed a
+            # 777-second audit run whose deliverable survived only because it
+            # happened to have been written outside the workspace.
+            if row["status"] not in _TERMINAL_WORKSPACE_CLEANUP_STATUSES:
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: parent is %s, not "
+                    "terminal", parent_id, row["status"],
+                )
+                continue
+            # Belt-and-braces: a terminal status can still race a worker that
+            # is mid-teardown. Only reap once the recorded worker identity is
+            # provably gone — the (pid, start-time, boot-id) tuple, never a
+            # bare PID, which recycles (measured: PID space wraps roughly
+            # every 3-4 hours on the fleet host at ~314 forks/sec).
+            if row["worker_pid"] is not None and _recorded_worker_alive(
+                row["worker_pid"],
+                worker_pgid=row["worker_pgid"],
+                worker_sid=row["worker_sid"],
+                worker_boot_id=row["worker_boot_id"],
+                worker_started_at=row["worker_started_at"],
+            ):
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: recorded worker "
+                    "pid %s is still alive", parent_id, row["worker_pid"],
+                )
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
@@ -9561,6 +9608,125 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+# How long after its run started a dead worker may have stopped writing and
+# still be treated as a *launch-class* failure — a provider/config fault that
+# killed the worker before it could do any work. Retrying such a worker just
+# re-runs it into the same wall (the `frontend` lane burned 6 spawns in 6
+# minutes on a single missing env key), so these block immediately with the
+# log line attached instead of consuming the full retry budget.
+DEFAULT_LAUNCH_FAILURE_WINDOW_SECONDS = 10
+
+# Consecutive-failure budget for launch-class failures. Deliberately small but
+# not 1: one fast death can be transient (e.g. a remote worker losing its SSH
+# lease immediately after spawn, which requeues and succeeds on the canonical
+# respawn), so a single observation is not proof of a standing fault. Two is.
+_LAUNCH_FAILURE_RETRY_LIMIT = 2
+
+# Cap on how much of the worker log tail is read / stored. The tail exists to
+# answer "why did it die" at a glance; it is not a log shipper.
+_WORKER_LOG_TAIL_READ_BYTES = 8192
+_WORKER_LOG_TAIL_MAX_CHARS = 300
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _resolve_launch_failure_window_seconds() -> float:
+    """Return the launch-failure window in seconds.
+
+    Reads ``HERMES_KANBAN_LAUNCH_FAILURE_WINDOW_SECONDS``; falls back to
+    ``DEFAULT_LAUNCH_FAILURE_WINDOW_SECONDS`` when absent, empty,
+    non-numeric, or negative. ``0`` disables launch-class classification
+    entirely (every dead worker takes the ordinary crash path).
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_LAUNCH_FAILURE_WINDOW_SECONDS", "",
+    ).strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return float(DEFAULT_LAUNCH_FAILURE_WINDOW_SECONDS)
+        if value >= 0:
+            return value
+    return float(DEFAULT_LAUNCH_FAILURE_WINDOW_SECONDS)
+
+
+def _worker_log_tail(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> "tuple[Optional[str], Optional[float]]":
+    """Return ``(last meaningful log line, log mtime)`` for a task's worker.
+
+    Why this exists: ``_classify_worker_exit`` can only answer for a PID this
+    process itself reaped. The fleet dispatcher runs as a ``Type=oneshot``
+    systemd unit on a timer, so every tick is a *fresh process* — a worker
+    spawned by tick N is re-parented to init when tick N exits and can never
+    be ``waitpid``-ed by tick N+1. In that (normal) deployment the reap
+    registry is empty and every real crash classifies as ``unknown``, which
+    is why the board only ever showed ``pid <N> not alive``. The worker's own
+    log survives across ticks and is the only durable account of why it died.
+
+    The mtime doubles as the best available estimate of *when* the worker
+    stopped — used to separate a sub-second launch fault from a genuine
+    mid-task crash. Returns ``(None, None)`` when the log is unreadable;
+    callers must treat that as "unknown", never as evidence of a fault.
+    """
+    try:
+        path = worker_log_path(task_id, board=board)
+        stat = path.stat()
+    except (OSError, ValueError, RuntimeError):
+        return (None, None)
+    mtime = float(stat.st_mtime)
+    try:
+        with open(path, "rb") as fh:
+            if stat.st_size > _WORKER_LOG_TAIL_READ_BYTES:
+                fh.seek(-_WORKER_LOG_TAIL_READ_BYTES, os.SEEK_END)
+            blob = fh.read()
+    except OSError:
+        return (None, mtime)
+    text = blob.decode("utf-8", errors="replace")
+    for line in reversed(text.splitlines()):
+        cleaned = _ANSI_ESCAPE_RE.sub("", line).strip()
+        if cleaned:
+            return (cleaned[:_WORKER_LOG_TAIL_MAX_CHARS], mtime)
+    return (None, mtime)
+
+
+def _is_launch_class_failure(
+    kind: str,
+    *,
+    started_at: Optional[float],
+    log_mtime: Optional[float],
+    window_seconds: Optional[float] = None,
+) -> bool:
+    """True when a dead worker died fast enough to be a launch fault.
+
+    ``kind`` is the ``_classify_worker_exit`` verdict. ``clean_exit`` (a
+    protocol violation — the work may well have been done) and
+    ``rate_limited`` (a quota wall, explicitly not a task failure) are never
+    launch-class. ``unknown`` **is** eligible: under the oneshot dispatcher
+    that is the only verdict a real crash ever gets, so excluding it would
+    make this check dead code in the deployment it was written for.
+
+    Timing comes from the log mtime rather than the reap timestamp, which
+    can lag a death by a whole tick. When either bound is unknown we return
+    False — an unproven fault must take the ordinary retry path.
+    """
+    if kind in ("clean_exit", "rate_limited"):
+        return False
+    if started_at is None or log_mtime is None:
+        return False
+    window = (
+        _resolve_launch_failure_window_seconds()
+        if window_seconds is None else float(window_seconds)
+    )
+    if window <= 0:
+        return False
+    lifetime = float(log_mtime) - float(started_at)
+    return 0 <= lifetime <= window
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
@@ -11189,8 +11355,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, launch_failure)
     board_db, board_slug = _connection_worker_board_identity(conn)
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.claim_lock, t.current_run_id, "
@@ -11325,6 +11491,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            launch_failure = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -11380,11 +11547,41 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
                     error_text = f"pid {pid} not alive"
+                # Attach the worker's own last words. "pid <N> not alive"
+                # describes only what the dispatcher could see; the log line
+                # is what actually explains the death, and under the oneshot
+                # dispatcher it is the ONLY explanation available (see
+                # ``_worker_log_tail``). Six spawns were burned on a one-line
+                # env gap that this single line named outright.
+                log_line, log_mtime = _worker_log_tail(
+                    row["id"], board=board_slug,
+                )
+                launch_failure = _is_launch_class_failure(
+                    kind,
+                    started_at=(
+                        float(row["active_started_at"])
+                        if row["active_started_at"] is not None else None
+                    ),
+                    log_mtime=log_mtime,
+                )
+                if launch_failure:
+                    lifetime = float(log_mtime) - float(row["active_started_at"])
+                    error_text = (
+                        f"launch failure: worker died {lifetime:.1f}s after "
+                        f"start without doing any work — retrying re-runs it "
+                        f"into the same fault"
+                    )
+                if log_line:
+                    error_text = f"{error_text} — last log line: {log_line}"
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                if log_line:
+                    event_payload["last_log_line"] = log_line
+                if launch_failure:
+                    event_payload["launch_failure"] = True
 
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -11443,7 +11640,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, launch_failure)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -11465,10 +11662,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, launch_failure,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -11517,14 +11716,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
+            # A launch-class failure is usually a config/provider fault: the
+            # worker never got far enough to attempt the work, so each retry
+            # re-runs it into the identical wall at ~60s intervals (a visible
+            # contributor to a load spike to 28.7). Give it a SHORT bounded
+            # budget rather than an immediate trip — a single fast death can
+            # still be transient (a remote worker losing its SSH lease just
+            # after spawn requeues and succeeds on the canonical respawn), and
+            # blocking on one observation would strand those. A *second* fast
+            # death is a standing fault, so we stop there instead of burning
+            # the full budget.
+            _limit: Optional[int] = None
+            if is_systemic:
+                _limit = 1
+            elif launch_failure:
+                _limit = _LAUNCH_FAILURE_RETRY_LIMIT
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=_limit,
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
+                event_payload_extra={
+                    "pid": pid,
+                    "claimer": claimer,
+                    **({"launch_failure": True} if launch_failure else {}),
+                },
             )
             if tripped:
                 auto_blocked.append(tid)
