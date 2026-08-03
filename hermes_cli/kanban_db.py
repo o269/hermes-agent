@@ -135,6 +135,7 @@ _DECOMPOSITION_HOLD_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPECTED_ASSIGNEE_UNSET = object()
+_EXPECTED_ASSIGNMENT_GENERATION_UNSET = object()
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -889,6 +890,10 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    # Monotonic ABA fence. The database trigger increments this on every real
+    # assignee transition, including transitions that later restore the same
+    # assignee value while an external operation is in flight.
+    assignment_generation: int = 0
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -990,6 +995,12 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            assignment_generation=(
+                int(row["assignment_generation"])
+                if "assignment_generation" in keys
+                and row["assignment_generation"] is not None
+                else 0
+            ),
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -1274,6 +1285,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
+    -- Monotonic custody token. Incremented by the migration-installed trigger
+    -- whenever assignee changes, so A -> B -> A cannot masquerade as no write.
+    assignment_generation INTEGER NOT NULL DEFAULT 0,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
@@ -2761,6 +2775,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    if "assignment_generation" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "assignment_generation",
+            "assignment_generation INTEGER NOT NULL DEFAULT 0",
+        )
+
+    # Keep assignment custody monotonic across every SQL write path, including
+    # public assign_task(), dispatcher fallback assignment, decomposer writes,
+    # and any future helper that updates tasks.assignee. An AFTER trigger is
+    # used because SQLite does not support assigning to NEW.column directly;
+    # the inner UPDATE does not mention assignee and therefore cannot recurse.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_generation
+        AFTER UPDATE OF assignee ON tasks
+        FOR EACH ROW
+        WHEN OLD.assignee IS NOT NEW.assignee
+        BEGIN
+            UPDATE tasks
+            SET assignment_generation = COALESCE(OLD.assignment_generation, 0) + 1
+            WHERE id = NEW.id;
+        END
+        """
+    )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -6652,9 +6693,12 @@ def specify_triage_task(
     assignee: Optional[str] = None,
     author: Optional[str] = None,
     preserve_status: bool = False,
-    valid_assignees: Optional[Iterable[str]] = None,
+    valid_assignees: Optional[
+        Iterable[str] | Callable[[], Iterable[str]]
+    ] = None,
     decomposition_guard: bool = False,
     expected_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
+    expected_assignment_generation: object = _EXPECTED_ASSIGNMENT_GENERATION_UNSET,
 ) -> bool:
     """Flesh out a triage task, optionally preserving control-card custody.
 
@@ -6674,23 +6718,17 @@ def specify_triage_task(
     provided, a newly written assignee must be present in the current live
     profile roster. ``decomposition_guard=True`` rechecks control holds inside
     the same write transaction. When ``expected_assignee`` is supplied, the
-    assignee must still exactly match the pre-LLM snapshot; a mismatch returns
-    ``False`` before title, body, status, comments, or events are mutated. This
-    is the decomposer's immutable custody token for the no-fanout path.
+    assignee and assignment generation must still exactly match the pre-LLM
+    snapshot; a mismatch returns ``False`` before title, body, status, comments,
+    or events are mutated. The monotonic generation closes assignee-value ABA.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     requested_assignee = _canonical_assignee(assignee)
-    resolved_assignees = None
-    if valid_assignees is not None:
-        resolved_assignees = {
-            canonical
-            for name in valid_assignees
-            if (canonical := _canonical_assignee(name)) is not None
-        }
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, assignment_generation "
+            "FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -6705,11 +6743,28 @@ def specify_triage_task(
             )
             if existing_assignee != expected_canonical:
                 return False
+        if (
+            decomposition_guard
+            and expected_assignment_generation
+            is not _EXPECTED_ASSIGNMENT_GENERATION_UNSET
+            and existing["assignment_generation"] != expected_assignment_generation
+        ):
+            return False
         if decomposition_guard and existing_assignee is not None:
             assignee = existing_assignee
             preserve_status = True
         else:
             assignee = requested_assignee
+        resolved_assignees = None
+        if valid_assignees is not None:
+            live_assignees = (
+                valid_assignees() if callable(valid_assignees) else valid_assignees
+            )
+            resolved_assignees = {
+                canonical
+                for name in live_assignees
+                if (canonical := _canonical_assignee(name)) is not None
+            }
         if (
             assignee is not None
             and assignee != existing_assignee
@@ -7017,10 +7072,11 @@ def decompose_triage_task(
     *,
     root_assignee: Optional[str],
     children: list[dict],
-    valid_assignees: Iterable[str],
+    valid_assignees: Iterable[str] | Callable[[], Iterable[str]],
     author: Optional[str] = None,
     auto_promote: bool = True,
     expected_root_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
+    expected_root_assignment_generation: object = _EXPECTED_ASSIGNMENT_GENERATION_UNSET,
 ) -> Optional[list[str]]:
     """Fan a triage task out without stealing explicit root custody.
 
@@ -7043,10 +7099,10 @@ def decompose_triage_task(
     Every newly-written assignee must appear in it; an unroutable
     assignee aborts the same write transaction as the inserts.
 
-    When supplied, ``expected_root_assignee`` is the exact pre-LLM custody
-    snapshot. The transactional helper compares it with the live root assignee
-    before any child creation; every assignment transition, including
-    ``None -> name``, is a compare-and-set miss and leaves the graph untouched.
+    When supplied, ``expected_root_assignee`` and
+    ``expected_root_assignment_generation`` are the exact pre-LLM custody
+    snapshot. The transactional helper compares both before any child creation;
+    the monotonic generation makes even ``None -> name -> None`` a miss.
 
     Returns the list of created child task ids (in input order) on success.
     Returns ``None`` when the root is missing, no longer in ``triage``, already
@@ -7056,11 +7112,6 @@ def decompose_triage_task(
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
-    resolved_assignees = {
-        canonical
-        for name in valid_assignees
-        if (canonical := _canonical_assignee(name)) is not None
-    }
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -7115,7 +7166,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, assignee, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, assignee, assignment_generation, tenant, "
+            "workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7136,6 +7188,21 @@ def decompose_triage_task(
             )
             if existing_root_assignee != expected_canonical:
                 return None
+        if (
+            expected_root_assignment_generation
+            is not _EXPECTED_ASSIGNMENT_GENERATION_UNSET
+            and root_row["assignment_generation"]
+            != expected_root_assignment_generation
+        ):
+            return None
+        live_assignees = (
+            valid_assignees() if callable(valid_assignees) else valid_assignees
+        )
+        resolved_assignees = {
+            canonical
+            for name in live_assignees
+            if (canonical := _canonical_assignee(name)) is not None
+        }
         preserve_root_custody = existing_root_assignee is not None
         if not preserve_root_custody:
             if root_assignee is None:
