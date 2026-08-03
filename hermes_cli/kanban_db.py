@@ -102,6 +102,9 @@ from typing import (
 
 import yaml
 
+from hermes_cli.kanban_assignment_policy import (
+    assignment_guard_reason as _pure_assignment_guard_reason,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -114,6 +117,25 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+KANBAN_GATE_KEYWORDS = frozenset({
+    "OPERATOR-GATE",
+    "OPERATOR-HOLD",
+    "DECISION REQUIRED",
+    "DO NOT DISPATCH",
+    "QUIESCE-GATE",
+    "FREEZE-GATE",
+})
+_KANBAN_GATE_KEYWORD_RE = re.compile(r"GATE-[A-Z0-9][A-Z0-9_-]*\Z")
+_DECOMPOSITION_HOLD_RE = re.compile(
+    r"\[(?:OPERATOR[- ](?:GATE|HOLD|AUTHORITY)|DECISION[-_\s]+REQUIRED|"
+    r"DO\s+NOT\s+DISPATCH|NON[- ]?(?:EXECUTABLE|DISPATCHABLE)|"
+    r"OWNER/PRODUCT\s+DECISION|QUIESCE(?:[- ]GATE)?|FREEZE[- ]GATE|"
+    r"GATE[-_][A-Z0-9][A-Z0-9_-]*)\]",
+    re.IGNORECASE,
+)
+_EXPECTED_ASSIGNEE_UNSET = object()
+_EXPECTED_ASSIGNMENT_GENERATION_UNSET = object()
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -146,6 +168,23 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+    """Normalize a per-task reasoning override or reject an invalid level."""
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    value = str(effort or "").strip().lower()
+    if not value:
+        return None
+    if value == "none" or value in VALID_REASONING_EFFORTS:
+        return value
+    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    raise ValueError(
+        f"reasoning_effort must be one of {allowed}, got {effort!r}"
+    )
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -868,6 +907,10 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    # Monotonic ABA fence. The database trigger increments this on every real
+    # assignee transition, including transitions that later restore the same
+    # assignee value while an external operation is in flight.
+    assignment_generation: int = 0
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -900,6 +943,8 @@ class Task:
     # no extra skills.
     skills: object = None
     model_override: Optional[str] = None
+    # Per-task thinking depth. NULL inherits the profile's configured value.
+    reasoning_effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -973,6 +1018,12 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            assignment_generation=(
+                int(row["assignment_generation"])
+                if "assignment_generation" in keys
+                and row["assignment_generation"] is not None
+                else 0
+            ),
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -1009,6 +1060,11 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            reasoning_effort=(
+                row["reasoning_effort"]
+                if "reasoning_effort" in keys and row["reasoning_effort"]
+                else None
+            ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1264,6 +1320,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
+    -- Monotonic custody token. Incremented by the migration-installed trigger
+    -- whenever assignee changes, so A -> B -> A cannot masquerade as no write.
+    assignment_generation INTEGER NOT NULL DEFAULT 0,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
@@ -1310,6 +1369,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task thinking depth (or 'none' to disable thinking). NULL inherits
+    -- the worker profile's agent.reasoning_effort.
+    reasoning_effort     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1571,6 +1633,258 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+_ASSIGNMENT_POLICY_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_insert
+BEFORE INSERT ON tasks
+WHEN kanban_assignment_guard(
+    NEW.id,
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_update
+BEFORE UPDATE OF title, body, assignee, status ON tasks
+WHEN kanban_assignment_guard(
+    NEW.id,
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    OLD.title,
+    OLD.body,
+    OLD.assignee,
+    OLD.status,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+"""
+
+
+class AssignmentPolicyConfigError(RuntimeError):
+    """Authority-profile config could not be resolved safely for this board."""
+
+
+def _configured_board_profiles(
+    conn: sqlite3.Connection,
+    key: str,
+    default: object,
+) -> tuple[str, ...]:
+    """Read a profile allowlist from the config bound to ``conn``'s board.
+
+    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
+    policy.  The opened SQLite path resolves the canonical root, matching the
+    continuation-authority model. A present but unreadable/malformed config is
+    an enforcement error, never an empty allowlist that disables the fence.
+    """
+
+    raw = default
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        raise AssignmentPolicyConfigError("assignment authority root is unresolved")
+    config_path = authority_root / "config.yaml"
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = {}
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise AssignmentPolicyConfigError(
+            f"cannot read assignment authority config at {config_path}"
+        ) from exc
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: root must be a mapping"
+        )
+    kanban_config = payload.get("kanban")
+    if kanban_config is None:
+        kanban_config = {}
+    if not isinstance(kanban_config, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: kanban must be a mapping"
+        )
+    configured = kanban_config.get(key)
+    if configured is not None:
+        raw = configured
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        raise AssignmentPolicyConfigError(
+            f"invalid {key}: expected comma string or list"
+        )
+    return tuple(
+        dict.fromkeys(
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        )
+    )
+
+
+def _authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    kanban_defaults = DEFAULT_CONFIG.get("kanban")
+    default = (
+        kanban_defaults.get("authority_profiles", "")
+        if isinstance(kanban_defaults, dict)
+        else ""
+    )
+    return _configured_board_profiles(conn, "authority_profiles", default)
+
+
+def _assignment_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+    status: Optional[str],
+    has_open_parent: bool,
+    task_id: Optional[str] = None,
+    old_title: Optional[str] = None,
+    old_body: Optional[str] = None,
+    old_assignee: Optional[str] = None,
+    old_status: Optional[str] = None,
+) -> Optional[str]:
+    return _pure_assignment_guard_reason(
+        title=title,
+        body=body,
+        assignee=assignee,
+        status=status,
+        authority_profiles=_authority_profiles(conn),
+        has_open_parent=has_open_parent,
+        task_id=task_id,
+        old_title=old_title,
+        old_body=old_body,
+        old_assignee=old_assignee,
+        old_status=old_status,
+    )
+
+
+def _task_has_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    )
+
+
+def _parents_have_open_task(
+    conn: sqlite3.Connection, parents: Sequence[str]
+) -> bool:
+    if not parents:
+        return False
+    placeholders = ",".join("?" * len(parents))
+    return bool(
+        conn.execute(
+            f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+            "AND status NOT IN ('done', 'archived') LIMIT 1",
+            tuple(parents),
+        ).fetchone()
+    )
+
+
+def _register_assignment_policy_guard(conn: sqlite3.Connection) -> None:
+    """Install the per-connection UDF used by persistent SQLite triggers."""
+
+    def guard(
+        task_id: Optional[str],
+        title: Optional[str],
+        body: Optional[str],
+        assignee: Optional[str],
+        status: Optional[str],
+        old_title: Optional[str],
+        old_body: Optional[str],
+        old_assignee: Optional[str],
+        old_status: Optional[str],
+        has_open_parent: object,
+    ) -> str:
+        return _assignment_guard_reason(
+            conn,
+            title=title,
+            body=body,
+            assignee=assignee,
+            status=status,
+            has_open_parent=bool(has_open_parent),
+            task_id=task_id,
+            old_title=old_title,
+            old_body=old_body,
+            old_assignee=old_assignee,
+            old_status=old_status,
+        ) or ""
+
+    conn.create_function("kanban_assignment_guard", 10, guard)
+
+
+def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
+    # Trigger definitions evolve with the policy. Replace them in one SQLite
+    # write transaction: other connections see either the prior complete fence
+    # or the new complete fence, never the DROP/CREATE gap. Install first so a
+    # malformed/unreadable config on first initialization leaves a durable
+    # fail-closed fence; raw connections do not register the UDF and therefore
+    # cannot write through these triggers.
+    replace_sql = (
+        "BEGIN IMMEDIATE;"
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+        + _ASSIGNMENT_POLICY_TRIGGERS_SQL
+        + "COMMIT;"
+    )
+    try:
+        conn.executescript(replace_sql)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+    if _authority_profiles(conn):
+        return
+
+    # A valid empty authority allowlist intentionally disables the fence. Drop
+    # both triggers atomically only after configuration parsed successfully,
+    # preserving legacy raw-SQL compatibility for installations not opted in.
+    try:
+        conn.executescript(
+            "BEGIN IMMEDIATE;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+            "COMMIT;"
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 @contextlib.contextmanager
@@ -1968,6 +2282,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
@@ -1993,6 +2308,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
@@ -2023,6 +2339,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _install_assignment_policy_triggers(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2510,6 +2827,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "reasoning_effort" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2548,6 +2870,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    if "assignment_generation" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "assignment_generation",
+            "assignment_generation INTEGER NOT NULL DEFAULT 0",
+        )
+
+    # Keep assignment custody monotonic across every SQL write path, including
+    # public assign_task(), dispatcher fallback assignment, decomposer writes,
+    # and any future helper that updates tasks.assignee. An AFTER trigger is
+    # used because SQLite does not support assigning to NEW.column directly;
+    # the inner UPDATE does not mention assignee and therefore cannot recurse.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_generation
+        AFTER UPDATE OF assignee ON tasks
+        FOR EACH ROW
+        WHEN OLD.assignee IS NOT NEW.assignee
+        BEGIN
+            UPDATE tasks
+            SET assignment_generation = COALESCE(OLD.assignment_generation, 0) + 1
+            WHERE id = NEW.id;
+        END
+        """
+    )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3108,6 +3457,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -3137,8 +3487,13 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``reasoning_effort`` is an optional invocation-only thinking-depth override
+    for the worker. ``None`` inherits the profile config; ``"none"`` explicitly
+    disables reasoning.
     """
     assignee = _canonical_assignee(assignee)
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3335,6 +3690,31 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Stage parent links before the task insert (inside this same
+                # transaction) so the INSERT trigger can distinguish a real
+                # dependency-held authority parking state from an orphaned
+                # executor card. ``task_links`` intentionally has no FK; a
+                # failed task insert rolls these rows back atomically.
+                for pid in parents:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (pid, task_id),
+                    )
+
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=title.strip(),
+                    body=body,
+                    assignee=assignee,
+                    status=task_status,
+                    has_open_parent=_parents_have_open_task(conn, parents),
+                    task_id=task_id,
+                )
+                if assignment_denial is not None:
+                    raise ValueError(
+                        f"kanban assignment policy: {assignment_denial}"
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3342,8 +3722,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, reasoning_effort,
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3363,16 +3744,12 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                     ),
                 )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
-                    )
                 _append_event(
                     conn,
                     task_id,
@@ -3384,6 +3761,7 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "reasoning_effort": reasoning_effort,
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
@@ -3489,7 +3867,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT title, body, status, claim_lock, assignee "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3498,6 +3878,17 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=row["title"],
+            body=row["body"],
+            assignee=profile,
+            status=row["status"],
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -4195,7 +4586,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, title, body, assignee, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4214,6 +4605,20 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=row["title"],
+                    body=row["body"],
+                    assignee=row["assignee"],
+                    status="ready",
+                    has_open_parent=False,
+                    task_id=task_id,
+                )
+                if assignment_denial is not None:
+                    # Keep dependency-held authority work safely parked. The
+                    # operator/bridge must first route executor work to a
+                    # spawnable lane (or leave authority work non-dispatching).
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4326,6 +4731,26 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "ready":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            # Fail closed for legacy rows that predate trigger installation or
+            # were imported with the policy disabled. The dispatcher sees an
+            # ordinary non-claim and cannot spawn the protected row.
+            return None
+
     override_reason: Optional[str] = None
     operator_authorizer: Optional[str] = None
     if operator_override_reason is not None:
@@ -4706,6 +5131,23 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "review":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -6337,7 +6779,9 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status, dispatch_origin FROM tasks WHERE id = ?", (task_id,)
+        "SELECT title, body, assignee, status, dispatch_origin "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6366,14 +6810,26 @@ def promote_task(
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
 
-    if dry_run:
-        return True, None
-
     new_status = (
         "review"
         if cur_status == "blocked" and row["dispatch_origin"] == "review"
         else "ready"
     )
+    assignment_denial = _assignment_guard_reason(
+        conn,
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+        status=new_status,
+        has_open_parent=_task_has_open_parent(conn, task_id),
+        task_id=task_id,
+    )
+    if assignment_denial is not None:
+        return False, f"kanban assignment policy: {assignment_denial}"
+
+    if dry_run:
+        return True, None
+
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = ? "
@@ -6409,31 +6865,43 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id, dispatch_origin FROM tasks "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT title, body, assignee, current_run_id, dispatch_origin "
+            "FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
-        if stale:
-            _end_run(
-                conn,
-                task_id,
-                outcome="reclaimed",
-                status="reclaimed",
-                summary="invariant recovery on unblock",
-            )
+        if stale is None:
+            return False
         # Re-gate on parent completion before flipping an author-lane block back
         # to ready. Review-lane blockers already passed dependency gating and
         # must return to review rather than silently restarting author work.
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = (
             "review"
-            if stale and stale["dispatch_origin"] == "review"
+            if stale["dispatch_origin"] == "review"
             else ("todo" if undone_parents else "ready")
+        )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=stale["title"],
+            body=stale["body"],
+            assignee=stale["assignee"],
+            status=new_status,
+            has_open_parent=bool(undone_parents),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            return False
+        _end_run(
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
+            summary="invariant recovery on unblock",
         )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
@@ -6468,13 +6936,20 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    preserve_status: bool = False,
+    valid_assignees: Optional[
+        Iterable[str] | Callable[[], Iterable[str]]
+    ] = None,
+    decomposition_guard: bool = False,
+    expected_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
+    expected_assignment_generation: object = _EXPECTED_ASSIGNMENT_GENERATION_UNSET,
 ) -> bool:
-    """Flesh out a triage task and promote it to ``todo``.
+    """Flesh out a triage task, optionally preserving control-card custody.
 
-    Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
-    False when the task is missing or not in the ``triage`` column — callers
-    should surface that as "nothing to specify" rather than an error.
+    The normal specify path atomically updates fields and transitions
+    ``triage -> todo``.  ``preserve_status=True`` is reserved for the
+    decomposer's no-fanout fallback on an already-assigned root: it may tighten
+    title/body but must not make the custody card dispatchable.
 
     ``todo`` (not ``ready``) is the correct landing column: ``recompute_ready``
     promotes parent-free / parent-done todos to ``ready`` on the next
@@ -6483,19 +6958,84 @@ def specify_triage_task(
 
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
-    comment spam for status-only promotions.
+    comment spam for status-only promotions. When ``valid_assignees`` is
+    provided, a newly written assignee must be present in the current live
+    profile roster. ``decomposition_guard=True`` rechecks control holds inside
+    the same write transaction. When ``expected_assignee`` is supplied, the
+    assignee and assignment generation must still exactly match the pre-LLM
+    snapshot; a mismatch returns ``False`` before title, body, status, comments,
+    or events are mutated. The monotonic generation closes assignee-value ABA.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    requested_assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, assignment_generation "
+            "FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        # --- decomposition_guard logic (backward compat from main) ---
+        if decomposition_guard and decomposition_hold_reason(conn, task_id) is not None:
+            return False
+        existing_assignee = _canonical_assignee(existing["assignee"])
+        if decomposition_guard and expected_assignee is not _EXPECTED_ASSIGNEE_UNSET:
+            expected_canonical = _canonical_assignee(
+                expected_assignee if isinstance(expected_assignee, str) else None
+            )
+            if existing_assignee != expected_canonical:
+                return False
+        if (
+            decomposition_guard
+            and expected_assignment_generation
+            is not _EXPECTED_ASSIGNMENT_GENERATION_UNSET
+            and existing["assignment_generation"] != expected_assignment_generation
+        ):
+            return False
+        if decomposition_guard and existing_assignee is not None:
+            assignee = existing_assignee
+            preserve_status = True
+        else:
+            assignee = requested_assignee
+        resolved_assignees = None
+        if valid_assignees is not None:
+            live_assignees = (
+                valid_assignees() if callable(valid_assignees) else valid_assignees
+            )
+            resolved_assignees = {
+                canonical
+                for name in live_assignees
+                if (canonical := _canonical_assignee(name)) is not None
+            }
+        if (
+            assignee is not None
+            and assignee != existing_assignee
+            and resolved_assignees is not None
+            and assignee not in resolved_assignees
+        ):
+            raise ValueError(
+                f"assignee {assignee!r} has no resolvable profile on any known host"
+            )
+        # --- assignment policy enforcement (from PR branch) ---
+        effective_title = title.strip() if title is not None else existing["title"]
+        effective_body = body if body is not None else existing["body"]
+        effective_assignee = (
+            assignee if assignee is not None else existing["assignee"]
+        )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=effective_title,
+            body=effective_body,
+            assignee=effective_assignee,
+            status="todo",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
+        sets: list[str] = [] if preserve_status else ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -6510,14 +7050,15 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
-        params.append(task_id)
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
-            tuple(params),
-        )
-        if cur.rowcount != 1:
-            return False
+        if sets:
+            params.append(task_id)
+            cur = conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} "
+                f"WHERE id = ? AND status = 'triage'",
+                tuple(params),
+            )
+            if cur.rowcount != 1:
+                return False
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
@@ -6532,7 +7073,11 @@ def specify_triage_task(
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    + (
+                        "; custody status preserved."
+                        if preserve_status
+                        else " and promoted to todo."
+                    ),
                     int(time.time()),
                 ),
             )
@@ -6540,14 +7085,228 @@ def specify_triage_task(
             conn,
             task_id,
             "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            {
+                "changed_fields": changed_fields,
+                "status_preserved": preserve_status,
+            },
         )
+        if decomposition_guard:
+            _append_event(
+                conn,
+                task_id,
+                "decomposed",
+                {
+                    "fanout": False,
+                    "child_ids": [],
+                    "custody_preserved": preserve_status,
+                },
+            )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
-    # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    # idling in 'todo' until the next sweep. Custody-preserving calls remain
+    # in triage and must not enter the ready queue.
+    if not preserve_status:
+        recompute_ready(conn)
+    return True
+
+
+def decomposition_hold_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return why auto-decomposition must leave a triage task untouched.
+
+    Control-plane gates are current, structured state: canonical markers in
+    the card title/body, normalized active-PR custody, or a prior
+    ``decomposed`` event. Free-form historical comments are deliberately not
+    interpreted as permanent holds: prose such as "the prior operator hold is
+    closed" must never strand a card forever.
+    """
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    prior = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior is not None:
+        return "already decomposed"
+
+    active_prs = _active_pr_custody(
+        conn,
+        task_id,
+        cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if active_prs:
+        return (
+            f"active PR custody detected ({', '.join(active_prs)}). Finish or close "
+            "the existing PR instead of creating replacement work. For an "
+            "operator-approved repair, use the live root gateway to run "
+            f"`/kanban continuation review {task_id} --verdict fix-required "
+            "--reason <reason>` and then `/kanban continuation authorize "
+            f"{task_id} --pr OWNER/REPO#N@SHA --reason <reason> --profile "
+            "<assignee> --provider <provider>`"
+        )
+
+    for source, text in (("title", row["title"]), ("body", row["body"])):
+        match = _DECOMPOSITION_HOLD_RE.search(text or "")
+        if match:
+            return f"{source} contains control-plane hold {match.group(0)!r}"
+    return None
+
+
+def list_decomposition_eligible_triage_ids(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
+    """Return a bounded triage eligibility page using one broker read.
+
+    The former caller loaded up to 1,000 tasks and then invoked
+    :func:`decomposition_hold_reason` once per row. On broker-backed boards that
+    became an N+1 RPC pattern, and each hold check could scan an unbounded
+    comment history. This query batches the structured DB evidence in one
+    statement; the only Python-side check is the canonical marker regex over
+    the bounded title/body page.
+    """
+    bounded_limit = max(1, min(int(limit), 1000))
+    tenant_clause = " AND t.tenant = ?" if tenant is not None else ""
+    params: list[Any] = []
+    if tenant is not None:
+        params.append(tenant)
+    cutoff = int(time.time()) - _RESPAWN_GUARD_PR_WINDOW
+    params.extend((bounded_limit, cutoff))
+    rows = conn.execute(
+        f"""
+        WITH candidates AS (
+            SELECT t.id, t.title, t.body, t.priority, t.created_at
+            FROM tasks AS t
+            WHERE t.status = 'triage'{tenant_clause}
+            ORDER BY t.priority DESC, t.created_at ASC
+            LIMIT ?
+        )
+        SELECT c.id, c.title, c.body,
+               EXISTS (
+                   SELECT 1 FROM task_events AS e
+                   WHERE e.task_id = c.id AND e.kind = 'decomposed'
+               ) AS was_decomposed,
+               EXISTS (
+                   SELECT 1 FROM task_pr_ownership AS own
+                   WHERE own.task_id = c.id
+                     AND own.last_seen_at >= ?
+                     AND (
+                         own.declared = 1
+                         OR NOT EXISTS (
+                             SELECT 1 FROM task_pr_ownership AS other
+                             WHERE other.canonical_url = own.canonical_url
+                               AND other.task_id <> c.id
+                               AND other.declared = 1
+                         )
+                     )
+               ) AS has_active_pr
+        FROM candidates AS c
+        ORDER BY c.priority DESC, c.created_at ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return [
+        str(row["id"])
+        for row in rows
+        if not bool(row["was_decomposed"])
+        and not bool(row["has_active_pr"])
+        and _DECOMPOSITION_HOLD_RE.search(row["title"] or "") is None
+        and _DECOMPOSITION_HOLD_RE.search(row["body"] or "") is None
+    ]
+
+
+def canonical_gate_keyword(keyword: str) -> str:
+    """Validate and normalize a user-facing Kanban gate keyword."""
+    canonical = re.sub(r"\s+", " ", str(keyword or "").strip().upper())
+    canonical = {
+        "QUIESCE": "QUIESCE-GATE",
+        "FREEZE": "FREEZE-GATE",
+    }.get(canonical, canonical)
+    if (
+        canonical not in KANBAN_GATE_KEYWORDS
+        and _KANBAN_GATE_KEYWORD_RE.fullmatch(canonical) is None
+    ):
+        allowed = ", ".join(sorted(KANBAN_GATE_KEYWORDS))
+        raise ValueError(
+            f"unknown gate keyword {keyword!r}; choose one of: {allowed}, "
+            "or GATE-<NAME>"
+        )
+    return canonical
+
+
+def append_task_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    keyword: str,
+    *,
+    field: str = "title",
+    author: Optional[str] = None,
+) -> bool:
+    """Idempotently append a canonical control-plane gate marker.
+
+    This is deliberately a content-only mutation: it never changes task
+    status, assignee, claims, or dependency links.  Workers can therefore mark
+    a non-done card as a gate without taking custody or accidentally making it
+    dispatchable.
+    """
+    canonical = canonical_gate_keyword(keyword)
+    if field not in {"title", "body"}:
+        raise ValueError("gate field must be 'title' or 'body'")
+
+    marker = f"[{canonical}]"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in {"done", "archived"}:
+            raise ValueError(
+                f"cannot mark {row['status']} task {task_id} as a control-plane gate"
+            )
+
+        current = row[field] or ""
+        if marker.casefold() not in current.casefold():
+            if field == "title":
+                updated = f"{current.rstrip()} {marker}".strip()
+            else:
+                separator = "\n\n" if current.strip() else ""
+                updated = f"{current.rstrip()}{separator}{marker}"
+            conn.execute(
+                f"UPDATE tasks SET {field} = ? WHERE id = ?",
+                (updated, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "gate_marked",
+                {"keyword": canonical, "field": field, "by": author or "user"},
+            )
+            if author and author.strip():
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        author.strip(),
+                        f"Marked {field} with {marker}; status and assignee preserved.",
+                        now,
+                    ),
+                )
     return True
 
 
@@ -6557,34 +7316,41 @@ def decompose_triage_task(
     *,
     root_assignee: Optional[str],
     children: list[dict],
+    valid_assignees: Iterable[str] | Callable[[], Iterable[str]],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    expected_root_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
+    expected_root_assignment_generation: object = _EXPECTED_ASSIGNMENT_GENERATION_UNSET,
 ) -> Optional[list[str]]:
-    """Fan a triage task out into child tasks and promote the root to ``todo``.
+    """Fan a triage task out without stealing explicit root custody.
 
-    The root task stays alive and becomes the parent of every child —
-    when all children reach ``done``, the root promotes to ``ready`` and
-    its assignee (typically the orchestrator profile) wakes back up to
-    judge completion or spawn more work.
+    Unassigned executable roots keep the original orchestration behaviour:
+    they move to ``todo`` and are assigned to ``root_assignee`` while waiting
+    on every child.  An already-assigned root is a custody-bearing control
+    card, so its assignee *and status* are preserved byte-for-byte while the
+    child graph runs beneath it.
 
     ``children`` is a list of dicts, each shaped like::
 
         {
             "title": "...",
             "body": "...",                     # optional
-            "assignee": "profile-name",        # optional, None -> default fallback
+            "assignee": "profile-name",        # required after routing
             "parents": [0, 2],                 # indices into this same children list
         }
 
-    Returns the list of created child task ids (in input order) on
-    success. Returns ``None`` when:
-      - The root task does not exist
-      - The root task is not in ``triage``
-      - A cycle would result (caller built a bad graph)
+    ``valid_assignees`` is the caller's current configured profile roster.
+    Every newly-written assignee must appear in it; an unroutable
+    assignee aborts the same write transaction as the inserts.
 
-    Validation of titles/assignees happens inside the same write_txn as
-    the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    When supplied, ``expected_root_assignee`` and
+    ``expected_root_assignment_generation`` are the exact pre-LLM custody
+    snapshot. The transactional helper compares both before any child creation;
+    the monotonic generation makes even ``None -> name -> None`` a miss.
+
+    Returns the list of created child task ids (in input order) on success.
+    Returns ``None`` when the root is missing, no longer in ``triage``, already
+    decomposed, or protected by a control-plane hold.
     """
     if not children:
         return None
@@ -6622,15 +7388,15 @@ def decompose_triage_task(
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
-    _seen = 0
+    _topological_order: list[int] = []
     while _queue:
         _node = _queue.pop()
-        _seen += 1
+        _topological_order.append(_node)
         for _nb in _adj[_node]:
             _in_deg[_nb] -= 1
             if _in_deg[_nb] == 0:
                 _queue.append(_nb)
-    if _seen != len(children):
+    if len(_topological_order) != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
     # We do the full decomposition in a SINGLE write_txn so it's
@@ -6644,7 +7410,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, assignee, assignment_generation, tenant, "
+            "workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6652,6 +7419,47 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        hold_reason = decomposition_hold_reason(conn, task_id)
+        if hold_reason is not None:
+            return None
+
+        existing_root_assignee = _canonical_assignee(root_row["assignee"])
+        if expected_root_assignee is not _EXPECTED_ASSIGNEE_UNSET:
+            expected_canonical = _canonical_assignee(
+                expected_root_assignee
+                if isinstance(expected_root_assignee, str)
+                else None
+            )
+            if existing_root_assignee != expected_canonical:
+                return None
+        if (
+            expected_root_assignment_generation
+            is not _EXPECTED_ASSIGNMENT_GENERATION_UNSET
+            and root_row["assignment_generation"]
+            != expected_root_assignment_generation
+        ):
+            return None
+        live_assignees = (
+            valid_assignees() if callable(valid_assignees) else valid_assignees
+        )
+        resolved_assignees = {
+            canonical
+            for name in live_assignees
+            if (canonical := _canonical_assignee(name)) is not None
+        }
+        preserve_root_custody = existing_root_assignee is not None
+        if not preserve_root_custody:
+            if root_assignee is None:
+                raise ValueError(
+                    "cannot decompose an unassigned root without a resolved "
+                    "orchestrator profile"
+                )
+            if root_assignee not in resolved_assignees:
+                raise ValueError(
+                    f"root assignee {root_assignee!r} has no resolvable profile "
+                    "on any known host"
+                )
+
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -6660,15 +7468,32 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Allocate every id and stage sibling dependency intents before any
+        # child INSERT. ``task_links`` intentionally has no FK, and this entire
+        # block is one IMMEDIATE transaction, so no external reader can observe
+        # an intent or a partial child set. Children are then inserted in
+        # topological order: when the assignment trigger checks a dependency-
+        # held Fable executor, every referenced parent row already exists.
+        child_ids = [_new_task_id() for _child in children]
         for idx, child in enumerate(children):
-            new_id = _new_task_id()
+            for p_idx in child.get("parents") or []:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (child_ids[p_idx], child_ids[idx]),
+                )
+
+        for idx in _topological_order:
+            child = children[idx]
+            new_id = child_ids[idx]
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = _canonical_assignee(child.get("assignee")) or root_assignee
+            if assignee is None or assignee not in resolved_assignees:
+                raise ValueError(
+                    f"child[{idx}] assignee {assignee!r} has no resolvable "
+                    "profile on any known host"
+                )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -6702,18 +7527,13 @@ def decompose_triage_task(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
-            child_ids.append(new_id)
 
-        # Link children to their sibling parents (within the decomposed graph).
+        # Emit link events only after every child row exists. The dependency
+        # edges themselves were already staged above for the INSERT trigger.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
-                conn.execute(
-                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                    "VALUES (?, ?)",
-                    (parent_id, child_id),
-                )
                 _append_event(
                     conn, child_id, "linked",
                     {"parent": parent_id, "child": child_id},
@@ -6730,29 +7550,32 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
-        params: list[Any] = []
-        if root_assignee is not None:
-            sets.append("assignee = ?")
-            params.append(root_assignee)
-        params.append(task_id)
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
-            tuple(params),
-        )
+        # An assigned triage root is an explicit custody/control card.  Keep
+        # both assignee and status unchanged; only unassigned executable roots
+        # join the ordinary orchestrator wake-up path.
+        if not preserve_root_custody:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', assignee = ? WHERE id = ?",
+                (root_assignee, task_id),
+            )
+        effective_root_assignee = existing_root_assignee or root_assignee
+        effective_root_status = "triage" if preserve_root_custody else "todo"
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
+            if preserve_root_custody:
+                disposition = (
+                    " Root custody preserved; assignee and triage status unchanged."
+                )
+            else:
+                disposition = " Root will wake when all children complete."
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (
                     task_id,
                     author.strip(),
-                    "Decomposed into "
-                    + ", ".join(child_ids)
-                    + ". Root will wake when all children complete.",
+                    "Decomposed into " + ", ".join(child_ids) + "." + disposition,
                     now,
                 ),
             )
@@ -6760,7 +7583,9 @@ def decompose_triage_task(
             conn, task_id, "decomposed",
             {
                 "child_ids": child_ids,
-                "root_assignee": root_assignee,
+                "root_assignee": effective_root_assignee,
+                "root_status": effective_root_status,
+                "custody_preserved": preserve_root_custody,
             },
         )
 
@@ -8135,8 +8960,6 @@ def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
         if not raw_path:
             return None
         db_path = Path(raw_path).resolve()
-        if db_path.name != "kanban.db":
-            return None
         if (
             db_path.parent.parent.name == "boards"
             and db_path.parent.parent.parent.name == "kanban"
@@ -8192,39 +9015,21 @@ def _continuation_operator_profiles(
     """
     from hermes_cli.config import DEFAULT_CONFIG
 
-    raw = DEFAULT_CONFIG.get("kanban", {}).get(
+    default = DEFAULT_CONFIG.get("kanban", {}).get(
         "continuation_operator_profiles", "default"
     )
-    authority_root = _continuation_authority_root(conn)
-    if authority_root is None:
-        return ()
-    config_path = authority_root / "config.yaml"
     try:
-        if config_path.exists():
-            payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            if not isinstance(payload, dict):
-                return ()
-            kanban_config = payload.get("kanban") or {}
-            if not isinstance(kanban_config, dict):
-                return ()
-            configured = kanban_config.get(
-                "continuation_operator_profiles"
-            )
-            if configured is not None:
-                raw = configured
-    except (OSError, yaml.YAMLError):
-        return ()
-    if isinstance(raw, str):
-        raw = raw.split(",")
-    if not isinstance(raw, (list, tuple)):
-        return ()
-    return tuple(
-        dict.fromkeys(
-            str(item).strip().casefold()
-            for item in raw
-            if str(item).strip()
+        return _configured_board_profiles(
+            conn,
+            "continuation_operator_profiles",
+            default,
         )
-    )
+    except AssignmentPolicyConfigError:
+        # Continuation authorization already treats an empty allowlist as deny
+        # all. Preserve that public fail-closed contract while assignment-policy
+        # trigger setup/UDF evaluation raises instead of silently disabling its
+        # configured authority fence.
+        return ()
 
 
 def _continuation_operator_context(
@@ -8593,6 +9398,13 @@ class DispatchResult:
     The reason alone is not the full diagnosis: the matching
     ``respawn_guarded`` event carries the PR URL, source comment, ownership
     class and expiry."""
+    respawn_guard_details: list[dict[str, Any]] = field(default_factory=list)
+    """Structured operator diagnostics, one per ``respawn_guarded`` entry.
+
+    Every record carries ``task_id`` and ``reason``. Active-PR suppressions
+    additionally carry the exact PR identity and expiry when the guard knows
+    them, allowing CLI and daemon logs to explain skips without a second DB
+    query."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -8604,6 +9416,68 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+
+    def add_respawn_guard(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        detail: Optional[Mapping[str, Any]] = None,
+        phase: Optional[str] = None,
+    ) -> None:
+        """Record a guarded task in legacy and operator-visible forms."""
+        self.respawn_guarded.append((task_id, reason))
+        diagnostic = dict(detail or {})
+        diagnostic.update({"task_id": task_id, "reason": reason})
+        if phase is not None:
+            diagnostic["phase"] = phase
+        self.respawn_guard_details.append(diagnostic)
+
+    def normalized_respawn_guard_details(self) -> list[dict[str, Any]]:
+        """Return one structured diagnostic for every guarded respawn."""
+        details = [dict(entry) for entry in self.respawn_guard_details]
+        return [
+            {
+                **(details[index] if index < len(details) else {}),
+                "task_id": task_id,
+                "reason": reason,
+            }
+            for index, (task_id, reason) in enumerate(self.respawn_guarded)
+        ]
+
+    def respawn_guard_log_lines(self) -> list[str]:
+        """Render stable, grep-friendly suppression log lines."""
+        lines: list[str] = []
+        for detail in self.normalized_respawn_guard_details():
+            fields = [
+                f"SKIP {detail['task_id']}",
+                f"respawn_guarded={detail['reason']}",
+            ]
+            pr_details = detail.get("pr_details")
+            rendered_pr_detail = False
+            if isinstance(pr_details, Sequence) and not isinstance(
+                pr_details, (str, bytes)
+            ):
+                for pr_detail in pr_details:
+                    if not isinstance(pr_detail, Mapping) or not pr_detail.get(
+                        "pr_url"
+                    ):
+                        continue
+                    fields.append(f"pr={pr_detail['pr_url']}")
+                    if pr_detail.get("expires_at") is not None:
+                        fields.append(f"expires={pr_detail['expires_at']}")
+                    rendered_pr_detail = True
+            if not rendered_pr_detail:
+                if detail.get("pr_url"):
+                    fields.append(f"pr={detail['pr_url']}")
+                if detail.get("expires_at") is not None:
+                    fields.append(f"expires={detail['expires_at']}")
+            if detail.get("phase"):
+                fields.append(f"phase={detail['phase']}")
+            if detail.get("continuation_denial"):
+                fields.append(f"denial={detail['continuation_denial']}")
+            lines.append(" ".join(fields))
+        return lines
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11115,20 +11989,29 @@ def _active_pr_guard_detail(
     and when the window lapses — the four facts an operator needs to tell a
     real active-PR hold apart from a stale one without reading the DB.
     """
-    last_seen = max(
-        (
-            int(record.get("last_seen_at") or 0)
-            for record in owned
-            if record.get("last_seen_at") is not None
-        ),
-        default=0,
-    )
+    pr_details: list[dict[str, Any]] = []
+    for record in owned:
+        last_seen = int(record.get("last_seen_at") or 0)
+        expires_at = record.get("expires_at")
+        if expires_at is None and last_seen:
+            expires_at = last_seen + _RESPAWN_GUARD_PR_WINDOW
+        pr_details.append(
+            {
+                "pr_url": str(record["canonical_url"]),
+                "ownership": str(record.get("ownership") or "referenced"),
+                "source_comment_id": record.get("source_comment_id"),
+                "last_seen_at": last_seen or None,
+                "expires_at": int(expires_at) if expires_at is not None else None,
+            }
+        )
+    primary = pr_details[0] if pr_details else None
     detail: dict[str, Any] = {
-        "pr_url": str(owned[0]["canonical_url"]) if owned else None,
-        "pr_urls": [str(record["canonical_url"]) for record in owned],
-        "ownership": str(owned[0].get("ownership") or "referenced") if owned else None,
-        "source_comment_id": owned[0].get("source_comment_id") if owned else None,
-        "expires_at": (last_seen + _RESPAWN_GUARD_PR_WINDOW) if last_seen else None,
+        "pr_url": primary["pr_url"] if primary else None,
+        "pr_urls": [record["pr_url"] for record in pr_details],
+        "pr_details": pr_details,
+        "ownership": primary["ownership"] if primary else None,
+        "source_comment_id": primary["source_comment_id"] if primary else None,
+        "expires_at": primary["expires_at"] if primary else None,
         "window_seconds": _RESPAWN_GUARD_PR_WINDOW,
     }
     if disowned:
@@ -11223,7 +12106,13 @@ def evaluate_respawn_guard(
             and ended_at is not None
             and (now - int(ended_at)) < rl_cooldown
         ):
-            return RespawnGuardDecision(reason="rate_limit_cooldown")
+            return RespawnGuardDecision(
+                reason="rate_limit_cooldown",
+                detail={
+                    "expires_at": int(ended_at) + rl_cooldown,
+                    "window_seconds": rl_cooldown,
+                },
+            )
         # Cooldown disabled/elapsed: preserve the pre-continuation cheap-probe
         # contract. Rate-limited workers intentionally retry forever, including
         # when they already opened a PR, until quota returns or a newer outcome
@@ -11253,7 +12142,13 @@ def evaluate_respawn_guard(
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return RespawnGuardDecision(reason="recent_success")
+            return RespawnGuardDecision(
+                reason="recent_success",
+                detail={
+                    "expires_at": completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW,
+                    "window_seconds": _RESPAWN_GUARD_SUCCESS_WINDOW,
+                },
+            )
 
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
@@ -11282,8 +12177,6 @@ def evaluate_respawn_guard(
         authorization,
         now=now,
     )
-    if decision.reason is None:
-        return decision
     return replace(decision, detail=detail)
 
 
@@ -11509,61 +12402,61 @@ def _preflight_forced_skills(
     return False
 
 
+def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
+    """Return whether an assignee has a local profile or configured VPS2 SSH target."""
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.fleet_vps2_worker import (
+            configured_vps2_worker,
+            is_vps2_assignee,
+        )
+    except Exception:
+        # A partial/rolling install must fail closed for remote-only lanes while
+        # retaining the historical degraded-install fallback for local lanes.
+        if assignee.lower().startswith("vps2-"):
+            return False
+    else:
+        # vps2-* lanes are remote-only. If the transport is disabled or its
+        # config cannot be read, they remain nonspawnable rather than falling
+        # through to a coincidentally named local profile.
+        if is_vps2_assignee(assignee):
+            try:
+                return configured_vps2_worker(assignee) is not None
+            except Exception:
+                return False
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        # Preserve the historical degraded-install behavior for local lanes.
+        return True
+    return bool(profile_exists(assignee))
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    """Return True iff a ready+assigned+unclaimed task has a spawn target.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
-
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Spawn targets are either local Hermes profiles or an operator-enabled
+    ``kanban.vps2_ssh`` transport for ``vps2-*`` profiles.  This telemetry uses
+    the same predicate as canonical dispatch, so remote lanes are neither
+    silently starved nor handled by an independent scanner.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
+    """Mirror :func:`has_spawnable_ready` for the review column."""
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def dispatch_once(
@@ -11864,27 +12757,10 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+        # Spawn only through the canonical target predicate.  A target is either
+        # a local profile or the configured attached-SSH VPS2 transport; terminal
+        # control-plane lanes remain nonspawnable and pull claims themselves.
+        if not _assignee_has_spawn_target(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
             continue
         # A live owner for THIS card is left to the same-card respawn guard
@@ -11933,7 +12809,12 @@ def _dispatch_once_locked(
             # inspected and attributed to a different card.
             record_respawn_guard_decision(conn, row["id"], guard_decision)
         if guard_decision.reason is not None:
-            result.respawn_guarded.append((row["id"], guard_decision.reason))
+            result.add_respawn_guard(
+                row["id"],
+                guard_decision.reason,
+                detail=guard_decision.detail,
+                phase="ready",
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -11960,8 +12841,20 @@ def _dispatch_once_locked(
                     guard_decision.continuation_authorization_id
                 ),
                 continuation_denial=exc.code,
+                detail={
+                    **(guard_decision.detail or {}),
+                    "continuation_denial": exc.code,
+                    "continuation_authorization_id": (
+                        guard_decision.continuation_authorization_id
+                    ),
+                },
             )
-            result.respawn_guarded.append((row["id"], "active_pr"))
+            result.add_respawn_guard(
+                row["id"],
+                "active_pr",
+                detail=raced.detail,
+                phase="claim_exception",
+            )
             record_respawn_guard_decision(
                 conn,
                 row["id"],
@@ -11980,8 +12873,10 @@ def _dispatch_once_locked(
             board_slug=board_slug,
             phase="ready",
         ):
-            result.respawn_guarded.append(
-                (claimed.id, "live_worker_process")
+            result.add_respawn_guard(
+                claimed.id,
+                "live_worker_process",
+                phase="ready",
             )
             continue
         try:
@@ -12072,11 +12967,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_has_spawn_target(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         active_cards = _per_profile_active_cards.get(row["assignee"], set())
@@ -12103,8 +12994,10 @@ def _dispatch_once_locked(
             board_db=board_db,
             board_slug=board_slug,
         ):
-            result.respawn_guarded.append(
-                (row["id"], "live_worker_process")
+            result.add_respawn_guard(
+                row["id"],
+                "live_worker_process",
+                phase="review",
             )
             if not dry_run:
                 with write_txn(conn):
@@ -12133,8 +13026,10 @@ def _dispatch_once_locked(
             board_slug=board_slug,
             phase="review",
         ):
-            result.respawn_guarded.append(
-                (claimed.id, "live_worker_process")
+            result.add_respawn_guard(
+                claimed.id,
+                "live_worker_process",
+                phase="review",
             )
             continue
         try:
@@ -12560,28 +13455,38 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
+    from hermes_cli.fleet_vps2_worker import (
+        RemoteStartError,
+        configured_vps2_worker,
+        is_vps2_assignee,
+    )
+
+    remote_config = configured_vps2_worker(profile_arg)
+    if is_vps2_assignee(profile_arg) and remote_config is None:
+        # A config reload/disable between eligibility and spawn must never turn
+        # a remote-only lane into a local process after the canonical claim.
+        raise RemoteStartError(
+            f"VPS2 SSH transport is not enabled for remote-only assignee {profile_arg!r}"
+        )
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
-    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
-    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
-    # env, and when the child process starts `hermes -p <name>` the
-    # _apply_profile_override() runs *before* hermes_constants is imported.
-    # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
-    # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
-    # profile-specific config entirely.  Fixes profile-scoped fallback_providers
-    # being invisible to kanban workers.
+    # Local workers inherit the assignee profile home. Remote VPS2 workers must
+    # resolve that profile on VPS2 instead; forwarding the dispatcher's local
+    # HERMES_HOME would point at a path/profile that does not exist there.
     from hermes_cli.profiles import resolve_profile_env
 
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if remote_config is None:
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            # Profile dir doesn't exist — defer resolution to the CLI's
+            # _apply_profile_override() via HERMES_PROFILE (set below).
+            # This only happens in test fixtures where the isolated
+            # HERMES_HOME never had profiles created.
+            pass
+    else:
+        env.pop("HERMES_HOME", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -12652,8 +13557,7 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
+    worker_argv = [
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
@@ -12668,23 +13572,29 @@ def _default_spawn(
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
     for skill in spawn_skills:
-        cmd.extend(["--skills", skill])
+        worker_argv.extend(["--skills", skill])
     if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        worker_argv.extend(["-m", task.model_override])
+    if task.reasoning_effort:
+        worker_argv.extend(["--reasoning", task.reasoning_effort])
+    # Local profile toolsets are not authoritative for a profile that exists
+    # only on VPS2. Let the remote CLI resolve that profile's own config.
+    worker_toolsets = (
+        _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if remote_config is None
+        else None
+    )
     if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
+        worker_argv.extend(["--toolsets", ",".join(worker_toolsets)])
+    worker_argv.extend([
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    if task.goal_mode or remote_config is not None:
+        # Goal-mode and remote workers take the fully-quiet path. Remote workers
+        # use that path so Hermes can emit its internal readiness token only
+        # after credentials, profile config, and the agent are initialized.
+        worker_argv.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -12698,30 +13608,44 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        if remote_config is not None:
+            from hermes_cli.fleet_vps2_worker import spawn_vps2_worker_via_ssh
+
+            proc = spawn_vps2_worker_via_ssh(
+                task_id=task.id,
+                board=resolved_board,
+                workspace=workspace,
+                local_workspace_root=env["HERMES_KANBAN_WORKSPACES_ROOT"],
+                local_env=env,
+                worker_argv=worker_argv,
+                stderr=log_f,
+                config=remote_config,
+            )
+        else:
+            cmd = [*_resolve_hermes_argv(), *worker_argv]
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            )
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    except Exception:
+        log_f.close()
+        raise
+    # The child has inherited the log FD.  For VPS2, the local SSH process keeps
+    # the diagnostics FD while the foreground remote worker writes its remote
+    # log.  In both cases the Popen PID is the canonical local lifecycle token.
     # ``start_new_session=True`` guarantees PGID/SID == child PID on POSIX.
-    # Capture that contract here, before a short-lived wrapper can disappear;
-    # descendants inherit the group even after its leader exits.
     pgid, sid, started_at = _read_worker_process_identity(proc.pid)
     if started_at is None:
         started_at = time.time()

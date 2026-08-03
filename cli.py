@@ -3760,6 +3760,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         model: str = None,
         toolsets: List[str] = None,
         provider: str = None,
+        reasoning_effort: str = None,
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
@@ -3777,6 +3778,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+            reasoning_effort: Invocation-only thinking depth override; ``none`` disables reasoning
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
@@ -3992,8 +3994,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Reasoning config (OpenRouter reasoning effort level)
         # Per-model override > global reasoning_effort — resolved through the
         # shared chokepoint in hermes_constants (Closes #21256).
-        from hermes_constants import resolve_reasoning_config
-        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+        if reasoning_effort is None:
+            self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        else:
+            self.reasoning_config = parse_reasoning_effort(reasoning_effort)
+            if self.reasoning_config is None:
+                raise ValueError(f"invalid reasoning effort: {reasoning_effort!r}")
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -15603,6 +15610,7 @@ def main(
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
     provider: str = None,
+    reasoning_effort: str = None,
     api_key: str = None,
     base_url: str = None,
     max_turns: int = None,
@@ -15631,6 +15639,7 @@ def main(
         skills: Comma-separated or repeated list of skills to preload for the session
         model: Model to use (default: anthropic/claude-opus-4-20250514)
         provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+        reasoning_effort: Invocation-only thinking depth override; ``none`` disables reasoning
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
@@ -15745,6 +15754,7 @@ def main(
         model=model,
         toolsets=toolsets_list,
         provider=provider,
+        reasoning_effort=reasoning_effort,
         api_key=api_key,
         base_url=base_url,
         max_turns=max_turns,
@@ -15996,6 +16006,16 @@ def main(
                         runtime_override=turn_route["runtime"],
                         request_overrides=turn_route.get("request_overrides"),
                     ):
+                        # An attached VPS2 worker is accepted only after this
+                        # process has loaded its profile/credentials and built
+                        # the real agent. The internal FD is supplied by the
+                        # remote supervisor; all normal CLI runs are unchanged.
+                        if os.environ.get("_HERMES_INTERNAL_KANBAN_READY_FD"):
+                            from hermes_cli.fleet_vps2_worker import (
+                                signal_vps2_worker_ready_from_env,
+                            )
+
+                            signal_vps2_worker_ready_from_env()
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays

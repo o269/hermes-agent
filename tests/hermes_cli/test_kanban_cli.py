@@ -7,11 +7,13 @@ import json
 import os
 import threading
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
 
 
 @pytest.fixture
@@ -130,6 +132,19 @@ def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("list")
     assert "ship feature" in out
     assert "alice" in out
+
+
+def test_run_slash_create_and_show_reasoning_effort(kanban_home):
+    out = kc.run_slash(
+        "create 'deep task' --assignee alice --reasoning-effort high"
+    )
+    task_id = out.split()[1]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.reasoning_effort == "high"
+    assert "reasoning: high" in kc.run_slash(f"show {task_id}")
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
@@ -303,6 +318,149 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'b' --assignee bob")
     out = kc.run_slash("dispatch --dry-run")
     assert "Spawned:" in out
+
+
+def test_run_slash_dispatch_logs_active_pr_identity_and_expiry(
+    kanban_home, monkeypatch
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
+        },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_recent",
+        "recent_success",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
+        phase="ready",
+    )
+    monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert (
+        "SKIP t_owned respawn_guarded=active_pr "
+        "pr=https://github.com/o269/hermes-agent/pull/8 "
+        "expires=1785660000 "
+        "pr=https://github.com/o269/hermes-agent/pull/9 "
+        "expires=1785660300 phase=ready"
+    ) in out
+    assert (
+        "SKIP t_recent respawn_guarded=recent_success "
+        "expires=1785660600 phase=ready"
+    ) in out
+
+
+def test_run_slash_dispatch_json_includes_respawn_guard_diagnostics(
+    kanban_home, monkeypatch
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
+        },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_rate",
+        "rate_limit_cooldown",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
+        phase="ready",
+    )
+    monkeypatch.setattr(kb, "dispatch_once", lambda _conn, **_kwargs: result)
+
+    payload = json.loads(kc.run_slash("dispatch --dry-run --json"))
+
+    assert payload["respawn_guarded"] == [
+        {
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
+            "task_id": "t_owned",
+            "reason": "active_pr",
+            "phase": "ready",
+        },
+        {
+            "expires_at": 1785660600,
+            "window_seconds": 600,
+            "task_id": "t_rate",
+            "reason": "rate_limit_cooldown",
+            "phase": "ready",
+        },
+    ]
+
+
+def test_legacy_daemon_tick_uses_shared_respawn_diagnostics(
+    kanban_home, monkeypatch, capsys
+):
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_rate",
+        "rate_limit_cooldown",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
+        phase="ready",
+    )
+
+    def run_one_tick(**kwargs):
+        kwargs["on_tick"](result)
+
+    monkeypatch.setattr(kb, "run_daemon", run_one_tick)
+    monkeypatch.setattr(kb, "has_spawnable_ready", lambda _conn: False)
+
+    rc = kc._cmd_daemon(
+        argparse.Namespace(
+            force=True,
+            pidfile=None,
+            verbose=False,
+            interval=1,
+            max=1,
+            failure_limit=2,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (
+        "SKIP t_rate respawn_guarded=rate_limit_cooldown "
+        "expires=1785660600 phase=ready"
+    ) in captured.out
 
 
 def test_run_slash_context_output_format(kanban_home):
@@ -636,6 +794,9 @@ def test_run_slash_bare_returns_curated_help(kanban_home):
     assert "/kanban" in out
     assert "list" in out
     assert "show" in out
+    assert "decompose" in out
+    assert "gate" in out
+    assert "continuation" in out
     # Sanity: should be a chat-friendly size, not the raw usage tree.
     assert len(out) < 2000
     # Shouldn't surface argparse's usage-error sentinel.
@@ -657,6 +818,44 @@ def test_run_slash_subcommand_help_returns_help_text(kanban_home):
     assert "task_id" in out
     assert "/kanban show" in out
     assert not out.startswith("⚠")
+
+
+def test_run_slash_decompose_json_reports_stale_skip(kanban_home):
+    outcome = decomp.DecomposeOutcome(
+        "t_stale",
+        False,
+        "skipped: task status changed to 'ready'; task left unchanged",
+        skipped=True,
+        root_status="ready",
+    )
+    with patch.object(decomp, "decompose_task", return_value=outcome):
+        payload = json.loads(kc.run_slash("decompose t_stale --json"))
+
+    assert payload["ok"] is False
+    assert payload["skipped"] is True
+    assert payload["root_status"] == "ready"
+    assert "status changed" in payload["reason"]
+
+
+def test_run_slash_decompose_reports_dependency_closure(kanban_home):
+    outcome = decomp.DecomposeOutcome(
+        "t_graph",
+        True,
+        "decomposed into 3 children",
+        fanout=True,
+        child_ids=["t_a", "t_b", "t_c"],
+        root_status="triage",
+        dependency_edges=2,
+        root_dependencies=3,
+        leaf_count=1,
+    )
+    with patch.object(decomp, "decompose_task", return_value=outcome):
+        out = kc.run_slash("decompose t_graph")
+
+    assert "root custody preserved in triage" in out
+    assert "dependency closure: 2 internal edge(s)" in out
+    assert "root waits on 3 child task(s)" in out
+    assert "1 leaf task(s)" in out
 
 
 def test_run_slash_unknown_action_friendly_error(kanban_home):

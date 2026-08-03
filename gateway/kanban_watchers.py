@@ -25,6 +25,12 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _log_respawn_guard_results(board_slug: str, result: Any) -> None:
+    """Expose every suppressed respawn in the embedded dispatcher log."""
+    for line in result.respawn_guard_log_lines():
+        logger.info("kanban dispatcher [%s]: %s", board_slug, line)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1235,6 +1241,8 @@ class GatewayKanbanWatchersMixin:
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
+                    if res is not None:
+                        _log_respawn_guard_results(slug, res)
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually

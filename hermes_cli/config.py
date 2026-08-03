@@ -1543,6 +1543,33 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Fleet-only attached SSH transport for vps2-* profiles. Disabled by
+        # default: enabling it is an operator deployment choice, not a second
+        # dispatcher. Canonical dispatch_once still owns policy, claim/run
+        # creation, capacity, continuation, crash detection, and reclaim.
+        "vps2_ssh": {
+            "enabled": False,
+            "host": "vps2",
+            "user": "root",
+            "hermes_bin": "/root/.local/bin/hermes",
+            "boardd_sock": "/run/boardd-blitz.sock",
+            "workspace_root": "/mnt/HC_Volume_106418160/fleet-workspaces",
+            "log_root": "/tmp",
+            "path": (
+                "/root/.local/bin:/usr/local/sbin:/usr/local/bin:"
+                "/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "connect_timeout_seconds": 15,
+            "server_alive_interval_seconds": 15,
+            "server_alive_count_max": 2,
+            "start_timeout_seconds": 20.0,
+            "start_grace_seconds": 0.1,
+            # Local lease pulses feed a remote supervisor. The timeout is capped
+            # below canonical process-tree termination's five-second grace so
+            # the remote worker is dead before its local lifecycle PID exits.
+            "lease_interval_seconds": 1.0,
+            "lease_timeout_seconds": 4.0,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -2914,6 +2941,15 @@ DEFAULT_CONFIG = {
         # remains a supported, typed config mutation (the reader also accepts
         # YAML lists for hand-authored config files).
         "continuation_operator_profiles": "default",
+        # Non-spawnable decision / live-action profiles (for example an operator
+        # or sole lander). When non-empty, the Kanban kernel enforces the same
+        # assignment+state contract for typed APIs and broker-backed custom SQL:
+        # protected authority cards cannot enter ready/review/running or sit on an
+        # executor profile, while executor cards may only wait on an authority
+        # profile behind a parent/explicit parking contract. Empty preserves
+        # legacy behavior. Comma-delimited for `hermes config set` parity; YAML
+        # lists are accepted by the reader too.
+        "authority_profiles": "",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

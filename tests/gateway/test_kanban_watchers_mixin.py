@@ -8,6 +8,7 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+import logging
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -43,6 +44,53 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+def test_embedded_dispatcher_logs_guard_reason_pr_and_expiry(caplog):
+    from gateway.kanban_watchers import _log_respawn_guard_results
+    from hermes_cli import kanban_db as kb
+
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+            "expires_at": 1785660000,
+            "pr_details": [
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/8",
+                    "expires_at": 1785660000,
+                },
+                {
+                    "pr_url": "https://github.com/o269/hermes-agent/pull/9",
+                    "expires_at": 1785660300,
+                },
+            ],
+        },
+        phase="ready",
+    )
+    result.add_respawn_guard(
+        "t_recent",
+        "recent_success",
+        detail={"expires_at": 1785660600, "window_seconds": 600},
+        phase="ready",
+    )
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        _log_respawn_guard_results("fleet", result)
+
+    assert (
+        "kanban dispatcher [fleet]: SKIP t_owned respawn_guarded=active_pr "
+        "pr=https://github.com/o269/hermes-agent/pull/8 "
+        "expires=1785660000 "
+        "pr=https://github.com/o269/hermes-agent/pull/9 "
+        "expires=1785660300 phase=ready"
+    ) in caplog.messages
+    assert (
+        "kanban dispatcher [fleet]: SKIP t_recent "
+        "respawn_guarded=recent_success expires=1785660600 phase=ready"
+    ) in caplog.messages
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

@@ -1,10 +1,13 @@
 """Tests for the tirith security scanning subprocess wrapper."""
 
+import errno
 import io
 import json
 import os
+import stat
 import subprocess
 import tarfile
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -48,6 +51,39 @@ def _mock_run(returncode=0, stdout="", stderr=""):
 
 def _json_stdout(findings=None, summary=""):
     return json.dumps({"findings": findings or [], "summary": summary})
+
+
+def _native_binary_bytes(target: str) -> bytes:
+    """Minimal native header bytes accepted by the target-format parser."""
+    header = bytearray(64)
+    if target.endswith("unknown-linux-gnu"):
+        header[:8] = b"\x7fELF\x02\x01\x01\x00"
+        header[16:18] = (2).to_bytes(2, "little")  # ET_EXEC
+        machine = {
+            "x86_64-unknown-linux-gnu": 0x3E,
+            "aarch64-unknown-linux-gnu": 0xB7,
+        }[target]
+        header[18:20] = machine.to_bytes(2, "little")
+        return bytes(header)
+
+    header[:4] = b"\xcf\xfa\xed\xfe"
+    cpu_type = {
+        "x86_64-apple-darwin": 0x01000007,
+        "aarch64-apple-darwin": 0x0100000C,
+    }[target]
+    header[4:8] = cpu_type.to_bytes(4, "little")
+    header[12:16] = (2).to_bytes(4, "little")  # MH_EXECUTE
+    return bytes(header)
+
+
+def _foreign_target(target: str) -> str:
+    targets = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ]
+    return next(candidate for candidate in targets if candidate != target)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +196,16 @@ class TestOSErrorFailOpen:
         assert result["action"] == "block"
         assert "fail-closed" in result["summary"]
 
+    @patch("tools.tirith_security._load_security_config")
+    def test_open_circuit_honors_fail_closed(self, mock_cfg):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        _tirith_mod._circuit_open = True
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "circuit breaker" in result["summary"]
+        assert "fail-closed" in result["summary"]
+
 
 class TestTimeoutFailOpen:
     @patch("tools.tirith_security.subprocess.run")
@@ -219,13 +265,24 @@ class TestDisabled:
 
 
 class TestPathExpansion:
-    def test_tilde_expanded_in_resolve(self):
-        """_resolve_tirith_path should expand ~ in configured path."""
+    def test_tilde_expanded_in_resolve(self, tmp_path, monkeypatch):
+        """_resolve_tirith_path should expand ~ and cache an absolute path."""
         from tools.tirith_security import _resolve_tirith_path
+        home = tmp_path / "home"
+        binary = home / "bin" / "tirith"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(_native_binary_bytes("x86_64-unknown-linux-gnu"))
+        binary.chmod(0o755)
+        monkeypatch.setenv("HOME", str(home))
         _tirith_mod._resolved_path = None
-        # Explicit path — won't auto-download, just expands and caches miss
-        result = _resolve_tirith_path("~/bin/tirith")
-        assert "~" not in result, "tilde should be expanded"
+        with patch(
+            "tools.tirith_security._detect_target",
+            return_value="x86_64-unknown-linux-gnu",
+        ):
+            result = _resolve_tirith_path("~/bin/tirith")
+        assert result is not None
+        assert result == str(binary)
+        assert "~" not in result
         _tirith_mod._resolved_path = None
 
 
@@ -298,7 +355,8 @@ class TestEnsureInstalled:
                                  "tirith_timeout": 5, "tirith_fail_open": True}
         _tirith_mod._resolved_path = None
         with patch("os.path.isfile", return_value=True), \
-             patch("os.access", return_value=True):
+             patch("os.access", return_value=True), \
+             patch("tools.tirith_security._is_compatible_tirith_binary", return_value=True):
             result = ensure_installed()
         assert result == "/usr/local/bin/tirith"
         _tirith_mod._resolved_path = None
@@ -413,7 +471,7 @@ class TestUnsupportedPlatform:
         with patch("tools.tirith_security.is_platform_supported", return_value=False), \
              patch("tools.tirith_security.shutil.which") as mock_which:
             result = _tirith_mod._resolve_tirith_path("tirith")
-            assert result == "tirith"
+            assert result is None
             mock_which.assert_not_called()
             assert _tirith_mod._resolved_path is _tirith_mod._INSTALL_FAILED
             assert _tirith_mod._install_failure_reason == "unsupported_platform"
@@ -427,12 +485,194 @@ class TestUnsupportedPlatform:
                                  "tirith_path": "/opt/custom/tirith",
                                  "tirith_timeout": 5, "tirith_fail_open": True}
         _tirith_mod._resolved_path = None
-        with patch("tools.tirith_security.is_platform_supported", return_value=False), \
+        with patch("tools.tirith_security._detect_target", return_value=None), \
              patch("os.path.isfile", return_value=True), \
              patch("os.access", return_value=True):
             result = _tirith_mod._resolve_tirith_path("/opt/custom/tirith")
             assert result == "/opt/custom/tirith"
             assert _tirith_mod._resolved_path == "/opt/custom/tirith"
+
+
+# ---------------------------------------------------------------------------
+# Native release target validation
+# ---------------------------------------------------------------------------
+
+class TestBinaryTargetValidation:
+    TARGETS = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ]
+
+    @pytest.mark.parametrize("target", TARGETS)
+    def test_binary_target_recognizes_supported_native_headers(self, target, tmp_path):
+        binary = tmp_path / "tirith"
+        binary.write_bytes(_native_binary_bytes(target))
+        assert _tirith_mod._binary_target(str(binary)) == target
+
+    @pytest.mark.parametrize("elf_type", [0, 1])  # ET_NONE, ET_REL
+    def test_binary_target_rejects_non_executable_elf_types(self, elf_type, tmp_path):
+        payload = bytearray(_native_binary_bytes("x86_64-unknown-linux-gnu"))
+        payload[16:18] = elf_type.to_bytes(2, "little")
+        binary = tmp_path / "tirith"
+        binary.write_bytes(payload)
+        assert _tirith_mod._binary_target(str(binary)) is None
+
+    @pytest.mark.parametrize("file_type", [0, 1, 6, 8])
+    def test_binary_target_rejects_non_executable_macho_types(self, file_type, tmp_path):
+        payload = bytearray(_native_binary_bytes("aarch64-apple-darwin"))
+        payload[12:16] = file_type.to_bytes(4, "little")
+        binary = tmp_path / "tirith"
+        binary.write_bytes(payload)
+        assert _tirith_mod._binary_target(str(binary)) is None
+
+    @pytest.mark.parametrize("payload", [b"", b"\x7fELF", b"not-a-binary" * 4])
+    def test_binary_target_rejects_malformed_headers(self, payload, tmp_path):
+        binary = tmp_path / "tirith"
+        binary.write_bytes(payload)
+        assert _tirith_mod._binary_target(str(binary)) is None
+
+    @pytest.mark.parametrize("target", TARGETS)
+    def test_rejects_foreign_binary_for_every_target(self, target, tmp_path):
+        binary = tmp_path / "tirith"
+        binary.write_bytes(_native_binary_bytes(_foreign_target(target)))
+        binary.chmod(0o755)
+        assert not _tirith_mod._is_compatible_tirith_binary(str(binary), target)
+
+    @pytest.mark.parametrize("target", TARGETS)
+    @patch("tools.tirith_security._mark_install_failed")
+    @patch("tools.tirith_security._is_install_failed_on_disk", return_value=False)
+    @patch("tools.tirith_security.shutil.which", return_value=None)
+    def test_resolver_replaces_incompatible_managed_binary(
+        self, mock_which, mock_disk_check, mock_mark, target, tmp_path, monkeypatch
+    ):
+        del mock_which, mock_disk_check, mock_mark
+        hermes_home = tmp_path / "hermes-home"
+        managed = hermes_home / "bin" / "tirith"
+        managed.parent.mkdir(parents=True)
+        managed.write_bytes(_native_binary_bytes(_foreign_target(target)))
+        managed.chmod(0o755)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _tirith_mod._resolved_path = None
+
+        installed = str(hermes_home / "bin" / "tirith-native")
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._install_tirith",
+                   return_value=(installed, "")) as mock_install:
+            result = _tirith_mod._resolve_tirith_path("tirith")
+
+        assert result == installed
+        mock_install.assert_called_once()
+        assert _tirith_mod._resolved_path == installed
+
+    @pytest.mark.parametrize("target", TARGETS)
+    def test_cached_absolute_binary_is_revalidated(self, target, tmp_path):
+        binary = tmp_path / "tirith"
+        binary.write_bytes(_native_binary_bytes(_foreign_target(target)))
+        binary.chmod(0o755)
+        _tirith_mod._resolved_path = str(binary)
+
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._load_security_config", return_value={
+                 "tirith_enabled": True,
+                 "tirith_path": "/explicit/tirith",
+                 "tirith_timeout": 5,
+                 "tirith_fail_open": False,
+             }), patch("tools.tirith_security.shutil.which", return_value=None):
+            assert ensure_installed() is None
+
+        assert _tirith_mod._resolved_path is _tirith_mod._INSTALL_FAILED
+        assert _tirith_mod._install_failure_reason == "explicit_path_unusable"
+
+    @pytest.mark.parametrize(("fail_open", "action"), [(True, "allow"), (False, "block")])
+    def test_unsupported_explicit_artifact_honors_fail_mode_without_spawn(
+        self, tmp_path, fail_open, action
+    ):
+        target = "x86_64-unknown-linux-gnu"
+        foreign = tmp_path / "tirith-foreign"
+        foreign.write_bytes(_native_binary_bytes(_foreign_target(target)))
+        foreign.chmod(0o755)
+        _tirith_mod._resolved_path = None
+        cfg = {
+            "tirith_enabled": True,
+            "tirith_path": str(foreign),
+            "tirith_timeout": 5,
+            "tirith_fail_open": fail_open,
+        }
+
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._load_security_config", return_value=cfg), \
+             patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security.subprocess.run") as mock_run:
+            result = check_command_security("echo safe")
+
+        assert result["action"] == action
+        assert "path unavailable" in result["summary"]
+        if not fail_open:
+            assert "fail-closed" in result["summary"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize("target", TARGETS)
+    def test_explicit_relative_path_is_absolute_and_revalidated(
+        self, target, tmp_path, monkeypatch
+    ):
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        original = first_dir / "tirith-custom"
+        original.write_bytes(_native_binary_bytes(target))
+        original.chmod(0o755)
+
+        monkeypatch.chdir(first_dir)
+        _tirith_mod._resolved_path = None
+        with patch("tools.tirith_security._detect_target", return_value=target):
+            resolved = _tirith_mod._resolve_tirith_path("./tirith-custom")
+            assert resolved is not None
+            assert resolved == str(original)
+            assert os.path.isabs(resolved)
+
+            # Cwd rebinding cannot redirect the cache to a same-named foreign file.
+            rebound = second_dir / "tirith-custom"
+            rebound.write_bytes(_native_binary_bytes(_foreign_target(target)))
+            rebound.chmod(0o755)
+            monkeypatch.chdir(second_dir)
+            assert _tirith_mod._resolve_tirith_path("./tirith-custom") == str(original)
+
+            # Replacing the original cached artifact is detected on the next call.
+            original.write_bytes(_native_binary_bytes(_foreign_target(target)))
+            original.chmod(0o755)
+            assert _tirith_mod._resolve_tirith_path("./tirith-custom") is None
+
+    @pytest.mark.parametrize("target", TARGETS)
+    def test_relative_path_lookup_is_cached_as_absolute(self, target, tmp_path, monkeypatch):
+        work = tmp_path / "work"
+        work.mkdir()
+        binary = work / "tirith"
+        binary.write_bytes(_native_binary_bytes(target))
+        binary.chmod(0o755)
+        monkeypatch.chdir(work)
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security.shutil.which", return_value="tirith"):
+            assert _tirith_mod._resolve_tirith_path("tirith") == str(binary)
+        assert _tirith_mod._resolved_path == str(binary)
+
+    def test_preexisting_relative_cache_is_canonicalized(self, tmp_path, monkeypatch):
+        target = "x86_64-unknown-linux-gnu"
+        binary = tmp_path / "tirith-custom"
+        binary.write_bytes(_native_binary_bytes(target))
+        binary.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        _tirith_mod._resolved_path = "tirith-custom"
+
+        with patch("tools.tirith_security._detect_target", return_value=target):
+            result = _tirith_mod._resolve_tirith_path("tirith-custom")
+
+        assert result == str(binary)
+        assert _tirith_mod._resolved_path == str(binary)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +704,26 @@ class TestFailedDownloadCaching:
 
     @patch("tools.tirith_security._mark_install_failed")
     @patch("tools.tirith_security._is_install_failed_on_disk", return_value=False)
+    @patch(
+        "tools.tirith_security._install_tirith",
+        return_value=(None, "binary_target_mismatch"),
+    )
+    @patch("tools.tirith_security.shutil.which", return_value=None)
+    def test_sync_target_mismatch_marker_is_persisted_once(
+        self, mock_which, mock_install, mock_disk_check, mock_mark
+    ):
+        del mock_which, mock_disk_check
+        _tirith_mod._resolved_path = None
+
+        assert _tirith_mod._resolve_tirith_path("tirith") is None
+        assert _tirith_mod._resolve_tirith_path("tirith") is None
+
+        mock_install.assert_called_once()
+        mock_mark.assert_called_once_with("binary_target_mismatch")
+        assert _tirith_mod._install_failure_reason == "binary_target_mismatch"
+
+    @patch("tools.tirith_security._mark_install_failed")
+    @patch("tools.tirith_security._is_install_failed_on_disk", return_value=False)
     @patch("tools.tirith_security._install_tirith", return_value=(None, "download_failed"))
     @patch("tools.tirith_security.shutil.which", return_value=None)
     @patch("tools.tirith_security.subprocess.run")
@@ -471,20 +731,21 @@ class TestFailedDownloadCaching:
     def test_failed_install_scan_uses_fail_open(self, mock_cfg, mock_run,
                                                  mock_which, mock_install,
                                                  mock_disk_check, mock_mark):
-        """After cached miss, check_command_security hits OSError → fail_open."""
+        """A cached miss applies fail-open without spawning or tripping the breaker."""
         _tirith_mod._resolved_path = None
         mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
                                  "tirith_timeout": 5, "tirith_fail_open": True}
-        mock_run.side_effect = FileNotFoundError("No such file: tirith")
-        # First command triggers install attempt + cached miss + scan
+        # First command triggers one install attempt and returns path-unavailable.
         result = check_command_security("echo hello")
         assert result["action"] == "allow"
         assert mock_install.call_count == 1
 
-        # Second command: no install retry, just hits OSError → allow
+        # Second command uses the cached failure without install/spawn retry.
         result = check_command_security("echo world")
         assert result["action"] == "allow"
-        assert mock_install.call_count == 1  # still 1
+        assert mock_install.call_count == 1
+        mock_run.assert_not_called()
+        assert _tirith_mod._crash_count == 0
 
         _tirith_mod._resolved_path = None
 
@@ -502,10 +763,10 @@ class TestExplicitPathNoAutoDownload:
         _tirith_mod._resolved_path = None
 
         result = _resolve_tirith_path("/opt/custom/tirith")
-        # Should cache failure, not call _install_tirith
+        # Should cache failure, not call _install_tirith or spawn the bad path.
         mock_install.assert_not_called()
         assert _tirith_mod._resolved_path is _INSTALL_FAILED
-        assert "/opt/custom/tirith" in result
+        assert result is None
 
         _tirith_mod._resolved_path = None
 
@@ -519,7 +780,7 @@ class TestExplicitPathNoAutoDownload:
         result = _resolve_tirith_path("~/bin/tirith")
         mock_install.assert_not_called()
         assert _tirith_mod._resolved_path is _INSTALL_FAILED
-        assert "~" not in result  # tilde still expanded
+        assert result is None
 
         _tirith_mod._resolved_path = None
 
@@ -678,11 +939,11 @@ class TestCosignVerification:
                                                               mock_checksum, mock_tarfile):
         """_install_tirith proceeds with SHA-256 when .sig/.pem downloads fail."""
         from tools.tirith_security import _install_tirith
-        import urllib.request
+        import urllib.error
 
         def _dl_side_effect(url, dest, timeout=10):
             if url.endswith(".sig") or url.endswith(".pem"):
-                raise urllib.request.URLError("404 Not Found")
+                raise urllib.error.URLError("404 Not Found")
 
         mock_dl.side_effect = _dl_side_effect
         mock_tar = MagicMock()
@@ -722,18 +983,18 @@ class TestCosignVerification:
 
 
 class TestInstallArchiveMemberValidation:
-    def _write_archive(self, tmp_path, member: tarfile.TarInfo, data: bytes | None = None):
-        archive = tmp_path / "tirith-aarch64-apple-darwin.tar.gz"
+    def _write_archive(
+        self, tmp_path, target: str, member: tarfile.TarInfo, data: bytes | None = None
+    ):
+        archive_name = f"tirith-{target}.tar.gz"
+        archive = tmp_path / archive_name
         checksums = tmp_path / "checksums.txt"
         with tarfile.open(archive, "w:gz") as tar:
             if data is None:
                 tar.addfile(member)
             else:
                 tar.addfile(member, io.BytesIO(data))
-        checksums.write_text(
-            "ignored  tirith-aarch64-apple-darwin.tar.gz\n",
-            encoding="utf-8",
-        )
+        checksums.write_text(f"ignored  {archive_name}\n", encoding="utf-8")
         return archive, checksums
 
     def _download_side_effect(self, archive, checksums):
@@ -751,47 +1012,82 @@ class TestInstallArchiveMemberValidation:
 
         return _download
 
+    @pytest.mark.parametrize("target", TestBinaryTargetValidation.TARGETS)
     @patch("tools.tirith_security._verify_checksum", return_value=True)
     @patch("tools.tirith_security.shutil.which", return_value=None)
-    @patch("tools.tirith_security._detect_target", return_value="aarch64-apple-darwin")
-    def test_install_extracts_regular_tirith_member(self, mock_target, mock_which,
-                                                    mock_checksum, tmp_path, monkeypatch):
-        """A valid regular-file tirith member is installed as a plain file."""
-        del mock_target, mock_which, mock_checksum
+    def test_install_extracts_regular_tirith_member(
+        self, mock_which, mock_checksum, target, tmp_path, monkeypatch
+    ):
+        """A valid regular-file Tirith member is installed for every target."""
+        del mock_which, mock_checksum
         from tools.tirith_security import _install_tirith
 
-        payload = b"#!/bin/sh\nexit 0\n"
+        payload = _native_binary_bytes(target)
         member = tarfile.TarInfo("bin/tirith")
         member.mode = 0o755
         member.size = len(payload)
-        archive, checksums = self._write_archive(tmp_path, member, payload)
+        archive, checksums = self._write_archive(tmp_path, target, member, payload)
 
         hermes_home = tmp_path / "hermes-home"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        with patch("tools.tirith_security._download_file",
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._download_file",
                    side_effect=self._download_side_effect(archive, checksums)):
             path, reason = _install_tirith(log_failures=False)
 
         assert reason == ""
-        assert path == str(hermes_home / "bin" / "tirith")
+        expected_path = str(hermes_home / "bin" / "tirith")
+        assert path is not None
+        assert path == expected_path
         assert os.path.isfile(path)
         assert not os.path.islink(path)
+        assert stat.S_IMODE(os.stat(expected_path).st_mode) == 0o755
         with open(path, "rb") as f:
             assert f.read() == payload
+
+    @pytest.mark.parametrize("target", TestBinaryTargetValidation.TARGETS)
+    @patch("tools.tirith_security._verify_checksum", return_value=True)
+    @patch("tools.tirith_security.shutil.which", return_value=None)
+    def test_install_rejects_wrong_target_before_publication(
+        self, mock_which, mock_checksum, target, tmp_path, monkeypatch
+    ):
+        """A signed/checksummed archive still cannot publish a foreign binary."""
+        del mock_which, mock_checksum
+        from tools.tirith_security import _install_tirith
+
+        payload = _native_binary_bytes(_foreign_target(target))
+        member = tarfile.TarInfo("bin/tirith")
+        member.mode = 0o755
+        member.size = len(payload)
+        archive, checksums = self._write_archive(tmp_path, target, member, payload)
+
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._download_file",
+                   side_effect=self._download_side_effect(archive, checksums)):
+            path, reason = _install_tirith(log_failures=False)
+
+        assert path is None
+        assert reason == "binary_target_mismatch"
+        assert not os.path.lexists(hermes_home / "bin" / "tirith")
 
     @patch("tools.tirith_security._verify_checksum", return_value=True)
     @patch("tools.tirith_security.shutil.which", return_value=None)
     @patch("tools.tirith_security._detect_target", return_value="aarch64-apple-darwin")
-    def test_install_rejects_non_regular_tirith_member(self, mock_target, mock_which,
-                                                       mock_checksum, tmp_path, monkeypatch):
-        """Symlink or hardlink tar members must not be installed as tirith."""
+    def test_install_rejects_non_regular_tirith_member(
+        self, mock_target, mock_which, mock_checksum, tmp_path, monkeypatch
+    ):
+        """Symlink or hardlink tar members must not be installed as Tirith."""
         del mock_target, mock_which, mock_checksum
         from tools.tirith_security import _install_tirith
 
         member = tarfile.TarInfo("bin/tirith")
         member.type = tarfile.SYMTYPE
         member.linkname = "/bin/sh"
-        archive, checksums = self._write_archive(tmp_path, member)
+        archive, checksums = self._write_archive(
+            tmp_path, "aarch64-apple-darwin", member
+        )
 
         hermes_home = tmp_path / "hermes-home"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -802,6 +1098,157 @@ class TestInstallArchiveMemberValidation:
         assert path is None
         assert reason == "binary_not_regular_file"
         assert not os.path.lexists(hermes_home / "bin" / "tirith")
+
+
+class TestAtomicPublication:
+    TARGET = "x86_64-unknown-linux-gnu"
+
+    def _source(self, tmp_path, suffix: bytes = b""):
+        source = tmp_path / "downloaded-tirith"
+        source.write_bytes(_native_binary_bytes(self.TARGET) + suffix)
+        return source
+
+    def test_existing_destination_symlink_is_replaced_not_followed(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        victim = tmp_path / "victim"
+        victim.write_bytes(b"do-not-overwrite")
+        destination = bin_dir / "tirith"
+        destination.symlink_to(victim)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        payload = self._source(tmp_path).read_bytes()
+
+        path, reason = _tirith_mod._publish_tirith_binary(
+            str(tmp_path / "downloaded-tirith"), self.TARGET
+        )
+
+        assert reason == ""
+        assert path == str(destination)
+        assert victim.read_bytes() == b"do-not-overwrite"
+        assert not destination.is_symlink()
+        assert destination.read_bytes() == payload
+
+    def test_exdev_never_falls_back_through_destination_symlink(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        victim = tmp_path / "victim"
+        victim.write_bytes(b"do-not-overwrite")
+        destination = bin_dir / "tirith"
+        destination.symlink_to(victim)
+        source = self._source(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with patch(
+            "tools.tirith_security.os.replace",
+            side_effect=OSError(errno.EXDEV, "cross-device link"),
+        ):
+            path, reason = _tirith_mod._publish_tirith_binary(
+                str(source), self.TARGET
+            )
+
+        assert path is None
+        assert reason == "atomic_publish_failed"
+        assert destination.is_symlink()
+        assert victim.read_bytes() == b"do-not-overwrite"
+        assert list(bin_dir.glob(".tirith-stage-*")) == []
+
+    def test_directory_destination_is_rejected_without_nesting(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        destination = hermes_home / "bin" / "tirith"
+        destination.mkdir(parents=True)
+        destination.parent.chmod(0o700)
+        source = self._source(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        path, reason = _tirith_mod._publish_tirith_binary(str(source), self.TARGET)
+
+        assert path is None
+        assert reason == "atomic_publish_failed"
+        assert destination.is_dir()
+        assert list(destination.parent.glob(".tirith-stage-*")) == []
+
+    def test_group_writable_install_directory_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True)
+        bin_dir.chmod(0o770)
+        source = self._source(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        path, reason = _tirith_mod._publish_tirith_binary(str(source), self.TARGET)
+
+        assert path is None
+        assert reason == "install_directory_insecure"
+        assert not (bin_dir / "tirith").exists()
+
+    def test_new_install_directory_is_private_under_permissive_umask(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "new-hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        previous_umask = os.umask(0)
+        try:
+            bin_dir = _tirith_mod._hermes_bin_dir()
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE(os.stat(bin_dir).st_mode) == 0o700
+
+    def test_reader_observes_only_complete_old_or_new_binary(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        destination = bin_dir / "tirith"
+        old_payload = _native_binary_bytes(self.TARGET) + b"old"
+        new_payload = _native_binary_bytes(self.TARGET) + b"new" * 100_000
+        destination.write_bytes(old_payload)
+        destination.chmod(0o755)
+        source = tmp_path / "downloaded-tirith"
+        source.write_bytes(new_payload)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        before_replace = threading.Event()
+        allow_replace = threading.Event()
+        real_replace = os.replace
+        result: list[tuple[str | None, str]] = []
+
+        def gated_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            before_replace.set()
+            assert allow_replace.wait(timeout=5)
+            return real_replace(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        with patch("tools.tirith_security.os.replace", side_effect=gated_replace):
+            publisher = threading.Thread(
+                target=lambda: result.append(
+                    _tirith_mod._publish_tirith_binary(str(source), self.TARGET)
+                )
+            )
+            publisher.start()
+            assert before_replace.wait(timeout=5)
+            assert destination.read_bytes() == old_payload
+            allow_replace.set()
+            publisher.join(timeout=5)
+
+        assert not publisher.is_alive()
+        assert result == [(str(destination), "")]
+        assert destination.read_bytes() == new_payload
 
 
 # ---------------------------------------------------------------------------
@@ -850,8 +1297,8 @@ class TestBackgroundInstall:
 
         _tirith_mod._resolved_path = None
 
-    def test_resolve_returns_default_when_thread_alive(self):
-        """_resolve_tirith_path returns default while background thread runs."""
+    def test_resolve_returns_none_when_thread_alive(self):
+        """A live installer never respawns a rejected/default PATH artifact."""
         from tools.tirith_security import _resolve_tirith_path
         _tirith_mod._resolved_path = None
         mock_thread = MagicMock()
@@ -861,7 +1308,7 @@ class TestBackgroundInstall:
         with patch("tools.tirith_security.shutil.which", return_value=None), \
              patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"):
             result = _resolve_tirith_path("tirith")
-            assert result == "tirith"  # returns configured default, doesn't block
+            assert result is None
 
         _tirith_mod._install_thread = None
         _tirith_mod._resolved_path = None
@@ -872,10 +1319,89 @@ class TestBackgroundInstall:
         # Simulate background thread having completed and set the path
         _tirith_mod._resolved_path = "/usr/local/bin/tirith"
 
-        result = _resolve_tirith_path("tirith")
+        with patch("tools.tirith_security._is_usable_tirith_binary", return_value=True):
+            result = _resolve_tirith_path("tirith")
         assert result == "/usr/local/bin/tirith"
 
         _tirith_mod._resolved_path = None
+
+    def test_incompatible_path_during_install_does_not_open_breaker_and_recovers(
+        self, tmp_path
+    ):
+        target = "x86_64-unknown-linux-gnu"
+        foreign = tmp_path / "path-tirith"
+        foreign.write_bytes(_native_binary_bytes("aarch64-apple-darwin"))
+        foreign.chmod(0o755)
+        installed = tmp_path / "managed" / "tirith"
+        installed.parent.mkdir()
+        installed.write_bytes(_native_binary_bytes(target))
+        installed.chmod(0o755)
+        empty_bin = tmp_path / "empty-bin"
+        empty_bin.mkdir()
+
+        live_thread = MagicMock()
+        live_thread.is_alive.return_value = True
+        _tirith_mod._install_thread = live_thread
+        _tirith_mod._resolved_path = None
+        cfg = {
+            "tirith_enabled": True,
+            "tirith_path": "tirith",
+            "tirith_timeout": 5,
+            "tirith_fail_open": True,
+        }
+
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security.shutil.which", return_value=str(foreign)), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value=str(empty_bin)), \
+             patch("tools.tirith_security._load_security_config", return_value=cfg), \
+             patch("tools.tirith_security.subprocess.run") as mock_run:
+            for _ in range(_tirith_mod._CRASH_LIMIT + 1):
+                result = check_command_security("echo waiting")
+                assert result["action"] == "allow"
+                assert "path unavailable" in result["summary"]
+
+        mock_run.assert_not_called()
+        assert _tirith_mod._crash_count == 0
+        assert _tirith_mod._circuit_open is False
+
+        # A successful background install closes even a previously open breaker.
+        _tirith_mod._install_thread = None
+        _tirith_mod._circuit_open = True
+        _tirith_mod._crash_count = _tirith_mod._CRASH_LIMIT
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security.shutil.which", return_value=str(foreign)), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value=str(empty_bin)), \
+             patch("tools.tirith_security._install_tirith",
+                   return_value=(str(installed), "")), \
+             patch("tools.tirith_security._clear_install_failed"):
+            _tirith_mod._background_install()
+
+        assert _tirith_mod._resolved_path == str(installed)
+        assert _tirith_mod._crash_count == 0
+        assert _tirith_mod._circuit_open is False
+
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security._load_security_config", return_value=cfg), \
+             patch("tools.tirith_security.subprocess.run",
+                   return_value=_mock_run(0, _json_stdout())) as mock_run:
+            result = check_command_security("echo recovered")
+
+        assert result["action"] == "allow"
+        assert mock_run.call_args.args[0][0] == str(installed)
+
+    def test_background_target_mismatch_marker_is_persisted_once(self):
+        _tirith_mod._resolved_path = None
+        with patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
+             patch("tools.tirith_security._install_tirith",
+                   return_value=(None, "binary_target_mismatch")), \
+             patch("tools.tirith_security._mark_install_failed") as mock_mark:
+            _tirith_mod._background_install()
+            _tirith_mod._background_install()
+
+        mock_mark.assert_called_once_with("binary_target_mismatch")
+        assert _tirith_mod._resolved_path is _tirith_mod._INSTALL_FAILED
+        assert _tirith_mod._install_failure_reason == "binary_target_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1530,7 @@ class TestDiskFailureMarker:
         _tirith_mod._resolved_path = _INSTALL_FAILED
 
         with patch("tools.tirith_security.shutil.which", return_value="/usr/local/bin/tirith"), \
+             patch("tools.tirith_security._is_usable_tirith_binary", return_value=True), \
              patch("tools.tirith_security._clear_install_failed") as mock_clear:
             result = _resolve_tirith_path("tirith")
             assert result == "/usr/local/bin/tirith"
@@ -1012,21 +1539,20 @@ class TestDiskFailureMarker:
 
         _tirith_mod._resolved_path = None
 
-    def test_install_failed_recovers_from_hermes_bin(self):
-        """After _INSTALL_FAILED, manual install in HERMES_HOME/bin is picked up."""
+    @pytest.mark.parametrize("target", TestBinaryTargetValidation.TARGETS)
+    def test_install_failed_recovers_from_hermes_bin(self, target, tmp_path):
+        """After _INSTALL_FAILED, every native managed target is picked up."""
         from tools.tirith_security import _resolve_tirith_path, _INSTALL_FAILED
-        import tempfile
-        tmpdir = tempfile.mkdtemp()
-        hermes_bin = os.path.join(tmpdir, "tirith")
-        # Create a fake executable
-        with open(hermes_bin, "w") as f:
-            f.write("#!/bin/sh\n")
+        hermes_bin = str(tmp_path / "tirith")
+        with open(hermes_bin, "wb") as f:
+            f.write(_native_binary_bytes(target))
         os.chmod(hermes_bin, 0o755)
 
         _tirith_mod._resolved_path = _INSTALL_FAILED
 
-        with patch("tools.tirith_security.shutil.which", return_value=None), \
-             patch("tools.tirith_security._hermes_bin_dir", return_value=tmpdir), \
+        with patch("tools.tirith_security._detect_target", return_value=target), \
+             patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value=str(tmp_path)), \
              patch("tools.tirith_security._clear_install_failed") as mock_clear:
             result = _resolve_tirith_path("tirith")
             assert result == hermes_bin
@@ -1044,7 +1570,7 @@ class TestDiskFailureMarker:
              patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
              patch("tools.tirith_security._install_tirith") as mock_install:
             result = _resolve_tirith_path("tirith")
-            assert result == "tirith"  # fallback to configured path
+            assert result is None
             mock_install.assert_not_called()
 
         _tirith_mod._resolved_path = None
@@ -1100,7 +1626,7 @@ class TestDiskFailureMarker:
              patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
              patch("tools.tirith_security._install_tirith") as mock_install:
             result = _resolve_tirith_path("tirith")
-            assert result == "tirith"  # fallback
+            assert result is None
             mock_install.assert_not_called()
 
         _tirith_mod._resolved_path = None
@@ -1115,7 +1641,7 @@ class TestDiskFailureMarker:
              patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
              patch("tools.tirith_security._install_tirith") as mock_install:
             result = _resolve_tirith_path("tirith")
-            assert result == "tirith"  # fallback
+            assert result is None
             mock_install.assert_not_called()
 
         _tirith_mod._resolved_path = None

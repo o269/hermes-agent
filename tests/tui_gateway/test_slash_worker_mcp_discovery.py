@@ -10,11 +10,51 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
 
 pytest.importorskip("mcp.server.fastmcp")
+
+
+# MCP process startup is CPU-heavy enough to exceed the production 1.5-second
+# discovery budget when the suite is running 16 files at once. This integration
+# test needs discovery to finish before it can assert the first /tools snapshot,
+# so give discovery a deliberately loose test-only budget. The response wait is
+# larger still to leave room for HermesCLI initialization on a loaded runner.
+_MCP_DISCOVERY_TIMEOUT_S = 30.0
+_SLASH_RESPONSE_TIMEOUT_S = 60.0
+
+
+def _wait_for_stdout_line(proc: subprocess.Popen[str], output: queue.Queue[str]) -> str:
+    """Wait portably for one response while failing fast if the worker exits."""
+    deadline = time.monotonic() + _SLASH_RESPONSE_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                "slash worker produced no /tools response within "
+                f"{_SLASH_RESPONSE_TIMEOUT_S:g} seconds "
+                f"(exit_code={proc.poll()!r})"
+            )
+
+        try:
+            line = output.get(timeout=min(0.1, remaining))
+        except queue.Empty:
+            returncode = proc.poll()
+            if returncode is None:
+                continue
+            pytest.fail(
+                f"slash worker exited with code {returncode} before /tools responded"
+            )
+
+        if line:
+            return line
+        pytest.fail(
+            "slash worker closed stdout before /tools responded "
+            f"(exit_code={proc.poll()!r})"
+        )
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
@@ -40,17 +80,16 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         encoding="utf-8",
     )
     (profile_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "mcp_servers": {
-                    "profileprobe": {
-                        "enabled": True,
-                        "command": sys.executable,
-                        "args": [str(server)],
-                    }
+        yaml.safe_dump({
+            "mcp_discovery_timeout": _MCP_DISCOVERY_TIMEOUT_S,
+            "mcp_servers": {
+                "profileprobe": {
+                    "enabled": True,
+                    "command": sys.executable,
+                    "args": [str(server)],
                 }
-            }
-        ),
+            },
+        }),
         encoding="utf-8",
     )
 
@@ -89,10 +128,7 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         ).start()
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+        line = _wait_for_stdout_line(proc, output)
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]

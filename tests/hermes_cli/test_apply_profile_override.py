@@ -50,6 +50,64 @@ def _run_apply_profile_override(
     return os.environ.get("HERMES_HOME")
 
 
+def _run_with_worker_env(
+    tmp_path, monkeypatch, *,
+    hermes_home: str | None,
+    active_profile: str | None,
+    argv: list[str],
+    worker_env: dict[str, str | None],
+):
+    """Run _apply_profile_override with simulated dispatcher-set worker env.
+
+    Returns a SimpleNamespace with the post-override environment values.
+    """
+    hermes_root = tmp_path / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+
+    if active_profile is not None:
+        (hermes_root / "active_profile").write_text(active_profile)
+    if active_profile and active_profile != "default":
+        (hermes_root / "profiles" / active_profile).mkdir(parents=True, exist_ok=True)
+
+    # Create profile directories for the explicit -p argument and the parent.
+    explicit_profile = None
+    try:
+        idx = argv.index("-p")
+        explicit_profile = argv[idx + 1]
+    except (ValueError, IndexError):
+        pass
+    if explicit_profile:
+        (hermes_root / "profiles" / explicit_profile).mkdir(parents=True, exist_ok=True)
+    if hermes_home and Path(hermes_home).parent.name == "profiles":
+        parent_name = Path(hermes_home).name
+        (hermes_root / "profiles" / parent_name).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    if hermes_home is not None:
+        monkeypatch.setenv("HERMES_HOME", hermes_home)
+    else:
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    for name, value in worker_env.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    monkeypatch.setattr(sys, "argv", list(argv))
+
+    from hermes_cli.main import _apply_profile_override
+    _apply_profile_override()
+
+    return SimpleNamespace(
+        hermes_home=os.environ.get("HERMES_HOME"),
+        hermes_profile=os.environ.get("HERMES_PROFILE"),
+        kanban_task=os.environ.get("HERMES_KANBAN_TASK"),
+        kanban_run_id=os.environ.get("HERMES_KANBAN_RUN_ID"),
+        kanban_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+        terminal_cwd=os.environ.get("TERMINAL_CWD"),
+    )
+
 class TestApplyProfileOverrideHermesHomeGuard:
     """Regression guard for issue #22502.
 
@@ -322,4 +380,169 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+
+
+class TestCrossProfileKanbanContextScrub:
+    """Containment: a cross-profile explicit ``-p`` from a dispatched worker must
+    drop inherited Kanban card context so the nested session is not a worker.
+
+    Same-profile dispatcher startup (``-p <same>`` with a matching parent profile)
+    must retain the context so workers can operate.
+
+    Regression coverage for the run-6550 incident: an engineer worker spawned a
+    ``hermes -p gemini1`` liveness probe that kept HERMES_KANBAN_* and completed
+    the engineer's run.
+    """
+
+    def test_same_profile_worker_retains_card_context(self, tmp_path, monkeypatch):
+        """Dispatcher startup pattern: -p engineer from an engineer worker."""
+        hermes_root = tmp_path / ".hermes"
+        engineer_home = hermes_root / "profiles" / "engineer"
+        engineer_home.mkdir(parents=True, exist_ok=True)
+
+        result = _run_with_worker_env(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(engineer_home),
+            active_profile="engineer",
+            argv=["hermes", "-p", "engineer", "chat"],
+            worker_env={
+                "HERMES_PROFILE": "engineer",
+                "HERMES_KANBAN_TASK": "t_0e2540e1",
+                "HERMES_KANBAN_RUN_ID": "r_6550",
+                "HERMES_KANBAN_CLAIM_LOCK": "claim-engineer-6550",
+                "TERMINAL_CWD": "/workspace/engineer",
+            },
+        )
+
+        assert result.hermes_home.endswith("profiles/engineer")
+        assert result.hermes_profile == "engineer"
+        assert result.kanban_task == "t_0e2540e1"
+        assert result.kanban_run_id == "r_6550"
+        assert result.kanban_claim_lock == "claim-engineer-6550"
+        assert result.terminal_cwd == "/workspace/engineer"
+
+    def test_cross_profile_worker_scrubs_card_context(self, tmp_path, monkeypatch):
+        """Incident repro: engineer worker launches a gemini1 probe."""
+        hermes_root = tmp_path / ".hermes"
+        engineer_home = hermes_root / "profiles" / "engineer"
+        gemini1_home = hermes_root / "profiles" / "gemini1"
+        engineer_home.mkdir(parents=True, exist_ok=True)
+        gemini1_home.mkdir(parents=True, exist_ok=True)
+
+        result = _run_with_worker_env(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(engineer_home),
+            active_profile="engineer",
+            argv=["hermes", "-p", "gemini1", "-z", "liveness probe", "--cli"],
+            worker_env={
+                "HERMES_PROFILE": "engineer",
+                "HERMES_KANBAN_TASK": "t_0e2540e1",
+                "HERMES_KANBAN_RUN_ID": "r_6550",
+                "HERMES_KANBAN_CLAIM_LOCK": "claim-engineer-6550",
+                "HERMES_KANBAN_BOARD_SLUG": "fleet",
+                "TERMINAL_CWD": "/workspace/engineer",
+            },
+        )
+
+        assert result.hermes_home.endswith("profiles/gemini1")
+        assert result.hermes_profile == "gemini1"
+        assert result.kanban_task is None
+        assert result.kanban_run_id is None
+        assert result.kanban_claim_lock is None
+        assert result.terminal_cwd is None
+
+    def test_cross_profile_scrub_derives_parent_from_home(self, tmp_path, monkeypatch):
+        """Parent profile can be derived from HERMES_HOME when HERMES_PROFILE is absent."""
+        hermes_root = tmp_path / ".hermes"
+        engineer_home = hermes_root / "profiles" / "engineer"
+        gemini1_home = hermes_root / "profiles" / "gemini1"
+        engineer_home.mkdir(parents=True, exist_ok=True)
+        gemini1_home.mkdir(parents=True, exist_ok=True)
+
+        result = _run_with_worker_env(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(engineer_home),
+            active_profile="engineer",
+            argv=["hermes", "-p", "gemini1", "chat"],
+            worker_env={
+                "HERMES_PROFILE": None,
+                "HERMES_KANBAN_TASK": "t_0e2540e1",
+                "HERMES_KANBAN_RUN_ID": "r_6550",
+                "TERMINAL_CWD": "/workspace/engineer",
+            },
+        )
+
+        assert result.hermes_profile == "gemini1"
+        assert result.kanban_task is None
+        assert result.kanban_run_id is None
+
+    def test_active_profile_fallback_does_not_scrub(self, tmp_path, monkeypatch):
+        """No explicit -p means no scrub; active_profile fallback is a user choice."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        gemini1_home = hermes_root / "profiles" / "gemini1"
+        gemini1_home.mkdir(parents=True, exist_ok=True)
+
+        result = _run_with_worker_env(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(hermes_root),
+            active_profile="gemini1",
+            argv=["hermes", "chat"],
+            worker_env={
+                "HERMES_PROFILE": "engineer",
+                "HERMES_KANBAN_TASK": "t_0e2540e1",
+                "HERMES_KANBAN_RUN_ID": "r_6550",
+            },
+        )
+
+        assert result.hermes_profile == "gemini1"
+        assert result.kanban_task == "t_0e2540e1"
+        assert result.kanban_run_id == "r_6550"
+
+    def test_no_kanban_task_means_no_scrub_required(self, tmp_path, monkeypatch):
+        """Cross-profile explicit -p without a card is just a normal switch."""
+        hermes_root = tmp_path / ".hermes"
+        engineer_home = hermes_root / "profiles" / "engineer"
+        gemini1_home = hermes_root / "profiles" / "gemini1"
+        engineer_home.mkdir(parents=True, exist_ok=True)
+        gemini1_home.mkdir(parents=True, exist_ok=True)
+
+        result = _run_with_worker_env(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(engineer_home),
+            active_profile="engineer",
+            argv=["hermes", "-p", "gemini1", "chat"],
+            worker_env={
+                "HERMES_PROFILE": "engineer",
+                "HERMES_KANBAN_TASK": None,
+                "TERMINAL_CWD": "/workspace/engineer",
+            },
+        )
+
+        assert result.hermes_profile == "gemini1"
+        assert result.kanban_task is None
+        assert result.terminal_cwd == "/workspace/engineer"
+
+    def test_hermes_profile_set_for_trusted_home_profile(self, tmp_path, monkeypatch):
+        """When HERMES_HOME already points to a profile dir, HERMES_PROFILE must
+        be updated to match, not left stale."""
+        hermes_root = tmp_path / ".hermes"
+        coder_home = hermes_root / "profiles" / "coder"
+        coder_home.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(coder_home))
+        monkeypatch.setenv("HERMES_PROFILE", "stale-parent")
+        monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") == str(coder_home)
+        assert os.environ.get("HERMES_PROFILE") == "coder"
 

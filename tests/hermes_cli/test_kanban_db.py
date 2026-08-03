@@ -1049,7 +1049,12 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
         # Inside cooldown → defer with the rate-limit-specific reason.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
-        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        decision = kb.evaluate_respawn_guard(conn, tid)
+        assert decision.reason == "rate_limit_cooldown"
+        assert decision.detail == {
+            "expires_at": now + 300,
+            "window_seconds": 300,
+        }
 
         # Past cooldown → allowed (None), NOT trapped by blocker_auth even
         # though last_failure_error contains "rate-limited".
@@ -1961,8 +1966,12 @@ def test_respawn_guard_recent_success(kanban_home):
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, now - 120, now - 60),
         )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason == "recent_success"
+        decision = kb.evaluate_respawn_guard(conn, t)
+    assert decision.reason == "recent_success"
+    assert decision.detail == {
+        "expires_at": now - 60 + kb._RESPAWN_GUARD_SUCCESS_WINDOW,
+        "window_seconds": kb._RESPAWN_GUARD_SUCCESS_WINDOW,
+    }
 
 
 def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
@@ -2056,7 +2065,9 @@ def _requeue_after_completed_work_product(
         )
 
 
-def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
+def test_dispatch_respawns_card_with_cross_repo_pr_cite_owned_by_another_card(
+    kanban_home, all_assignees_spawnable
+):
     """The live repro: a companion PR quoted in a comment must not freeze us.
 
     ``t_45e612bd`` (engine work) sat Ready for hours because an unrelated
@@ -2075,7 +2086,18 @@ def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
             "card's bounded resolver; please coordinate land order.",
         )
 
-        assert kb.check_respawn_guard(conn, cited) is None
+        decision = kb.evaluate_respawn_guard(conn, cited)
+        assert decision.reason is None
+        assert decision.detail is not None
+        assert decision.detail["ignored_pr_urls"] == [
+            {"pr_url": _COMPANION_PR, "declared_by": owner}
+        ]
+
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        assert cited in {
+            task_id for task_id, _assignee, _workspace in dispatch.spawned
+        }
+        assert (cited, "active_pr") not in dispatch.respawn_guarded
         # Custody is not laundered away — the PR is still attributed to the
         # card whose own work product opened it, and only to that card.
         declared_by = [
@@ -2089,7 +2111,9 @@ def test_respawn_guard_ignores_cross_repo_pr_owned_by_another_card(kanban_home):
         assert declared_by == [owner]
 
 
-def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
+def test_dispatch_suppresses_self_authored_active_pr_custody(
+    kanban_home, all_assignees_spawnable
+):
     """The card's OWN worker announcing its own PR is custody, not a citation.
 
     This is the over-freeing case, and it is the common one. Replayed against
@@ -2112,6 +2136,11 @@ def test_respawn_guard_keeps_active_pr_for_self_authored_comment(kanban_home):
         )
 
         assert kb.check_respawn_guard(conn, author_card) == "active_pr"
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        assert (author_card, "active_pr") in dispatch.respawn_guarded
+        assert author_card not in {
+            task_id for task_id, _assignee, _workspace in dispatch.spawned
+        }
         # Both cards legitimately hold the PR; neither disowns the other.
         _requeue_after_completed_work_product(conn, reviewer)
         assert kb.check_respawn_guard(conn, reviewer) == "active_pr"
@@ -2214,6 +2243,12 @@ def test_respawn_guard_work_product_only_custody_blocks_dispatch_and_direct_clai
             spawn_fn=lambda task, _workspace: spawned.append(task.id),
         )
         assert (task_id, "active_pr") in dispatch.respawn_guarded
+        diagnostic = dispatch.respawn_guard_details[-1]
+        assert diagnostic["task_id"] == task_id
+        assert diagnostic["reason"] == "active_pr"
+        assert diagnostic["pr_url"] == _OWN_PR
+        assert diagnostic["expires_at"] == decision.detail["expires_at"]
+        assert diagnostic["phase"] == "ready"
         after_dispatch = kb.get_task(conn, task_id)
         assert after_dispatch is not None
         assert after_dispatch.status == "ready"
@@ -2372,6 +2407,82 @@ def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):
     assert payload["window_seconds"] == kb._RESPAWN_GUARD_PR_WINDOW
 
 
+def test_active_pr_diagnostics_keep_each_pr_paired_with_its_own_expiry(
+    kanban_home, monkeypatch
+):
+    """Unequal PR leases must never render one PR beside another PR's expiry."""
+    pr_a = "https://github.com/o269/hermes-agent/pull/20"
+    pr_b = "https://github.com/o269/hermes-agent/pull/21"
+    seen_a = 10_000_000
+    seen_b = seen_a + 100
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="two active PRs", assignee="worker")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_a)
+        comment_a = kb.add_comment(conn, task_id, "worker", f"Opened {pr_a}")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_b)
+        comment_b = kb.add_comment(conn, task_id, "worker", f"Opened {pr_b}")
+        monkeypatch.setattr(kb.time, "time", lambda: seen_b + 1)
+
+        decision = kb.evaluate_respawn_guard(conn, task_id)
+
+    assert decision.reason == "active_pr"
+    assert decision.detail is not None
+    assert decision.detail["pr_url"] == pr_a
+    assert decision.detail["expires_at"] == (
+        seen_a + kb._RESPAWN_GUARD_PR_WINDOW
+    )
+    assert decision.detail["pr_details"] == [
+        {
+            "pr_url": pr_a,
+            "ownership": "declared",
+            "source_comment_id": comment_a,
+            "last_seen_at": seen_a,
+            "expires_at": seen_a + kb._RESPAWN_GUARD_PR_WINDOW,
+        },
+        {
+            "pr_url": pr_b,
+            "ownership": "declared",
+            "source_comment_id": comment_b,
+            "last_seen_at": seen_b,
+            "expires_at": seen_b + kb._RESPAWN_GUARD_PR_WINDOW,
+        },
+    ]
+
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        task_id,
+        "active_pr",
+        detail=decision.detail,
+        phase="ready",
+    )
+    assert result.respawn_guard_log_lines() == [
+        f"SKIP {task_id} respawn_guarded=active_pr "
+        f"pr={pr_a} expires={seen_a + kb._RESPAWN_GUARD_PR_WINDOW} "
+        f"pr={pr_b} expires={seen_b + kb._RESPAWN_GUARD_PR_WINDOW} phase=ready"
+    ]
+
+
+def test_respawn_guard_log_corrupt_per_pr_payload_falls_back_to_legacy_fields():
+    """A malformed optional per-PR payload cannot erase known diagnostics."""
+    result = kb.DispatchResult()
+    result.add_respawn_guard(
+        "t_owned",
+        "active_pr",
+        detail={
+            "pr_url": _OWN_PR,
+            "expires_at": 1785660000,
+            "pr_details": [None, "corrupt", {"expires_at": 1785660300}],
+        },
+        phase="ready",
+    )
+
+    assert result.respawn_guard_log_lines() == [
+        "SKIP t_owned respawn_guarded=active_pr "
+        f"pr={_OWN_PR} expires=1785660000 phase=ready"
+    ]
+
+
 def test_disowned_pr_mention_is_audited_not_silent(kanban_home):
     """Letting a citation through is recorded too — silence hid the old bug."""
     with kb.connect() as conn:
@@ -2528,6 +2639,39 @@ def test_dispatch_never_supersedes_its_evaluated_authorization(
             "phase": "claim_race",
             "reason": "authorization_revoked",
         }
+
+
+def test_dispatch_claim_exception_preserves_active_pr_identity_and_expiry(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A claim-time authorization race retains the evaluated PR diagnosis."""
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    canonical_url = kb.parse_continuation_pr_tuple(pr_tuple).canonical_url
+
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+
+        def expire_before_claim(_connection, _task_id, **_kwargs):
+            raise kb.ContinuationAuthorizationError("authorization_expired")
+
+        monkeypatch.setattr(kb, "claim_task", expire_before_claim)
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: None)
+
+    assert result.spawned == []
+    assert result.respawn_guarded == [(task_id, "active_pr")]
+    diagnostic = result.respawn_guard_details[-1]
+    assert diagnostic["pr_url"] == canonical_url
+    assert diagnostic["pr_details"][0]["pr_url"] == canonical_url
+    assert diagnostic["pr_details"][0]["expires_at"] is not None
+    assert diagnostic["continuation_authorization_id"] == authorization.id
+    assert diagnostic["continuation_denial"] == "authorization_expired"
+    assert diagnostic["phase"] == "claim_exception"
+    rendered = result.respawn_guard_log_lines()[0]
+    assert f"pr={canonical_url}" in rendered
+    assert "expires=" in rendered
+    assert "phase=claim_exception" in rendered
+    assert "denial=authorization_expired" in rendered
 
 
 def test_post_claim_guard_audits_consumed_continuation_without_spawn(

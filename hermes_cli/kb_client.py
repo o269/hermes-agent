@@ -142,11 +142,13 @@ class Client:
     # mutations
     def create_task(self, *, title, assignee=None, status="running", body=None,
                     created_by=None, priority=0, workspace_kind="scratch",
-                    id=None, op_id=None):
+                    reasoning_effort=None, id=None, op_id=None):
         return self._request("create_task", {
             "title": title, "assignee": assignee, "status": status, "body": body,
             "created_by": created_by, "priority": priority,
-            "workspace_kind": workspace_kind, "id": id}, mutation=True,
+            "workspace_kind": workspace_kind,
+            "reasoning_effort": reasoning_effort,
+            "id": id}, mutation=True,
             op_id=op_id)["result"]
 
     def add_comment(self, task_id, author, body, *, op_id=None):

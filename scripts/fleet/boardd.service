@@ -1,0 +1,62 @@
+[Unit]
+Description=Hermes Kanban single-writer broker
+Documentation=https://github.com/o269/hermes-agent/blob/main/docs/operations/boardd-runtime.md
+After=local-fs.target
+ConditionFileIsExecutable=/opt/hermes-boardd/current/venv/bin/python
+ConditionPathIsReadWrite=/var/lib/boardd/fleet
+
+[Service]
+Type=notify
+User=boardd
+Group=boardd
+WorkingDirectory=/var/lib/boardd
+Environment=HERMES_HOME=/var/lib/boardd
+Environment=HERMES_KANBAN_BROKER=0
+Environment=HERMES_KANBAN_DB=/var/lib/boardd/fleet/kanban.db
+Environment=BOARDD_SOCK=/run/boardd/boardd.sock
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/test -r /opt/hermes-boardd/current/libexec/boardd.py
+ExecStart=/opt/hermes-boardd/current/venv/bin/python /opt/hermes-boardd/current/libexec/boardd.py --db /var/lib/boardd/fleet/kanban.db --sock /run/boardd/boardd.sock --import-schema --log-level INFO
+Restart=always
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+WatchdogSec=30s
+NotifyAccess=main
+RuntimeDirectory=boardd
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=boardd
+StateDirectoryMode=0700
+UMask=0077
+
+# boardd has no need for any home directory. Runtime is immutable under /opt;
+# only the broker DB/state and its runtime socket are writable.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/boardd/fleet /run/boardd
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
