@@ -432,6 +432,13 @@ class Broker:
         self._server: "BrokerServer | None" = None
         self._maintenance_lock = threading.Lock()
         self._write_canary_lock = threading.Lock()
+        # Shutdown must never run BaseServer.shutdown() on the serve thread
+        # (signal handlers fire there). Coordinator + idempotency gates below.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = threading.Event()
+        self._shutdown_coord_lock = threading.Lock()
+        self._shutdown_coord_started = False
+        self._shutdown_coord_thread: threading.Thread | None = None
         # health / stats
         self._started_at = _now()
         self._last_commit_ts = 0
@@ -1745,29 +1752,81 @@ class Broker:
         assert self._server is not None
         self._server.serve_forever(poll_interval=0.5)
 
-    def shutdown(self, *_a) -> None:
-        _log.info("boardd: shutdown requested")
-        self._stop.set()
-        if self._write_canary_thread_obj is not None:
-            self._write_canary_thread_obj.join(
-                timeout=max(1.0, self._write_canary_timeout_s + 1.0)
+    def _signal_shutdown(self, signum=None, frame=None) -> None:
+        """SIGTERM/SIGINT entry: start teardown on a dedicated coordinator thread.
+
+        ``socketserver.BaseServer.shutdown()`` must be invoked from a thread
+        other than the one blocked in ``serve_forever()``. Python delivers
+        signals on the main thread, which is also the serve thread, so calling
+        ``shutdown()`` directly from the handler deadlocks before canary join,
+        DB-thread close, or socket unlink. Spawn once; body is idempotent.
+        """
+        with self._shutdown_coord_lock:
+            if self._shutdown_coord_started:
+                return
+            self._shutdown_coord_started = True
+            self._shutdown_coord_thread = threading.Thread(
+                target=self.shutdown,
+                name="boardd-shutdown-coord",
+                daemon=True,
             )
-            if self._write_canary_thread_obj.is_alive():
-                _log.error(
-                    "boardd: write canary did not stop within %.1fs; "
-                    "continuing shutdown",
-                    self._write_canary_timeout_s + 1.0,
-                )
-        if self._server is not None:
-            self._server.shutdown()
-        self.q.put(_STOP)
-        if self._db_thread_obj is not None:
-            self._db_thread_obj.join(timeout=10)
+            self._shutdown_coord_thread.start()
+
+    def shutdown(self, *_a) -> None:
+        """Idempotent ordered teardown: canary join -> server stop -> DB close -> unlink.
+
+        Safe to call from the signal coordinator, from ``main()``'s ``finally``,
+        or directly from unit tests. Concurrent/serial callers either perform
+        the body once or wait for the in-flight teardown to finish.
+        """
+        if not self._shutdown_lock.acquire(blocking=False):
+            # Another thread owns teardown; wait for ordered completion.
+            # Bound wait so a wedged peer cannot hang a second caller forever.
+            self._shutdown_done.wait(
+                timeout=max(15.0, self._write_canary_timeout_s + 12.0)
+            )
+            return
         try:
-            if os.path.exists(self.sock_path):
-                os.unlink(self.sock_path)
-        except OSError:
-            pass
+            if self._shutdown_done.is_set():
+                return
+            _log.info("boardd: shutdown requested")
+            self._stop.set()
+            self._sd_notify("STOPPING=1")
+            if self._write_canary_thread_obj is not None:
+                self._write_canary_thread_obj.join(
+                    timeout=max(1.0, self._write_canary_timeout_s + 1.0)
+                )
+                if self._write_canary_thread_obj.is_alive():
+                    _log.error(
+                        "boardd: write canary did not stop within %.1fs; "
+                        "continuing shutdown",
+                        self._write_canary_timeout_s + 1.0,
+                    )
+                else:
+                    _log.info("boardd: write canary stopped")
+            if self._server is not None:
+                # Must run off the serve_forever thread (see _signal_shutdown).
+                self._server.shutdown()
+                _log.info("boardd: server stopped")
+            self.q.put(_STOP)
+            if self._db_thread_obj is not None:
+                self._db_thread_obj.join(timeout=10)
+                if self._db_thread_obj.is_alive():
+                    _log.error(
+                        "boardd: DB thread did not stop within 10s; "
+                        "continuing socket unlink"
+                    )
+                else:
+                    _log.info("boardd: DB thread stopped")
+            try:
+                if os.path.exists(self.sock_path):
+                    os.unlink(self.sock_path)
+                    _log.info("boardd: socket unlinked")
+            except OSError as exc:
+                _log.warning("boardd: socket unlink failed: %s", exc)
+        finally:
+            self._shutdown_done.set()
+            self._shutdown_lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -2133,14 +2192,24 @@ def main(argv=None) -> int:
         write_canary_alert_repeat_s=args.write_canary_alert_repeat,
     )
 
-    signal.signal(signal.SIGTERM, broker.shutdown)
-    signal.signal(signal.SIGINT, broker.shutdown)
+    # Signal handlers only kick a coordinator thread; they must not call
+    # BaseServer.shutdown() on the main/serve thread (deadlock).
+    signal.signal(signal.SIGTERM, broker._signal_shutdown)
+    signal.signal(signal.SIGINT, broker._signal_shutdown)
 
     broker.start()
     try:
         broker.serve_forever()
     finally:
+        # Idempotent: no-op wait if the signal coordinator already tore down.
         broker.shutdown()
+        coord = broker._shutdown_coord_thread
+        if (
+            coord is not None
+            and coord is not threading.current_thread()
+            and coord.is_alive()
+        ):
+            coord.join(timeout=max(15.0, broker._write_canary_timeout_s + 12.0))
     return 0
 
 

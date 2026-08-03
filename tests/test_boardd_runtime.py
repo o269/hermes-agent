@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -54,6 +55,7 @@ def running_boardd(
     import_schema: bool = False,
     write_canary_mode: str = "disabled",
     write_canary_start_delay: float = 0,
+    write_canary_interval: float = 300,
     write_canary_timeout: float = 5,
     env_overrides: dict[str, str] | None = None,
 ):
@@ -72,6 +74,8 @@ def running_boardd(
         write_canary_mode,
         "--write-canary-start-delay",
         str(write_canary_start_delay),
+        "--write-canary-interval",
+        str(write_canary_interval),
         "--write-canary-timeout",
         str(write_canary_timeout),
     ]
@@ -804,11 +808,16 @@ with kb.connect() as conn:
 
 
 def test_write_canary_detects_title_only_reserved_marker_collision(tmp_path: Path):
+    # Periodic short-interval mode (not once+wall-clock delay): insert the
+    # collision first, then wait for a post-insertion canary run. Avoids the
+    # race where once-mode fires healthy before the collision exists.
     with running_boardd(
         tmp_path,
         import_schema=True,
-        write_canary_mode="once",
-        write_canary_start_delay=1,
+        write_canary_mode="periodic",
+        write_canary_start_delay=0,
+        write_canary_interval=0.15,
+        write_canary_timeout=5,
     ) as (client, db_path, socket_path):
         collision = _run_kanban_db_script(
             db_path,
@@ -828,11 +837,22 @@ with kb.connect() as conn:
     print(json.dumps({{"id": task_id}}))
 """,
         )
+        runs_at_insert = client.ping()["write_canary"]["runs"]
         deadline = time.monotonic() + 10
         health = None
         while time.monotonic() < deadline:
             health = client.ping()
-            if health["write_canary"]["runs"] == 1:
+            alarm = health.get("write_canary_alarm") or {}
+            saw_post_insert_run = health["write_canary"]["runs"] > runs_at_insert
+            # Concurrent run that already observed the collision is also fine.
+            saw_collision = (
+                health["write_canary_ok"] is False
+                and alarm.get("kind") == "write-canary-identity-collision"
+                and alarm.get("task_id") == collision["id"]
+            )
+            if saw_collision and (
+                saw_post_insert_run or health["write_canary"]["runs"] >= 1
+            ):
                 break
             time.sleep(0.05)
 
@@ -965,3 +985,142 @@ def test_shutdown_waits_for_canary_before_stopping_server(tmp_path: Path):
     broker.shutdown()
 
     assert order == ["canary-started", "canary-finished", "server-stopped"]
+
+
+def test_shutdown_is_idempotent_across_repeated_calls(tmp_path: Path):
+    broker = _unit_broker(tmp_path)
+    stops: list[str] = []
+
+    class _Server:
+        def shutdown(self) -> None:
+            stops.append("server-stopped")
+
+    broker._server = _Server()
+    broker.shutdown()
+    broker.shutdown()
+    assert stops == ["server-stopped"]
+    assert broker._shutdown_done.is_set()
+
+
+def test_signal_shutdown_uses_coordinator_thread_not_serve_thread(tmp_path: Path):
+    """Signal path must not invoke BaseServer.shutdown on the calling thread."""
+    broker = _unit_broker(tmp_path)
+    caller_ids: list[int] = []
+    done = threading.Event()
+
+    class _Server:
+        def shutdown(self) -> None:
+            caller_ids.append(threading.get_ident())
+            done.set()
+
+    broker._server = _Server()
+    main_ident = threading.get_ident()
+    first_coord = None
+    broker._signal_shutdown(signal.SIGTERM, None)
+    first_coord = broker._shutdown_coord_thread
+
+    assert done.wait(timeout=5), "coordinator did not stop server"
+    assert broker._shutdown_done.wait(timeout=5)
+    assert first_coord is not None
+    assert caller_ids == [first_coord.ident]
+    assert caller_ids[0] != main_ident
+    # Second signal is a no-op (single coordinator).
+    broker._signal_shutdown(signal.SIGTERM, None)
+    assert broker._shutdown_coord_thread is first_coord
+
+
+def test_sigterm_subprocess_completes_ordered_teardown_without_sigkill(
+    tmp_path: Path,
+):
+    """Real process: SIGTERM must finish canary->server->DB->unlink without SIGKILL."""
+    db_path = tmp_path / "kanban.db"
+    sock_path = tmp_path / "boardd.sock"
+    command = [
+        sys.executable,
+        str(BOARDD),
+        "--db",
+        str(db_path),
+        "--sock",
+        str(sock_path),
+        "--import-schema",
+        "--log-level",
+        "INFO",
+        "--write-canary-mode",
+        "once",
+        "--write-canary-start-delay",
+        "30",
+        "--write-canary-timeout",
+        "2",
+    ]
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "HERMES_KANBAN_BROKER": "0",
+            "KB_CLIENT_RETRY_DEADLINE_S": "2",
+            "BOARDD_DISKGUARD_MIN_FREE_BYTES": "0",
+            "PYTHONPATH": str(REPO_ROOT),
+        }
+    )
+    proc = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        client: Client | None = None
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                raise AssertionError(
+                    f"boardd exited during startup (rc={proc.returncode})\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+            if sock_path.exists():
+                probe = Client(str(sock_path))
+                try:
+                    probe.ping()
+                except Exception:
+                    probe.close()
+                else:
+                    client = probe
+                    break
+            time.sleep(0.05)
+        assert client is not None, "boardd did not become ready"
+        client.close()
+
+        # Deliver SIGTERM while serve_forever is on the main thread.
+        proc.send_signal(signal.SIGTERM)
+
+        # TimeoutStopSec is 45s in the unit; regression bound is far tighter.
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(
+                "SIGTERM_HUNG: boardd did not exit within 10s after SIGTERM; "
+                "required SIGKILL\n"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+
+        assert proc.returncode is not None
+        # Clean coordinator path returns 0; never leave a hang that needs kill.
+        assert proc.returncode == 0, (
+            f"unexpected exit rc={proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+        assert not sock_path.exists(), "socket should be unlinked on SIGTERM teardown"
+        # Ordered completion markers from the coordinator body.
+        assert "boardd: shutdown requested" in stderr
+        assert "boardd: write canary stopped" in stderr
+        assert "boardd: server stopped" in stderr
+        assert "boardd: DB thread stopped" in stderr
+        assert "boardd: socket unlinked" in stderr
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)

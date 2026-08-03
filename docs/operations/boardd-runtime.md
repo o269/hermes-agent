@@ -160,6 +160,15 @@ only for a bounded maintenance exception. `once` is for a disposable staging
 broker or automated test; it retries a brief backup/manual overlap until one
 actual probe runs. Production stays `periodic`.
 
+### Stop / SIGTERM contract
+
+`TimeoutStopSec=45s` leaves headroom for a draining canary (`BOARDD_WRITE_CANARY_TIMEOUT_S`
+default 20s) before socket and DB teardown. SIGTERM/SIGINT start an ordered
+shutdown on a dedicated coordinator thread so `BaseServer.shutdown()` never runs
+on the main `serve_forever` thread (which would deadlock). Shutdown is
+idempotent and always runs: canary join → server stop → DB-thread close → socket
+unlink, then the process exits 0 without requiring SIGKILL.
+
 ## Rollback
 
 If the new executable cannot become healthy, do not open the DB directly and do
