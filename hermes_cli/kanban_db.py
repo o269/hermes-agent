@@ -6773,15 +6773,16 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo` or `blocked` task to its dispatch lane.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
     state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    assignee or claim state. Review-origin tasks return to ``review``;
+    author-origin tasks become ``ready``. Returns ``(True, None)`` on
+    success and ``(False, reason)`` if refused. ``dry_run=True`` validates
+    the promotion would succeed without mutating state.
     """
     row = conn.execute(
         "SELECT title, body, assignee, status, dispatch_origin "
@@ -6815,11 +6816,7 @@ def promote_task(
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
 
-    new_status = (
-        "review"
-        if cur_status == "blocked" and row["dispatch_origin"] == "review"
-        else "ready"
-    )
+    new_status = "review" if row["dispatch_origin"] == "review" else "ready"
     assignment_denial = _assignment_guard_reason(
         conn,
         title=row["title"],

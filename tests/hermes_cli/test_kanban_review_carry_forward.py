@@ -408,6 +408,72 @@ def test_review_dependency_wait_recovers_to_review_lane(
 
 
 @pytest.mark.parametrize(
+    ("block_kind", "waiting_status"),
+    [
+        ("dependency", "todo"),
+        ("needs_input", "blocked"),
+    ],
+)
+def test_manual_promote_preserves_review_origin(
+    isolated_board: Path,
+    block_kind: str,
+    waiting_status: str,
+) -> None:
+    """Manual promotion must return review-origin waits to the review lane."""
+    with kb.connect() as conn:
+        task_id, review_run = _claim_review(conn)
+        parent = None
+        if block_kind == "dependency":
+            parent = kb.create_task(
+                conn,
+                title="manual promotion dependency",
+                assignee="default",
+            )
+            kb.link_tasks(conn, parent_id=parent, child_id=task_id)
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason=f"manual {block_kind} wait",
+            kind=block_kind,
+            expected_run_id=review_run.id,
+        )
+        waiting = kb.get_task(conn, task_id)
+        assert waiting is not None
+        assert waiting.status == waiting_status
+        assert waiting.dispatch_origin == "review"
+
+        if parent is not None:
+            # Preserve the todo state while satisfying the dependency so this
+            # test exercises manual promotion rather than recompute_ready.
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+
+        promoted, error = kb.promote_task(
+            conn,
+            task_id,
+            actor="operator",
+            reason="review retry approved",
+        )
+        assert promoted is True
+        assert error is None
+
+        promoted_task = kb.get_task(conn, task_id)
+        assert promoted_task is not None
+        assert promoted_task.status == "review"
+        assert promoted_task.dispatch_origin == "review"
+        assert kb.claim_task(conn, task_id, claimer="test-host:author") is None
+
+        review_retry = kb.claim_review_task(
+            conn,
+            task_id,
+            claimer="test-host:reviewer",
+        )
+        assert review_retry is not None
+        assert review_retry.status == "running"
+        assert review_retry.dispatch_origin == "review"
+
+
+@pytest.mark.parametrize(
     ("transition", "expected_status", "expected_outcome"),
     [
         ("complete", "done", "completed"),
