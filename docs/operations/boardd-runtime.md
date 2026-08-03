@@ -65,6 +65,101 @@ release executable by its full staging path.
 `reasoning_effort` column is nullable, so legacy tasks retain profile-default
 thinking behavior. Invalid levels fail closed.
 
+## Functional write canary
+
+`boardd` owns a broker-loopback functional probe. It connects to the Unix socket
+with `kb_client.Client`, opens a `boardd_shim.BrokerConnection`, and calls the
+canonical `kanban_db.create_task` and `kanban_db.archive_task` operations. It does
+not open SQLite directly and does not use the lightweight native `create_task`
+handler. A healthy run performs four broker-visible checks:
+
+1. reconcile any active card with the complete reserved marker set;
+2. create a blocked, unassigned disposable card and verify the create receipt;
+3. archive it in a separate transaction; and
+4. read it back and verify the terminal `archived` state.
+
+Canary cards use `created_by=__hermes_boardd_write_canary_v1__`, an idempotency
+key in the same reserved namespace, and matching title/body markers. Cleanup
+requires every marker to agree and uses a case-sensitive literal key prefix.
+Discovery treats any individual reserved creator, key prefix, title prefix, or
+body marker as a namespace claim; a partial-marker row therefore fails loudly
+rather than escaping reconciliation or being mistaken for an owned canary.
+The archive UPDATE carries all expected identity fields as an atomic guard; a
+card changed after discovery is never archived. A partial namespace match fails
+loudly as an identity collision and is not reported as an orphan. Canary archive
+also suppresses the normal global dependency recompute because reserved cards
+cannot have links, so the probe does not perturb normal queues. Blocked canary
+cards cannot enter dispatch and archived cards are hidden from normal lists.
+
+The service defaults are:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `BOARDD_WRITE_CANARY_MODE` | `periodic` | `disabled`, `periodic`, or staging/test-only `once` |
+| `BOARDD_WRITE_CANARY_START_DELAY_S` | `90` | Initial offset from startup and the 900s backup boundary |
+| `BOARDD_WRITE_CANARY_INTERVAL_S` | `300` | Periodic cadence |
+| `BOARDD_WRITE_CANARY_TIMEOUT_S` | `20` | Absolute client lifetime for one complete probe |
+| `BOARDD_WRITE_CANARY_ALERT_REPEAT_S` | `3600` | Minimum repeat interval for an unchanged failure |
+
+Enable, disable, or select `once` only through the staged unit or a systemd
+drop-in that overrides `BOARDD_WRITE_CANARY_MODE`; Fable then performs the same
+single `daemon-reload` + restart sequence described above. Remove the override
+to restore the production `periodic` default. There is no live toggle and no
+database change involved.
+
+Backup and canary share an in-process maintenance lock; a canary due during a
+backup is suppressed and counted rather than overlapped. Normal writes remain
+serialized by the broker queue. The canary does not change the 2s interactive
+transaction cap or add filesystem, subprocess, external-network, or sleep work
+to transaction bodies. The only transport while a transaction is open is the
+existing local broker-protocol round trip required by every `BrokerConnection`.
+
+### Health and alert interpretation
+
+Inspect the broker, not the database:
+
+```bash
+sudo -u boardd env \
+  BOARDD_SOCK=/run/boardd/boardd.sock \
+  /opt/hermes-boardd/current/venv/bin/python -m hermes_cli.kb_client ping
+journalctl -u boardd.service -g 'WRITE CANARY' --since -2h
+sudo tail -n 20 /var/lib/boardd/fleet/boardd-HEALTH-ALERT
+```
+
+`write_canary_ok=false`, `health_ok=false`, and a non-null
+`write_canary_alarm` mean the real create/archive path failed. The alarm includes
+`kind`, `phase`, normalized `error_code`, `error_type`, `task_id`,
+`orphan_task_ids`, cleanup diagnostics, and a stable fingerprint. Raw OS and
+retry text is diagnostic only and is excluded from fingerprint identity, so
+transport jitter cannot create alert storms. Unknown-column failures are
+classified as `schema-drift`; transaction deadlines as `write-canary-timeout`;
+create receipt, archive, and terminal-state mismatches retain their precise
+phase. Identical failures update the in-memory count every run but write at most
+one repeat event per repeat interval. A changed fingerprint emits an immediate transition, and a
+successful full run emits an immediate recovery. No transition or recovery is
+suppressed by the repeat limiter. Emitted alarm state includes its first/last and
+last-emitted timestamps; boardd restores the latest unresolved write-canary alarm
+from the alert journal at startup, so a process restart neither resets the repeat
+window nor suppresses the eventual recovery notice.
+
+An archive failure always reports the affected task id. The next run searches
+for active full-marker canaries first and archives them before creating a new
+probe. Inspect suspected orphans through boardd:
+
+```bash
+sudo -u boardd env \
+  BOARDD_SOCK=/run/boardd/boardd.sock \
+  /opt/hermes-boardd/current/venv/bin/python -m hermes_cli.kb_client query \
+  "SELECT id,title,status,created_at FROM tasks WHERE status!='archived' AND created_by='__hermes_boardd_write_canary_v1__' ORDER BY created_at"
+```
+
+If a full-marker orphan remains after broker recovery, Fable may archive the
+reported id with `hermes kanban --board fleet archive <task-id>`. Never repair it
+with direct SQLite. `disabled` is an explicit loss of functional coverage and is
+only for a bounded maintenance exception. `once` is for a disposable staging
+broker or automated test; it retries a brief backup/manual overlap until one
+actual probe runs. Production stays `periodic`.
+
 ## Rollback
 
 If the new executable cannot become healthy, do not open the DB directly and do
