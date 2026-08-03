@@ -3,9 +3,11 @@ from __future__ import annotations
 from contextlib import contextmanager
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -32,6 +34,7 @@ kb_client = _load_repo_module(
 )
 BoarddError = kb_client.BoarddError
 Client = kb_client.Client
+boardd_runtime = _load_repo_module("boardd_runtime_daemon", BOARDD)
 
 
 def _repo_schema_sql() -> str:
@@ -223,6 +226,154 @@ def test_import_schema_adds_reasoning_effort_to_legacy_board(tmp_path: Path):
             reasoning_effort="medium",
         )["id"]
         assert client.get_task(task_id)["reasoning_effort"] == "medium"
+
+
+def test_schema_drift_check_reports_healthy_task_column_parity(tmp_path: Path):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_repo_schema_sql())
+    broker = boardd_runtime.Broker(
+        str(tmp_path / "kanban.db"),
+        str(tmp_path / "boardd.sock"),
+        import_schema=True,
+    )
+    broker.conn = conn
+    try:
+        result = broker._check_task_schema_drift()
+    finally:
+        conn.close()
+
+    assert result["status"] == "ok"
+    assert result["expected_column_count"] == result["live_column_count"]
+    assert broker._schema_drift_alarm is None
+    assert broker._schema_check_error is None
+
+
+def test_schema_drift_check_names_missing_expected_column(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    legacy_schema = _repo_schema_sql().replace(
+        "    reasoning_effort     TEXT,\n",
+        "",
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(legacy_schema)
+    broker = boardd_runtime.Broker(
+        str(tmp_path / "kanban.db"),
+        str(tmp_path / "boardd.sock"),
+        import_schema=True,
+    )
+    broker.conn = conn
+    caplog.set_level(logging.ERROR, logger="boardd")
+    try:
+        result = broker._check_task_schema_drift()
+    finally:
+        conn.close()
+
+    assert result["status"] == "drift"
+    assert result["missing_columns"] == ["reasoning_effort"]
+    assert broker._schema_drift_alarm["missing_columns"] == ["reasoning_effort"]
+    assert '"kind": "missing_task_columns"' in caplog.text
+    assert '"missing_columns": ["reasoning_effort"]' in caplog.text
+
+
+def test_boardd_startup_invokes_schema_drift_check(tmp_path: Path):
+    legacy_schema = _repo_schema_sql().replace(
+        "    reasoning_effort     TEXT,\n",
+        "",
+    )
+    schema_file = tmp_path / "legacy-schema.sql"
+    schema_file.write_text(legacy_schema, encoding="utf-8")
+
+    with running_boardd(tmp_path, schema_file=schema_file) as (client, _, _):
+        health = client.ping()
+        assert health["schema_checks"] >= 1
+        assert health["last_schema_check_ts"] > 0
+        assert health["schema_drift_alarm"]["missing_columns"] == [
+            "reasoning_effort"
+        ]
+        assert health["schema_check_error"] is None
+
+
+def test_periodic_schema_drift_check_dedupes_unchanged_alert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    legacy_schema = _repo_schema_sql().replace(
+        "    reasoning_effort     TEXT,\n",
+        "",
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(legacy_schema)
+    broker = boardd_runtime.Broker(
+        str(tmp_path / "kanban.db"),
+        str(tmp_path / "boardd.sock"),
+        import_schema=True,
+    )
+    broker.conn = conn
+
+    class StopAfterTwoChecks:
+        calls = 0
+
+        def wait(self, _timeout: float) -> bool:
+            self.calls += 1
+            return self.calls > 2
+
+    broker._stop = StopAfterTwoChecks()
+
+    def call_immediately(req: dict, timeout: float):
+        del timeout
+        return broker._handle(req)
+
+    monkeypatch.setattr(broker, "call_sync", call_immediately)
+    caplog.set_level(logging.ERROR, logger="boardd")
+    try:
+        broker._schema_check_loop()
+    finally:
+        conn.close()
+
+    assert broker._schema_checks == 2
+    alerts = [
+        record
+        for record in caplog.records
+        if "SCHEMA DRIFT ALERT" in record.getMessage()
+    ]
+    assert len(alerts) == 1
+    assert '"missing_columns": ["reasoning_effort"]' in alerts[0].getMessage()
+
+
+def test_schema_drift_introspection_failure_is_safe_and_deduped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    class FailingConnection:
+        def execute(self, _sql: str):
+            raise sqlite3.OperationalError("read-only introspection failed")
+
+    broker = boardd_runtime.Broker(
+        str(tmp_path / "kanban.db"),
+        str(tmp_path / "boardd.sock"),
+        import_schema=True,
+    )
+    broker.conn = FailingConnection()
+    caplog.set_level(logging.WARNING, logger="boardd")
+
+    first = broker._check_task_schema_drift()
+    second = broker._check_task_schema_drift()
+
+    assert first["status"] == "error"
+    assert second["status"] == "error"
+    assert broker._schema_drift_alarm is None
+    assert broker._schema_check_error["stage"] == "live_schema"
+    warnings = [
+        record
+        for record in caplog.records
+        if "SCHEMA DRIFT CHECK WARNING" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert '"kind": "introspection_error"' in warnings[0].getMessage()
 
 
 def test_service_unit_and_reasoning_tool_schema_are_runtime_valid():

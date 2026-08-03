@@ -120,6 +120,11 @@ DISKGUARD_INTERVAL_S = float(os.environ.get("BOARDD_DISKGUARD_INTERVAL_S", "30")
 DISKGUARD_MIN_FREE_BYTES = int(
     os.environ.get("BOARDD_DISKGUARD_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024))
 )
+# Source-vs-live task-column parity parses the installed schema once in memory,
+# then runs one live PRAGMA per check. It still belongs on a coarse bounded
+# cadence rather than every request. Keep this internal: it is operational
+# correctness, not a user-facing tuning knob.
+SCHEMA_CHECK_INTERVAL_S = 300.0
 # How long a client request may sit in the queue before we give up (safety).
 HANDLER_TIMEOUT_S = float(os.environ.get("BOARDD_HANDLER_TIMEOUT_S", "30"))
 # Retain applied_ops long enough that no in-flight client retry can miss its
@@ -202,6 +207,28 @@ def _is_disk_full(exc) -> bool:
 
 class DiskGuardError(RuntimeError):
     pass
+
+
+def _task_columns_from_schema_sql(schema_sql: str) -> frozenset[str]:
+    """Return canonical ``tasks`` columns without touching the live board.
+
+    SQLite itself parses the installed ``kanban_db.SCHEMA_SQL`` into an
+    in-memory database. This avoids a second, hand-maintained column list (and
+    avoids brittle source-text parsing) while keeping source introspection
+    completely separate from the broker-selected live DB.
+    """
+    probe = sqlite3.connect(":memory:")
+    probe.row_factory = sqlite3.Row
+    try:
+        probe.executescript(schema_sql)
+        columns = frozenset(
+            row["name"] for row in probe.execute("PRAGMA table_info(tasks)")
+        )
+    finally:
+        probe.close()
+    if not columns:
+        raise RuntimeError("installed kanban schema does not define tasks columns")
+    return columns
 
 
 class _Holder:
@@ -309,6 +336,16 @@ class Broker:
         self._txns = 0
         self._txn_capped = 0          # count of txns rolled back by the absolute cap
         self._integrity_alarm = None  # set to the failing check result on integrity fail
+        # Read-only source-vs-live schema drift state. The tuple signature
+        # dedupes unchanged drift; a successful parity check resets it so a
+        # future recurrence alerts again.
+        self._schema_drift_signature = None
+        self._schema_drift_alarm = None
+        self._schema_check_error_signature = None
+        self._schema_check_error = None
+        self._schema_checks = 0
+        self._last_schema_check_ts = 0
+        self._expected_task_columns_cache = None
 
     # ---- schema / connection (RUNS ONLY IN THE DB THREAD) ------------------ #
     def _load_schema_sql(self) -> str:
@@ -322,6 +359,122 @@ class Broker:
         raise RuntimeError(
             "no schema source: pass --schema-sql-file or --import-schema"
         )
+
+    def _load_expected_task_columns(self) -> frozenset[str]:
+        """Load task columns expected by the installed kanban create/update path."""
+        if self._expected_task_columns_cache is None:
+            import hermes_cli.kanban_db as k  # noqa: WPS433
+            self._expected_task_columns_cache = _task_columns_from_schema_sql(
+                k.SCHEMA_SQL
+            )
+        return self._expected_task_columns_cache
+
+    def _check_task_schema_drift(self) -> dict:
+        """Read-only compare installed task columns with the broker-owned DB.
+
+        This method always runs on the DB thread. It never invokes migrations or
+        writes the schema: source columns come from an in-memory parse and live
+        columns come only from ``PRAGMA table_info(tasks)``. Introspection errors
+        are warning-only so a probe can never take a healthy broker down.
+        """
+        self._schema_checks += 1
+        self._last_schema_check_ts = _now()
+        stage = "installed_schema"
+        try:
+            expected = self._load_expected_task_columns()
+            stage = "live_schema"
+            conn = self.conn
+            if conn is None:
+                raise RuntimeError("broker connection is not open")
+            live = frozenset(
+                row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+            )
+        except Exception as exc:
+            signature = (stage, type(exc).__name__, str(exc))
+            payload = {
+                "event": "boardd_schema_drift_check",
+                "kind": "introspection_error",
+                "stage": stage,
+                "db": self.db_realpath,
+                "table": "tasks",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+                "ts": self._last_schema_check_ts,
+            }
+            if signature != self._schema_check_error_signature:
+                _log.warning(
+                    "boardd: SCHEMA DRIFT CHECK WARNING %s",
+                    json.dumps(payload, sort_keys=True),
+                )
+            self._schema_check_error_signature = signature
+            self._schema_check_error = payload
+            # Preserve any last-known drift alarm: a failed probe is not proof
+            # that previously observed drift disappeared.
+            return {"status": "error", **payload}
+
+        if self._schema_check_error is not None:
+            _log.info(
+                "boardd: SCHEMA DRIFT CHECK RECOVERED %s",
+                json.dumps(
+                    {
+                        "event": "boardd_schema_drift_check",
+                        "kind": "introspection_recovered",
+                        "db": self.db_realpath,
+                        "table": "tasks",
+                        "ts": self._last_schema_check_ts,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        self._schema_check_error_signature = None
+        self._schema_check_error = None
+
+        missing = tuple(sorted(expected - live))
+        if missing:
+            payload = {
+                "event": "boardd_schema_drift",
+                "kind": "missing_task_columns",
+                "db": self.db_realpath,
+                "table": "tasks",
+                "missing_columns": list(missing),
+                "expected_column_count": len(expected),
+                "live_column_count": len(live),
+                "ts": self._last_schema_check_ts,
+            }
+            if missing != self._schema_drift_signature:
+                _log.error(
+                    "boardd: SCHEMA DRIFT ALERT %s",
+                    json.dumps(payload, sort_keys=True),
+                )
+            self._schema_drift_signature = missing
+            self._schema_drift_alarm = payload
+            return {"status": "drift", **payload}
+
+        if self._schema_drift_signature:
+            _log.info(
+                "boardd: SCHEMA DRIFT CLEARED %s",
+                json.dumps(
+                    {
+                        "event": "boardd_schema_drift",
+                        "kind": "task_columns_recovered",
+                        "db": self.db_realpath,
+                        "table": "tasks",
+                        "ts": self._last_schema_check_ts,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        self._schema_drift_signature = ()
+        self._schema_drift_alarm = None
+        return {
+            "status": "ok",
+            "event": "boardd_schema_drift",
+            "kind": "task_columns_match",
+            "table": "tasks",
+            "expected_column_count": len(expected),
+            "live_column_count": len(live),
+            "ts": self._last_schema_check_ts,
+        }
 
     def _open_conn(self) -> sqlite3.Connection:
         """Open THE single connection. Called only from the DB thread, after any
@@ -405,6 +558,10 @@ class Broker:
             self._sd_notify("STOPPING=1")
             os._exit(75)
         _log.info("boardd: owning single connection to %s", self.db_realpath)
+        # Startup parity check runs before the DB thread accepts its first queued
+        # request, so a missing create/update column is named before create_task
+        # can fail. The probe is read-only and fail-safe by construction.
+        self._check_task_schema_drift()
         try:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
@@ -600,6 +757,8 @@ class Broker:
             return {"ok": True, "result": self._health()}
         if op == "stats":
             return {"ok": True, "result": self._health()}
+        if op == "_schema_check":
+            return {"ok": True, "result": self._check_task_schema_drift()}
         if op == "_stall" and os.environ.get("BOARDD_ALLOW_STALL") == "1":
             # TEST-ONLY (gated): occupy the DB thread to force a handler timeout,
             # so the BLOCKER-2 close-socket->client-resend->exactly-once path can
@@ -819,6 +978,10 @@ class Broker:
             "txn_capped": self._txn_capped,
             "txn_open": self._txn_token is not None,
             "integrity_alarm": self._integrity_alarm,
+            "schema_drift_alarm": self._schema_drift_alarm,
+            "schema_check_error": self._schema_check_error,
+            "schema_checks": self._schema_checks,
+            "last_schema_check_ts": self._last_schema_check_ts,
         }
 
     # ---- maintenance loops (enqueue onto the DB thread) ------------------- #
@@ -830,6 +993,17 @@ class Broker:
                     _log.warning("boardd: checkpoint timed out")
             except Exception as exc:
                 _log.warning("boardd: checkpoint failed: %s", exc)
+
+    def _schema_check_loop(self) -> None:
+        while not self._stop.wait(SCHEMA_CHECK_INTERVAL_S):
+            try:
+                r = self.call_sync({"op": "_schema_check"}, timeout=HANDLER_TIMEOUT_S)
+                if r is None:
+                    _log.warning("boardd: schema drift check timed out")
+            except Exception as exc:
+                # Scheduling/queue failures are also observational only. The DB
+                # thread's check has its own structured introspection warning.
+                _log.warning("boardd: schema drift check failed safely: %s", exc)
 
     def _backup_loop(self) -> None:
         import glob
@@ -956,6 +1130,8 @@ class Broker:
         threading.Thread(target=self._diskguard_loop, name="boardd-disk",
                          daemon=True).start()
         threading.Thread(target=self._checkpoint_loop, name="boardd-ckpt",
+                         daemon=True).start()
+        threading.Thread(target=self._schema_check_loop, name="boardd-schema",
                          daemon=True).start()
         threading.Thread(target=self._backup_loop, name="boardd-backup",
                          daemon=True).start()
