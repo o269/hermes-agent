@@ -2882,80 +2882,98 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'authority_revision cannot decrease');
         END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_insert
-        AFTER INSERT ON task_comments
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = NEW.task_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_update
-        AFTER UPDATE ON task_comments
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = OLD.task_id;
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = NEW.task_id AND NEW.task_id IS NOT OLD.task_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_delete
-        AFTER DELETE ON task_comments
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = OLD.task_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_insert
-        AFTER INSERT ON task_links
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = NEW.child_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_update
-        AFTER UPDATE ON task_links
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = OLD.child_id;
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = NEW.child_id AND NEW.child_id IS NOT OLD.child_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_delete
-        AFTER DELETE ON task_links
-        FOR EACH ROW
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id = OLD.child_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_parent_status_authority_revision
-        AFTER UPDATE OF status ON tasks
-        FOR EACH ROW
-        WHEN OLD.status IS NOT NEW.status
-        BEGIN
-            UPDATE tasks
-               SET authority_revision = authority_revision + 1
-             WHERE id IN (
-                 SELECT child_id FROM task_links WHERE parent_id = NEW.id
-             );
-        END;
         """
     )
+
+    authority_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    # Some migration unit fixtures intentionally contain only a legacy tasks
+    # table. Install evidence triggers only after their referenced table exists;
+    # a later full init/import reruns this idempotent migration and adds them.
+    if "task_comments" in authority_tables:
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_insert
+            AFTER INSERT ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.task_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_update
+            AFTER UPDATE ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.task_id;
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.task_id AND NEW.task_id IS NOT OLD.task_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_delete
+            AFTER DELETE ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.task_id;
+            END;
+            """
+        )
+    if "task_links" in authority_tables:
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_insert
+            AFTER INSERT ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_update
+            AFTER UPDATE ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.child_id;
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.child_id AND NEW.child_id IS NOT OLD.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_delete
+            AFTER DELETE ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_parent_status_authority_revision
+            AFTER UPDATE OF status ON tasks
+            FOR EACH ROW
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id IN (
+                     SELECT child_id FROM task_links WHERE parent_id = NEW.id
+                 );
+            END;
+            """
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
