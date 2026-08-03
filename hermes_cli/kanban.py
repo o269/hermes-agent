@@ -63,6 +63,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "authority_revision": t.authority_revision,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -449,6 +450,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+    p_assign.add_argument(
+        "--expected-authority-revision",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail closed unless the task authority revision still equals N",
+    )
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -477,6 +485,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reassign.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+    p_reassign.add_argument(
+        "--expected-authority-revision",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail closed unless the task authority revision still equals N",
     )
 
     # --- diagnostics (board-wide health) ---
@@ -609,6 +624,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
+    p_comment.add_argument(
+        "--expected-authority-revision",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail closed unless the task authority revision still equals N",
+    )
 
     p_gate = sub.add_parser(
         "gate",
@@ -716,6 +738,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+    p_unblock.add_argument(
+        "--expected-authority-revision",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Single-task CAS: fail closed unless authority revision equals N",
+    )
 
     p_promote = sub.add_parser(
         "promote",
@@ -748,6 +777,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="json",
         action="store_true",
         help="Emit machine-readable JSON result",
+    )
+    p_promote.add_argument(
+        "--expected-authority-revision",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Single-task CAS: fail closed unless authority revision equals N",
     )
 
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
@@ -1614,7 +1650,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "parents": parents,
             "children": children,
             "comments": [
-                {"author": c.author, "body": c.body, "created_at": c.created_at}
+                {
+                    "id": c.id,
+                    "author": c.author,
+                    "body": c.body,
+                    "created_at": c.created_at,
+                }
                 for c in comments
             ],
             "events": [
@@ -1760,7 +1801,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+        ok = kb.assign_task(
+            conn,
+            args.task_id,
+            profile,
+            expected_authority_revision=getattr(
+                args, "expected_authority_revision", None
+            ),
+        )
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -1791,6 +1839,9 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
+            expected_authority_revision=getattr(
+                args, "expected_authority_revision", None
+            ),
         )
     if not ok:
         print(
@@ -2088,7 +2139,15 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(
+            conn,
+            args.task_id,
+            author,
+            body,
+            expected_authority_revision=getattr(
+                args, "expected_authority_revision", None
+            ),
+        )
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -2388,13 +2447,31 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
+    expected_revision = getattr(args, "expected_authority_revision", None)
+    if expected_revision is not None and len(ids) != 1:
+        print(
+            "kanban: --expected-authority-revision requires exactly one task id",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_revision is not None and reason:
+        print(
+            "kanban: --expected-authority-revision cannot be combined with "
+            "--reason because the reason comment is a separate mutation",
+            file=sys.stderr,
+        )
+        return 2
     author = _profile_author() if reason else None
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(
+                conn,
+                tid,
+                expected_authority_revision=expected_revision,
+            ):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
@@ -2414,6 +2491,13 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         if tid not in seen:
             ids.append(tid)
             seen.add(tid)
+    expected_revision = getattr(args, "expected_authority_revision", None)
+    if expected_revision is not None and len(ids) != 1:
+        print(
+            "kanban: --expected-authority-revision requires exactly one task id",
+            file=sys.stderr,
+        )
+        return 2
 
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
@@ -2425,6 +2509,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 reason=reason,
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
+                expected_authority_revision=expected_revision,
             )
             results.append({
                 "task_id": tid,

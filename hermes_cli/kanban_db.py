@@ -911,6 +911,10 @@ class Task:
     # assignee transition, including transitions that later restore the same
     # assignee value while an external operation is in flight.
     assignment_generation: int = 0
+    # Monotonic evidence fence for automation. Database triggers increment this
+    # on every task mutation and on authority-relevant comment/link/parent-state
+    # changes, allowing a reviewed projection to be bound to the write by CAS.
+    authority_revision: int = 0
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -1018,6 +1022,12 @@ class Task:
                 int(row["assignment_generation"])
                 if "assignment_generation" in keys
                 and row["assignment_generation"] is not None
+                else 0
+            ),
+            authority_revision=(
+                int(row["authority_revision"])
+                if "authority_revision" in keys
+                and row["authority_revision"] is not None
                 else 0
             ),
             result=row["result"] if "result" in keys else None,
@@ -1312,6 +1322,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Monotonic custody token. Incremented by the migration-installed trigger
     -- whenever assignee changes, so A -> B -> A cannot masquerade as no write.
     assignment_generation INTEGER NOT NULL DEFAULT 0,
+    -- Monotonic compare-and-swap token for authority-sensitive automation.
+    -- Migration-installed triggers also advance it for comments, links, and
+    -- parent status changes that alter this task's dispatch authority.
+    authority_revision  INTEGER NOT NULL DEFAULT 0,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
@@ -2816,6 +2830,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "assignment_generation INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "authority_revision" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "authority_revision",
+            "authority_revision INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Keep assignment custody monotonic across every SQL write path, including
     # public assign_task(), dispatcher fallback assignment, decomposer writes,
     # and any future helper that updates tasks.assignee. An AFTER trigger is
@@ -2834,6 +2856,124 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         END
         """
     )
+
+    # One monotonic authority fence spans every write path, including broker
+    # native operations and raw SQL executed through an interactive broker
+    # transaction. The task trigger is intentionally conservative: any task
+    # UPDATE invalidates an external projection. Comment/link triggers cover
+    # authority evidence outside the tasks row, while parent status propagation
+    # invalidates every child whose dependency evidence changed.
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_authority_revision
+        AFTER UPDATE ON tasks
+        FOR EACH ROW
+        WHEN NEW.authority_revision = OLD.authority_revision
+        BEGIN
+            UPDATE tasks
+               SET authority_revision = OLD.authority_revision + 1
+             WHERE id = NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_authority_revision_monotonic
+        BEFORE UPDATE OF authority_revision ON tasks
+        FOR EACH ROW
+        WHEN NEW.authority_revision < OLD.authority_revision
+        BEGIN
+            SELECT RAISE(ABORT, 'authority_revision cannot decrease');
+        END;
+        """
+    )
+
+    authority_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    # Some migration unit fixtures intentionally contain only a legacy tasks
+    # table. Install evidence triggers only after their referenced table exists;
+    # a later full init/import reruns this idempotent migration and adds them.
+    if "task_comments" in authority_tables:
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_insert
+            AFTER INSERT ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.task_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_update
+            AFTER UPDATE ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.task_id;
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.task_id AND NEW.task_id IS NOT OLD.task_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_comments_authority_revision_delete
+            AFTER DELETE ON task_comments
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.task_id;
+            END;
+            """
+        )
+    if "task_links" in authority_tables:
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_insert
+            AFTER INSERT ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_update
+            AFTER UPDATE ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.child_id;
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = NEW.child_id AND NEW.child_id IS NOT OLD.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_links_authority_revision_delete
+            AFTER DELETE ON task_links
+            FOR EACH ROW
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id = OLD.child_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_parent_status_authority_revision
+            AFTER UPDATE OF status ON tasks
+            FOR EACH ROW
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET authority_revision = authority_revision + 1
+                 WHERE id IN (
+                     SELECT child_id FROM task_links WHERE parent_id = NEW.id
+                 );
+            END;
+            """
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3294,6 +3434,28 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+class AuthorityRevisionMismatch(RuntimeError):
+    """The reviewed task evidence changed before its guarded mutation."""
+
+
+def _require_authority_revision(
+    row: sqlite3.Row,
+    task_id: str,
+    expected_authority_revision: Optional[int],
+) -> None:
+    if expected_authority_revision is None:
+        return
+    expected = int(expected_authority_revision)
+    if expected < 0:
+        raise ValueError("expected authority revision must be non-negative")
+    actual = int(row["authority_revision"])
+    if actual != expected:
+        raise AuthorityRevisionMismatch(
+            f"task {task_id} authority revision changed: "
+            f"expected {expected}, found {actual}"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3713,7 +3875,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    expected_authority_revision: Optional[int] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3722,12 +3890,13 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT title, body, status, claim_lock, assignee "
+            "SELECT title, body, status, claim_lock, assignee, authority_revision "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return False
+        _require_authority_revision(row, task_id, expected_authority_revision)
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -3873,7 +4042,12 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    expected_authority_revision: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -3882,10 +4056,11 @@ def add_comment(
     now = int(time.time())
     with write_txn(conn):
         task = conn.execute(
-            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT assignee, authority_revision FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not task:
             raise ValueError(f"unknown task {task_id}")
+        _require_authority_revision(task, task_id, expected_authority_revision)
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -5392,6 +5567,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    expected_authority_revision: Optional[int] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -5404,12 +5580,22 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    if reclaim_first and expected_authority_revision is not None:
+        raise ValueError(
+            "expected authority revision cannot be combined with --reclaim; "
+            "reclaim is a separate authority mutation"
+        )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(
+            conn,
+            task_id,
+            profile,
+            expected_authority_revision=expected_authority_revision,
+        )
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -6570,6 +6756,7 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    expected_authority_revision: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -6581,57 +6768,60 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
-
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
-
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body, assignee, status, authority_revision "
+            "FROM tasks WHERE id = ?",
             (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
-        if unsatisfied:
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        _require_authority_revision(row, task_id, expected_authority_revision)
+
+        cur_status = row["status"]
+        if cur_status not in ("todo", "blocked"):
             return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                f"'todo' or 'blocked'"
             )
 
-    assignment_denial = _assignment_guard_reason(
-        conn,
-        title=row["title"],
-        body=row["body"],
-        assignee=row["assignee"],
-        status="ready",
-        has_open_parent=_task_has_open_parent(conn, task_id),
-        task_id=task_id,
-    )
-    if assignment_denial is not None:
-        return False, f"kanban assignment policy: {assignment_denial}"
+        if not force:
+            parents = conn.execute(
+                "SELECT t.id, t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            unsatisfied = [
+                p["id"] for p in parents
+                if p["status"] not in ("done", "archived")
+            ]
+            if unsatisfied:
+                return False, (
+                    f"unsatisfied parent dependencies: "
+                    f"{', '.join(unsatisfied)} (use --force to override)"
+                )
 
-    if dry_run:
-        return True, None
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=row["title"],
+            body=row["body"],
+            assignee=row["assignee"],
+            status="ready",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            return False, f"kanban assignment policy: {assignment_denial}"
 
-    with write_txn(conn):
+        if dry_run:
+            return True, None
+
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            "WHERE id = ? AND status IN ('todo', 'blocked') "
+            "AND (? IS NULL OR authority_revision = ?)",
+            (task_id, expected_authority_revision, expected_authority_revision),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
@@ -6645,7 +6835,12 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_authority_revision: Optional[int] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -6658,12 +6853,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT title, body, assignee, current_run_id FROM tasks "
+            "SELECT title, body, assignee, current_run_id, authority_revision FROM tasks "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
         if stale is None:
             return False
+        _require_authority_revision(stale, task_id, expected_authority_revision)
         # Re-gate on parent completion before flipping 'blocked' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
@@ -6713,8 +6909,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled') "
+            "AND (? IS NULL OR authority_revision = ?)",
+            (
+                new_status,
+                task_id,
+                expected_authority_revision,
+                expected_authority_revision,
+            ),
         )
         if cur.rowcount != 1:
             return False

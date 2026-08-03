@@ -161,6 +161,68 @@ with kb.connect() as conn:
     return json.loads(result.stdout)
 
 
+def _guarded_mutation_through_kanban_db(
+    db_path: Path,
+    socket_path: Path,
+    *,
+    task_id: str,
+    expected_revision: int,
+    action: str = "promote",
+) -> dict[str, object]:
+    """Run the guarded public mutation through boardd's interactive txn."""
+    hermes_home = db_path.parent / f"cas-client-{expected_revision}"
+    fleet_dir = hermes_home / "kanban" / "boards" / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    (fleet_dir / "kanban.db").symlink_to(db_path)
+    code = """
+import json
+from hermes_cli import kanban_db as kb
+with kb.connect() as conn:
+    assert type(conn).__name__ == "BrokerConnection"
+    try:
+        if %r == "promote":
+            ok, error = kb.promote_task(
+                conn,
+                %r,
+                actor="boardqb",
+                expected_authority_revision=%d,
+            )
+        else:
+            kb.add_comment(
+                conn,
+                %r,
+                "boardqb",
+                "guarded boardd note",
+                expected_authority_revision=%d,
+            )
+            ok, error = True, None
+    except kb.AuthorityRevisionMismatch as exc:
+        print(json.dumps({"ok": False, "stale": True, "error": str(exc)}))
+    else:
+        print(json.dumps({"ok": ok, "stale": False, "error": error}))
+""" % (action, task_id, expected_revision, task_id, expected_revision)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_KANBAN_BROKER": "1",
+            "HERMES_KANBAN_DB": str(db_path),
+            "BOARDD_SOCK": str(socket_path),
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (
         client,
@@ -199,6 +261,81 @@ def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Pa
                 status="running",
                 reasoning_effort="turbo",
             )
+
+
+def test_authority_revision_survives_restart_and_refuses_stale_replay(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, db_path, _):
+        task_id = client.create_task(
+            title="authority CAS restart probe",
+            assignee="codex10",
+            status="todo",
+        )["id"]
+        assert client.get_task(task_id)["authority_revision"] == 0
+
+    with running_boardd(tmp_path, import_schema=True) as (
+        client,
+        db_path,
+        socket_path,
+    ):
+        client.add_comment(task_id, "operator", "DO NOT DISPATCH; OPERATOR-HOLD")
+        assert client.get_task(task_id)["authority_revision"] == 1
+
+        stale = _guarded_mutation_through_kanban_db(
+            db_path,
+            socket_path,
+            task_id=task_id,
+            expected_revision=0,
+        )
+        assert stale["ok"] is False
+        assert stale["stale"] is True
+        assert client.get_task(task_id)["status"] == "todo"
+
+    with running_boardd(tmp_path, import_schema=True) as (
+        client,
+        db_path,
+        socket_path,
+    ):
+        assert client.get_task(task_id)["authority_revision"] == 1
+        current = _guarded_mutation_through_kanban_db(
+            db_path,
+            socket_path,
+            task_id=task_id,
+            expected_revision=1,
+        )
+        assert current == {"ok": True, "stale": False, "error": None}
+        shown = client.get_task(task_id)
+        assert shown["status"] == "ready"
+        assert shown["authority_revision"] > 1
+
+        comment_revision = shown["authority_revision"]
+        client.add_comment(task_id, "operator", "race before guarded comment")
+        stale_comment = _guarded_mutation_through_kanban_db(
+            db_path,
+            socket_path,
+            task_id=task_id,
+            expected_revision=comment_revision,
+            action="comment",
+        )
+        assert stale_comment["stale"] is True
+        comments = client.query(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id",
+            [task_id],
+        )
+        assert all(item["body"] != "guarded boardd note" for item in comments)
+
+        fresh_revision = client.get_task(task_id)["authority_revision"]
+        current_comment = _guarded_mutation_through_kanban_db(
+            db_path,
+            socket_path,
+            task_id=task_id,
+            expected_revision=fresh_revision,
+            action="comment",
+        )
+        assert current_comment == {"ok": True, "stale": False, "error": None}
+        assert client.query(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            [task_id],
+        )[0]["body"] == "guarded boardd note"
 
 
 def test_import_schema_adds_reasoning_effort_to_legacy_board(tmp_path: Path):
