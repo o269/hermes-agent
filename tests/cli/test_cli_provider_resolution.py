@@ -140,6 +140,25 @@ def test_hermes_cli_init_does_not_eagerly_resolve_runtime_provider(monkeypatch):
     assert calls["count"] == 0
 
 
+def test_hermes_cli_invocation_reasoning_override_wins_profile_config(monkeypatch):
+    cli = _import_cli()
+    config = dict(cli.CLI_CONFIG)
+    config["agent"] = {
+        **config.get("agent", {}),
+        "reasoning_effort": "low",
+    }
+    monkeypatch.setattr(cli, "CLI_CONFIG", config)
+
+    shell = cli.HermesCLI(
+        model="gpt-5",
+        reasoning_effort="high",
+        compact=True,
+        max_turns=1,
+    )
+
+    assert shell.reasoning_config == {"enabled": True, "effort": "high"}
+
+
 def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     cli = _import_cli()
     calls = {"count": 0}

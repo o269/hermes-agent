@@ -1609,6 +1609,23 @@ def test_create_task_without_skills_defaults_to_empty_list(client):
     assert task.get("skills") in (None, [])
 
 
+def test_create_task_round_trips_reasoning_effort(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "deep dashboard task",
+            "assignee": "x",
+            "reasoning_effort": "medium",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["reasoning_effort"] == "medium"
+
+    got = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert got["task"]["reasoning_effort"] == "medium"
+
+
 def test_create_task_with_toolset_name_in_skills_is_rejected(client):
     """POST /tasks fails fast when callers confuse toolsets with skills."""
     r = client.post(

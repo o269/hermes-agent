@@ -125,12 +125,13 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     assert "HERMES_TUI" not in captured["env"]
 
 
-def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
-    """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
+def test_default_spawn_runtime_overrides_survive_real_cli_parse(monkeypatch, tmp_path):
+    """The dispatcher's pre-``chat`` runtime flags must reach argparse.
 
     This is an integration contract between Kanban's worker argv builder and
-    the real CLI parser. A parser default once erased the explicit override,
-    silently sending the worker to its profile default or fallback instead.
+    the real CLI parser. A parser default once erased the explicit model
+    override; an unregistered reasoning flag would make every overridden worker
+    exit before starting.
     """
     root = tmp_path / ".hermes"
     (root / "profiles" / "elias").mkdir(parents=True)
@@ -156,6 +157,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
+    task.reasoning_effort = "high"
     kb._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
@@ -167,6 +169,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
+    assert args.reasoning == "high"
     assert args.query == "work kanban task t_spawn_tools"
 
 

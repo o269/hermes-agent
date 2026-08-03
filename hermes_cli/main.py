@@ -2630,6 +2630,7 @@ def cmd_chat(args):
     kwargs = {
         "model": args.model,
         "provider": getattr(args, "provider", None),
+        "reasoning_effort": getattr(args, "reasoning", None),
         "toolsets": args.toolsets,
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
@@ -13449,6 +13450,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",

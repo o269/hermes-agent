@@ -134,6 +134,19 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_and_show_reasoning_effort(kanban_home):
+    out = kc.run_slash(
+        "create 'deep task' --assignee alice --reasoning-effort high"
+    )
+    task_id = out.split()[1]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.reasoning_effort == "high"
+    assert "reasoning: high" in kc.run_slash(f"show {task_id}")
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

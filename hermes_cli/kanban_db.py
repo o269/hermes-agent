@@ -168,6 +168,23 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+    """Normalize a per-task reasoning override or reject an invalid level."""
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    value = str(effort or "").strip().lower()
+    if not value:
+        return None
+    if value == "none" or value in VALID_REASONING_EFFORTS:
+        return value
+    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    raise ValueError(
+        f"reasoning_effort must be one of {allowed}, got {effort!r}"
+    )
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -922,6 +939,8 @@ class Task:
     # no extra skills.
     skills: object = None
     model_override: Optional[str] = None
+    # Per-task thinking depth. NULL inherits the profile's configured value.
+    reasoning_effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1034,6 +1053,11 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            reasoning_effort=(
+                row["reasoning_effort"]
+                if "reasoning_effort" in keys and row["reasoning_effort"]
+                else None
+            ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1331,6 +1355,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task thinking depth (or 'none' to disable thinking). NULL inherits
+    -- the worker profile's agent.reasoning_effort.
+    reasoning_effort     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2737,6 +2764,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "reasoning_effort" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -3280,6 +3312,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -3309,8 +3342,13 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``reasoning_effort`` is an optional invocation-only thinking-depth override
+    for the worker. ``None`` inherits the profile config; ``"none"`` explicitly
+    disables reasoning.
     """
     assignee = _canonical_assignee(assignee)
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3539,8 +3577,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, reasoning_effort,
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3560,6 +3599,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -3576,6 +3616,7 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "reasoning_effort": reasoning_effort,
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
@@ -13112,6 +13153,8 @@ def _default_spawn(
         worker_argv.extend(["--skills", skill])
     if task.model_override:
         worker_argv.extend(["-m", task.model_override])
+    if task.reasoning_effort:
+        worker_argv.extend(["--reasoning", task.reasoning_effort])
     # Local profile toolsets are not authoritative for a profile that exists
     # only on VPS2. Let the remote CLI resolve that profile's own config.
     worker_toolsets = (

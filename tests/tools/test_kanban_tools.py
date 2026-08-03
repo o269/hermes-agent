@@ -1008,6 +1008,24 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_persists_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "deep child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "reasoning_effort": "xhigh",
+    })
+    created = json.loads(out)
+    assert created["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+    assert task is not None
+    assert task.reasoning_effort == "xhigh"
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
