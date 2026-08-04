@@ -335,6 +335,7 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     show_out = kt._handle_show({"task_id": worker_env})
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
+    assert shown["runs"][-1]["dispatch_origin"] == "ready"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"
     assert shown["runs"][-1]["metadata"] == handoff
 

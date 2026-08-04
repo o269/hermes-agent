@@ -328,7 +328,11 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
             )
             conn.commit()
 
-        result = kb.dispatch_once(conn, failure_limit=2)
+        result = kb.dispatch_once(
+            conn,
+            failure_limit=2,
+            skill_validator=lambda _profile, _skills: [],
+        )
 
         assert result.spawned == [(task_id, "default", result.spawned[0][2])]
         assert result.auto_blocked == []
@@ -386,7 +390,7 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
         "bounded-large-invalid-member",
     ),
 )
-def test_real_db_claim_dispatch_rejects_invalid_skills_before_popen(
+def test_real_db_dispatch_fail_closes_invalid_skills_before_claim(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     stored_skills: object,
@@ -417,44 +421,47 @@ def test_real_db_claim_dispatch_rejects_invalid_skills_before_popen(
 
         assert first.spawned == []
         assert first.auto_blocked == []
+        assert first.forced_skill_blocked == [task_id]
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.status == "ready"
-        assert task.consecutive_failures == 1
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.dispatch_origin == "ready"
+        assert task.consecutive_failures == 0
         error = task.last_failure_error
         assert error is not None
-        assert error.startswith(f"task {task_id} has invalid skills ({reason})")
-        assert len(error) < 400
+        assert error.startswith(
+            "forced_skill_preflight_error: profile=default; "
+            "skills=<invalid skill declaration>; error="
+        )
+        assert f"task {task_id} has invalid skills ({reason})" in error
+        assert len(error) <= 500
         assert "\n" not in error
         assert "x" * 100 not in error
 
-        first_run = conn.execute(
-            "SELECT status, outcome, error FROM task_runs "
-            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        # Validation happens before claim, so malformed capability declarations
+        # create a named blocker rather than a fake worker attempt.
+        assert kb.list_runs(conn, task_id) == []
+        blocker = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'forced_skill_preflight_blocked' "
+            "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        assert first_run is not None
-        assert first_run["status"] == "spawn_failed"
-        assert first_run["outcome"] == "spawn_failed"
-        assert first_run["error"] == error
+        assert blocker is not None
+        assert '"blocker": "forced_skill_preflight_error"' in blocker["payload"]
 
         second = kb.dispatch_once(conn, failure_limit=2)
 
         assert second.spawned == []
-        assert second.auto_blocked == [task_id]
+        assert second.auto_blocked == []
+        assert second.forced_skill_blocked == []
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "blocked"
-        assert task.consecutive_failures == 2
+        assert task.consecutive_failures == 0
         assert task.last_failure_error == error
-        latest_run = conn.execute(
-            "SELECT status, outcome, error FROM task_runs "
-            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        assert latest_run is not None
-        assert latest_run["status"] == "gave_up"
-        assert latest_run["outcome"] == "gave_up"
-        assert latest_run["error"] == error
+        assert kb.list_runs(conn, task_id) == []
 
     assert popen_calls == []

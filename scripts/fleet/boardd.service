@@ -14,13 +14,22 @@ Environment=HERMES_HOME=/var/lib/boardd
 Environment=HERMES_KANBAN_BROKER=0
 Environment=HERMES_KANBAN_DB=/var/lib/boardd/fleet/kanban.db
 Environment=BOARDD_SOCK=/run/boardd/boardd.sock
+# Functional write path: create + verify + archive + verify through the broker.
+# The 90s initial offset avoids the 900s backup boundary; boardd also enforces
+# a shared maintenance lock so backup and canary cannot overlap when timing drifts.
+Environment=BOARDD_WRITE_CANARY_MODE=periodic
+Environment=BOARDD_WRITE_CANARY_START_DELAY_S=90
+Environment=BOARDD_WRITE_CANARY_INTERVAL_S=300
+Environment=BOARDD_WRITE_CANARY_TIMEOUT_S=20
+Environment=BOARDD_WRITE_CANARY_ALERT_REPEAT_S=3600
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStartPre=/usr/bin/test -r /opt/hermes-boardd/current/libexec/boardd.py
 ExecStart=/opt/hermes-boardd/current/venv/bin/python /opt/hermes-boardd/current/libexec/boardd.py --db /var/lib/boardd/fleet/kanban.db --sock /run/boardd/boardd.sock --import-schema --log-level INFO
 Restart=always
 RestartSec=2s
 TimeoutStartSec=30s
-TimeoutStopSec=30s
+# Allows the default 20s write-canary deadline to drain before socket/DB teardown.
+TimeoutStopSec=45s
 WatchdogSec=30s
 NotifyAccess=main
 RuntimeDirectory=boardd

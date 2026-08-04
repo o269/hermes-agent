@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -1448,6 +1449,7 @@ def test_task_detail_includes_runs(client):
     run = d["runs"][0]
     assert run["outcome"] == "completed"
     assert run["profile"] == "worker"
+    assert run["dispatch_origin"] == "ready"
     assert run["summary"] == "tested on rate limiter"
     assert run["metadata"] == {"changed_files": ["limiter.py"]}
     assert run["ended_at"] is not None
@@ -1526,9 +1528,18 @@ def test_patch_status_archive_closes_running_run(client):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        kb.claim_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        review_task = kb.get_task(conn, tid)
+        assert review_task is not None
+        assert review_task.status == "review"
+        assert review_task.claim_lock is None
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
         open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
         assert open_run.ended_at is None
+        assert open_run.dispatch_origin == "review"
     finally:
         conn.close()
     r = client.patch(
@@ -1541,7 +1552,118 @@ def test_patch_status_archive_closes_running_run(client):
         task = kb.get_task(conn, tid)
         assert task.status == "archived"
         assert task.current_run_id is None
-        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.outcome == "reclaimed"
+        assert run.dispatch_origin == "review"
+    finally:
+        conn.close()
+
+
+def test_patch_status_ready_closes_orphaned_running_run(client):
+    """A direct running -> ready move must reconcile an open orphaned run."""
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="orphaned direct move",
+            assignee="worker",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
+        run_id = open_run.id
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                (tid,),
+            )
+
+        assert plugin._set_status_direct(conn, tid, "ready")
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        status_event = conn.execute(
+            "SELECT run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert run is not None
+        assert run.id == run_id
+        assert run.outcome == "reclaimed"
+        assert run.ended_at is not None
+        assert status_event is not None
+        assert status_event["run_id"] == run_id
+    finally:
+        conn.close()
+
+
+def test_patch_status_ready_preserves_review_origin_queue(client):
+    """Review-origin dashboard recovery must land in review, not author ready."""
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review origin direct recovery",
+            assignee="worker",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (tid,),
+            )
+        claimed = kb.claim_review_task(conn, tid, claimer="test-host:reviewer")
+        assert claimed is not None
+        open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
+        run_id = open_run.id
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                (tid,),
+            )
+
+        assert plugin._set_status_direct(conn, tid, "ready")
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        status_event = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        open_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (tid,),
+        ).fetchone()
+
+        assert task is not None
+        assert task.status == "review"
+        assert task.dispatch_origin == "review"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert run is not None
+        assert run.id == run_id
+        assert run.outcome == "reclaimed"
+        assert run.ended_at is not None
+        assert run.summary == "status changed to review (dashboard/direct)"
+        assert open_count is not None and int(open_count["n"]) == 0
+        assert status_event is not None
+        assert status_event["run_id"] == run_id
+        assert json.loads(status_event["payload"]) == {"status": "review"}
+        assert kb.claim_task(conn, tid, claimer="test-host:author") is None
+        review_retry = kb.claim_review_task(
+            conn, tid, claimer="test-host:reviewer-retry"
+        )
+        assert review_retry is not None
+        assert review_retry.status == "running"
+        assert review_retry.dispatch_origin == "review"
     finally:
         conn.close()
 

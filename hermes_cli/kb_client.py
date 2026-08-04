@@ -66,45 +66,103 @@ class Client:
     or the module-level helpers which use a thread-local client.
     """
 
-    def __init__(self, sock_path: str = DEFAULT_SOCK, worker_id: str | None = None):
+    def __init__(
+        self,
+        sock_path: str = DEFAULT_SOCK,
+        worker_id: str | None = None,
+        *,
+        retry_deadline_s: float | None = None,
+        connect_timeout_s: float | None = None,
+        read_timeout_s: float | None = None,
+        total_timeout_s: float | None = None,
+    ):
         self.sock_path = sock_path
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+        self.retry_deadline_s = (
+            _RETRY_DEADLINE_S if retry_deadline_s is None else float(retry_deadline_s)
+        )
+        self.connect_timeout_s = (
+            _CONNECT_TIMEOUT_S if connect_timeout_s is None else float(connect_timeout_s)
+        )
+        self.read_timeout_s = (
+            _READ_TIMEOUT_S if read_timeout_s is None else float(read_timeout_s)
+        )
+        self._absolute_deadline = (
+            None
+            if total_timeout_s is None
+            else time.monotonic() + max(0.0, float(total_timeout_s))
+        )
         self._seq = 0
         self._sock: socket.socket | None = None
-        self._rfile = None
+        self._recv_buffer = b""
 
     # ---- transport -------------------------------------------------------- #
+    def _bounded_timeout(self, configured: float) -> float:
+        """Apply an optional client-lifetime deadline to one socket operation."""
+        timeout = max(0.001, configured)
+        if self._absolute_deadline is None:
+            return timeout
+        remaining = self._absolute_deadline - time.monotonic()
+        if remaining <= 0:
+            raise BoarddUnavailable("boardd client total deadline exceeded")
+        return max(0.001, min(timeout, remaining))
+
     def _connect(self) -> None:
         self._close()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(_CONNECT_TIMEOUT_S)
-        s.connect(self.sock_path)
-        s.settimeout(_READ_TIMEOUT_S)
+        try:
+            s.settimeout(self._bounded_timeout(self.connect_timeout_s))
+            s.connect(self.sock_path)
+            s.settimeout(self._bounded_timeout(self.read_timeout_s))
+        except Exception:
+            s.close()
+            raise
         self._sock = s
-        self._rfile = s.makefile("rb")
+        self._recv_buffer = b""
 
     def _close(self) -> None:
-        try:
-            if self._rfile is not None:
-                self._rfile.close()
-        except Exception:
-            pass
         try:
             if self._sock is not None:
                 self._sock.close()
         except Exception:
             pass
-        self._sock = self._rfile = None
+        self._sock = None
+        self._recv_buffer = b""
+
+    def _send_all(self, sock: socket.socket, payload: bytes) -> None:
+        """Send one frame while re-applying the absolute deadline per write."""
+        remaining = memoryview(payload)
+        while remaining:
+            sock.settimeout(self._bounded_timeout(self.read_timeout_s))
+            sent = sock.send(remaining)
+            if sent <= 0:
+                raise BoarddUnavailable("connection closed while sending request")
+            remaining = remaining[sent:]
+
+    def _readline(self, sock: socket.socket) -> bytes:
+        """Read one frame without letting trickled bytes extend the deadline."""
+        while True:
+            newline = self._recv_buffer.find(b"\n")
+            if newline >= 0:
+                raw = self._recv_buffer[:newline]
+                self._recv_buffer = self._recv_buffer[newline + 1 :]
+                return raw
+            sock.settimeout(self._bounded_timeout(self.read_timeout_s))
+            chunk = sock.recv(64 * 1024)
+            if not chunk:
+                raise BoarddUnavailable("connection closed by broker")
+            self._recv_buffer += chunk
 
     def _roundtrip(self, req: dict) -> dict:
         """One send+recv on the current connection; raises on transport error."""
         if self._sock is None:
             self._connect()
+        sock = self._sock
+        if sock is None:  # defensive: _connect either publishes a socket or raises
+            raise BoarddUnavailable("boardd connection was not established")
         line = (json.dumps(req) + "\n").encode("utf-8")
-        self._sock.sendall(line)
-        raw = self._rfile.readline()
-        if not raw:
-            raise BoarddUnavailable("connection closed by broker")
+        self._send_all(sock, line)
+        raw = self._readline(sock)
         return json.loads(raw)
 
     # ---- request with idempotent retry ------------------------------------ #
@@ -118,7 +176,9 @@ class Client:
             req["op_id"] = op_id or uuid.uuid4().hex
             req["worker_id"] = self.worker_id
             req["seq"] = self._seq
-        deadline = time.monotonic() + _RETRY_DEADLINE_S
+        deadline = time.monotonic() + max(0.0, self.retry_deadline_s)
+        if self._absolute_deadline is not None:
+            deadline = min(deadline, self._absolute_deadline)
         attempt = 0
         while True:
             attempt += 1
@@ -134,9 +194,11 @@ class Client:
                 if time.monotonic() >= deadline:
                     raise BoarddUnavailable(
                         f"boardd unreachable after {attempt} attempts: {exc}")
-                time.sleep(min(_BACKOFF_MAX_S,
-                               _BACKOFF_MIN_S * (2 ** min(attempt, 6)))
-                           * (0.5 + random.random()))
+                delay = (
+                    min(_BACKOFF_MAX_S, _BACKOFF_MIN_S * (2 ** min(attempt, 6)))
+                    * (0.5 + random.random())
+                )
+                time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
 
     # ---- typed API (mirrors hermes_cli.kanban_db) ------------------------- #
     # mutations
