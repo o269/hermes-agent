@@ -65,6 +65,15 @@ release executable by its full staging path.
 `reasoning_effort` column is nullable, so legacy tasks retain profile-default
 thinking behavior. Invalid levels fail closed.
 
+Before accepting its first queued request, and every five minutes thereafter,
+boardd read-only compares `PRAGMA table_info(tasks)` on its broker-owned live
+connection with the `tasks` columns declared by the installed
+`hermes_cli.kanban_db` schema. Missing columns emit one structured
+`SCHEMA DRIFT ALERT` per distinct missing-column set and are exposed through
+`ping`/`stats` as `schema_drift_alarm`; unchanged drift is deduplicated. Probe
+errors are warning-only (`schema_check_error`) and never block healthy startup.
+The detector does not run migrations or repair the live schema.
+
 ## Functional write canary
 
 `boardd` owns a broker-loopback functional probe. It connects to the Unix socket
