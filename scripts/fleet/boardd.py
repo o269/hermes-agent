@@ -85,6 +85,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -96,6 +97,7 @@ import sqlite3
 import sys
 import threading
 import time
+from typing import cast
 
 _log = logging.getLogger("boardd")
 
@@ -116,6 +118,23 @@ DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("BOARDD_BUSY_TIMEOUT_MS", "5000"))
 CHECKPOINT_INTERVAL_S = float(os.environ.get("BOARDD_CHECKPOINT_INTERVAL_S", "60"))
 BACKUP_INTERVAL_S = float(os.environ.get("BOARDD_BACKUP_INTERVAL_S", "900"))
 BACKUP_KEEP = int(os.environ.get("BOARDD_BACKUP_KEEP", "6"))
+# Broker-owned functional probe. The 90s initial offset deliberately avoids the
+# 900s backup boundary (90, 390, 690, 990, ... vs. 900, 1800, ...); a shared
+# maintenance lock is the hard concurrency guard when timings drift.
+WRITE_CANARY_MODE = os.environ.get("BOARDD_WRITE_CANARY_MODE", "periodic").strip().lower()
+WRITE_CANARY_START_DELAY_S = float(
+    os.environ.get("BOARDD_WRITE_CANARY_START_DELAY_S", "90")
+)
+WRITE_CANARY_INTERVAL_S = float(os.environ.get("BOARDD_WRITE_CANARY_INTERVAL_S", "300"))
+WRITE_CANARY_TIMEOUT_S = float(os.environ.get("BOARDD_WRITE_CANARY_TIMEOUT_S", "20"))
+WRITE_CANARY_ALERT_REPEAT_S = float(
+    os.environ.get("BOARDD_WRITE_CANARY_ALERT_REPEAT_S", "3600")
+)
+WRITE_CANARY_STALE_LIMIT = 10
+WRITE_CANARY_MARKER = "__hermes_boardd_write_canary_v1__"
+WRITE_CANARY_TITLE_PREFIX = "[SYSTEM CANARY][DO NOT DISPATCH] boardd write path"
+WRITE_CANARY_CREATED_BY = WRITE_CANARY_MARKER
+WRITE_CANARY_ALERT_FILE = "boardd-HEALTH-ALERT"
 DISKGUARD_INTERVAL_S = float(os.environ.get("BOARDD_DISKGUARD_INTERVAL_S", "30"))
 DISKGUARD_MIN_FREE_BYTES = int(
     os.environ.get("BOARDD_DISKGUARD_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024))
@@ -269,13 +288,137 @@ def _canon_reasoning_effort(value):
     return normalized
 
 
+class _CanaryFailure(RuntimeError):
+    """Structured functional-probe failure; raised only after a broker call ends."""
+
+    def __init__(
+        self,
+        phase: str,
+        detail: str,
+        *,
+        kind: str,
+        task_id: str | None = None,
+        orphan_task_ids: list[str] | None = None,
+    ):
+        super().__init__(detail)
+        self.phase = phase
+        self.detail = detail
+        self.kind = kind
+        self.task_id = task_id
+        self.orphan_task_ids = list(orphan_task_ids or [])
+
+
+class _BrokerWriteCanaryOps:
+    """Canonical kanban_db operations carried over the production broker socket.
+
+    This deliberately does not call boardd mutation handlers in-process. The
+    loopback Client + BrokerConnection path exercises the same interactive
+    transactions used by ``hermes kanban`` clients, including create_task and
+    archive_task policy/event behavior.
+    """
+
+    def __init__(self, sock_path: str, timeout_s: float):
+        from hermes_cli import boardd_shim, kb_client, kanban_db
+
+        socket_timeout = max(0.1, min(float(timeout_s), 2.0))
+        self._kanban_db = kanban_db
+        self._client = kb_client.Client(
+            sock_path,
+            worker_id=f"boardd-write-canary:{os.getpid()}",
+            retry_deadline_s=float(timeout_s),
+            connect_timeout_s=socket_timeout,
+            read_timeout_s=socket_timeout,
+            total_timeout_s=float(timeout_s),
+        )
+        self._conn = cast(
+            sqlite3.Connection,
+            boardd_shim.BrokerConnection(client=self._client),
+        )
+
+    def find_active_candidates(self, limit: int) -> list[dict]:
+        key_prefix = f"{WRITE_CANARY_MARKER}:"
+        rows = self._conn.execute(
+            "SELECT id, title, body, status, created_by, idempotency_key, created_at "
+            "FROM tasks WHERE status != 'archived' "
+            "AND (created_by = ? OR substr(idempotency_key, 1, ?) = ? "
+            "OR substr(title, 1, ?) = ? OR instr(body, ?) > 0) "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (
+                WRITE_CANARY_CREATED_BY,
+                len(key_prefix),
+                key_prefix,
+                len(WRITE_CANARY_TITLE_PREFIX),
+                WRITE_CANARY_TITLE_PREFIX,
+                WRITE_CANARY_MARKER,
+                int(limit),
+            ),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create(self, identity: dict) -> str:
+        return self._kanban_db.create_task(
+            self._conn,
+            title=identity["title"],
+            body=identity["body"],
+            created_by=WRITE_CANARY_CREATED_BY,
+            workspace_kind="scratch",
+            priority=-2_147_483_648,
+            idempotency_key=identity["idempotency_key"],
+            initial_status="blocked",
+        )
+
+    def get(self, task_id: str) -> dict | None:
+        task = self._kanban_db.get_task(self._conn, task_id)
+        if task is None:
+            return None
+        return {
+            "id": task.id,
+            "title": task.title,
+            "body": task.body,
+            "status": task.status,
+            "created_by": task.created_by,
+            "idempotency_key": task.idempotency_key,
+            "created_at": task.created_at,
+        }
+
+    def archive(self, task_id: str, identity: dict) -> bool:
+        expected_identity = {
+            "title": identity["title"],
+            "body": identity["body"],
+            "created_by": identity.get("created_by", WRITE_CANARY_CREATED_BY),
+            "idempotency_key": identity["idempotency_key"],
+        }
+        return bool(
+            self._kanban_db.archive_task(
+                self._conn,
+                task_id,
+                expected_identity=expected_identity,
+                recompute_dependents=False,
+            )
+        )
+
+    def close(self) -> None:
+        self._conn.close()
+        self._client.close()
+
+
 # --------------------------------------------------------------------------- #
 # The broker
 # --------------------------------------------------------------------------- #
 class Broker:
-    def __init__(self, db_path: str, sock_path: str, *,
-                 schema_sql_file: str | None = None,
-                 import_schema: bool = False):
+    def __init__(
+        self,
+        db_path: str,
+        sock_path: str,
+        *,
+        schema_sql_file: str | None = None,
+        import_schema: bool = False,
+        write_canary_mode: str = WRITE_CANARY_MODE,
+        write_canary_start_delay_s: float = WRITE_CANARY_START_DELAY_S,
+        write_canary_interval_s: float = WRITE_CANARY_INTERVAL_S,
+        write_canary_timeout_s: float = WRITE_CANARY_TIMEOUT_S,
+        write_canary_alert_repeat_s: float = WRITE_CANARY_ALERT_REPEAT_S,
+    ):
         # Canonical absolute realpath (hygiene; the single connection is the fix).
         self.db_realpath = os.path.realpath(db_path)
         self.sock_path = sock_path
@@ -285,7 +428,17 @@ class Broker:
         self.conn: sqlite3.Connection | None = None
         self._stop = threading.Event()
         self._db_thread_obj: threading.Thread | None = None
+        self._write_canary_thread_obj: threading.Thread | None = None
         self._server: "BrokerServer | None" = None
+        self._maintenance_lock = threading.Lock()
+        self._write_canary_lock = threading.Lock()
+        # Shutdown must never run BaseServer.shutdown() on the serve thread
+        # (signal handlers fire there). Coordinator + idempotency gates below.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = threading.Event()
+        self._shutdown_coord_lock = threading.Lock()
+        self._shutdown_coord_started = False
+        self._shutdown_coord_thread: threading.Thread | None = None
         # health / stats
         self._started_at = _now()
         self._last_commit_ts = 0
@@ -309,6 +462,60 @@ class Broker:
         self._txns = 0
         self._txn_capped = 0          # count of txns rolled back by the absolute cap
         self._integrity_alarm = None  # set to the failing check result on integrity fail
+        # Functional write-path health. State changes are guarded independently
+        # from the DB connection; alerts are emitted only after broker operations
+        # return and therefore never run inside a write transaction.
+        self._write_canary_mode = str(write_canary_mode).strip().lower()
+        self._write_canary_start_delay_s = float(write_canary_start_delay_s)
+        self._write_canary_interval_s = float(write_canary_interval_s)
+        self._write_canary_timeout_s = float(write_canary_timeout_s)
+        self._write_canary_alert_repeat_s = float(write_canary_alert_repeat_s)
+        durations = {
+            "start delay": self._write_canary_start_delay_s,
+            "interval": self._write_canary_interval_s,
+            "timeout": self._write_canary_timeout_s,
+            "alert repeat": self._write_canary_alert_repeat_s,
+        }
+        for label, value in durations.items():
+            if not math.isfinite(value):
+                raise ValueError(f"write canary {label} must be finite")
+        if self._write_canary_mode not in {"disabled", "periodic", "once"}:
+            raise ValueError("write canary mode must be disabled, periodic, or once")
+        if self._write_canary_start_delay_s < 0:
+            raise ValueError("write canary start delay must be >= 0")
+        if self._write_canary_mode == "periodic" and self._write_canary_interval_s <= 0:
+            raise ValueError("periodic write canary interval must be > 0")
+        if self._write_canary_timeout_s <= 0:
+            raise ValueError("write canary timeout must be > 0")
+        if self._write_canary_alert_repeat_s < 0:
+            raise ValueError("write canary alert repeat must be >= 0")
+        self._write_canary_state_lock = threading.Lock()
+        self._write_canary_alarm = None
+        self._write_canary_state = {
+            "mode": self._write_canary_mode,
+            "status": (
+                "disabled" if self._write_canary_mode == "disabled" else "pending"
+            ),
+            "interval_s": self._write_canary_interval_s,
+            "timeout_s": self._write_canary_timeout_s,
+            "runs": 0,
+            "overlap_suppressed": 0,
+            "last_run_ts": None,
+            "last_success_ts": None,
+            "last_failure_ts": None,
+            "last_task_id": None,
+            "last_reconciled_task_ids": [],
+        }
+        if self._write_canary_mode != "disabled":
+            self._write_canary_alarm = self._load_write_canary_alarm()
+            if self._write_canary_alarm is not None:
+                self._write_canary_state.update(
+                    {
+                        "status": "failing",
+                        "last_failure_ts": self._write_canary_alarm["last_ts"],
+                        "last_task_id": self._write_canary_alarm.get("task_id"),
+                    }
+                )
 
     # ---- schema / connection (RUNS ONLY IN THE DB THREAD) ------------------ #
     def _load_schema_sql(self) -> str:
@@ -474,6 +681,528 @@ class Broker:
             self._alert("disk-full", f"ENOSPC/disk-full write failure: {exc}")
             return True
         return False
+
+    # ---- functional write-path canary ------------------------------------- #
+    @staticmethod
+    def _canary_identity(nonce: str | None = None) -> dict:
+        nonce = nonce or f"{_now()}-{secrets.token_hex(8)}"
+        return {
+            "nonce": nonce,
+            "title": f"{WRITE_CANARY_TITLE_PREFIX} {nonce}",
+            "body": json.dumps(
+                {
+                    "marker": WRITE_CANARY_MARKER,
+                    "nonce": nonce,
+                    "purpose": "boardd-write-path-health",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "idempotency_key": f"{WRITE_CANARY_MARKER}:{nonce}",
+        }
+
+    @staticmethod
+    def _is_canary_row(row: dict | None, identity: dict | None = None) -> bool:
+        """Require every reserved marker before cleanup can touch a row."""
+        if not row or row.get("created_by") != WRITE_CANARY_CREATED_BY:
+            return False
+        key = row.get("idempotency_key")
+        if not isinstance(key, str) or not key.startswith(f"{WRITE_CANARY_MARKER}:"):
+            return False
+        nonce = key.removeprefix(f"{WRITE_CANARY_MARKER}:")
+        try:
+            body = json.loads(row.get("body") or "")
+        except (TypeError, ValueError):
+            return False
+        valid = (
+            bool(nonce)
+            and row.get("title") == f"{WRITE_CANARY_TITLE_PREFIX} {nonce}"
+            and isinstance(body, dict)
+            and body.get("marker") == WRITE_CANARY_MARKER
+            and body.get("nonce") == nonce
+            and body.get("purpose") == "boardd-write-path-health"
+        )
+        if not valid or identity is None:
+            return valid
+        return (
+            nonce == identity["nonce"]
+            and row.get("title") == identity["title"]
+            and row.get("body") == identity["body"]
+            and key == identity["idempotency_key"]
+        )
+
+    @staticmethod
+    def _canary_identity_from_row(row: dict) -> dict:
+        key = row["idempotency_key"]
+        return {
+            "nonce": key.removeprefix(f"{WRITE_CANARY_MARKER}:"),
+            "title": row["title"],
+            "body": row["body"],
+            "created_by": row["created_by"],
+            "idempotency_key": key,
+        }
+
+    @staticmethod
+    def _canary_failure(phase: str, exc: Exception, task_id: str | None) -> dict:
+        detail = str(exc) or type(exc).__name__
+        lowered = detail.lower()
+        if isinstance(exc, _CanaryFailure):
+            kind = exc.kind
+            phase = exc.phase
+            task_id = exc.task_id or task_id
+            detail = exc.detail
+            error_code = exc.kind
+        elif any(
+            marker in lowered
+            for marker in ("no column named", "no such column", "unknown column")
+        ):
+            kind = "schema-drift"
+            error_code = getattr(exc, "etype", None) or type(exc).__name__
+        elif any(
+            marker in lowered
+            for marker in (
+                "timed out",
+                "timeout",
+                "deadline exceeded",
+                "absolute cap",
+                "slow holder",
+                "txnbusy",
+                "txnstale",
+                "a transaction is already open",
+            )
+        ):
+            kind = "write-canary-timeout"
+            error_code = getattr(exc, "etype", None) or type(exc).__name__
+        else:
+            kind = "write-canary-failure"
+            error_code = getattr(exc, "etype", None) or type(exc).__name__
+        return {
+            "ok": False,
+            "status": "failing",
+            "kind": kind,
+            "phase": phase,
+            "detail": detail,
+            "error_type": type(exc).__name__,
+            "error_code": error_code,
+            "task_id": task_id,
+            "orphan_task_ids": list(getattr(exc, "orphan_task_ids", [])),
+        }
+
+    def _best_effort_canary_cleanup(self, ops, identity: dict, task_id: str | None) -> dict:
+        """One bounded cleanup retry, touching only rows with all reserved markers."""
+        orphan_ids: list[str] = []
+        cleanup_errors: list[str] = []
+        try:
+            candidates = ops.find_active_candidates(WRITE_CANARY_STALE_LIMIT + 1)
+        except Exception as exc:
+            cleanup_errors.append(f"discovery: {type(exc).__name__}: {exc}")
+            if task_id:
+                orphan_ids.append(task_id)
+            return {"orphan_task_ids": orphan_ids, "cleanup_errors": cleanup_errors}
+        exact = [row for row in candidates if self._is_canary_row(row, identity)]
+        if task_id and task_id not in {row.get("id") for row in exact}:
+            # The task may already be archived; verify through the broker before
+            # calling it an orphan. A missing/mismatched row remains diagnostic.
+            try:
+                shown = ops.get(task_id)
+            except Exception as exc:
+                cleanup_errors.append(f"verify: {type(exc).__name__}: {exc}")
+            else:
+                if shown and self._is_canary_row(shown, identity):
+                    if shown.get("status") != "archived":
+                        exact.append(shown)
+                elif shown:
+                    cleanup_errors.append(
+                        f"{task_id}: identity changed; guarded cleanup refused"
+                    )
+        for row in exact:
+            candidate_id = row["id"]
+            try:
+                archived = ops.archive(candidate_id, identity)
+                shown = ops.get(candidate_id)
+                if not archived or not shown or shown.get("status") != "archived":
+                    raise RuntimeError("archive receipt or terminal verification failed")
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"{candidate_id}: {type(exc).__name__}: {exc}"
+                )
+                if candidate_id not in orphan_ids:
+                    orphan_ids.append(candidate_id)
+            else:
+                orphan_ids = [orphan for orphan in orphan_ids if orphan != candidate_id]
+        return {"orphan_task_ids": orphan_ids, "cleanup_errors": cleanup_errors}
+
+    def _execute_write_canary(self, ops) -> dict:
+        started = time.monotonic()
+        reconciled: list[str] = []
+        identity = self._canary_identity()
+        cleanup_identity = None
+        task_id = None
+        phase = "reconcile-discovery"
+        try:
+            candidates = ops.find_active_candidates(WRITE_CANARY_STALE_LIMIT + 1)
+            collision = next(
+                (row for row in candidates if not self._is_canary_row(row)), None
+            )
+            if collision is not None:
+                raise _CanaryFailure(
+                    "reconcile-identity",
+                    "reserved canary namespace matched a row without the full marker set",
+                    kind="write-canary-identity-collision",
+                    task_id=collision.get("id"),
+                )
+            if len(candidates) > WRITE_CANARY_STALE_LIMIT:
+                orphan_ids = [
+                    str(row["id"])
+                    for row in candidates
+                    if row.get("id")
+                ]
+                raise _CanaryFailure(
+                    phase,
+                    f"more than {WRITE_CANARY_STALE_LIMIT} active canary candidates; "
+                    "bounded reconciliation refused",
+                    kind="write-canary-reconcile-limit",
+                    orphan_task_ids=orphan_ids,
+                )
+            for row in candidates:
+                stale_id = row.get("id")
+                stale_identity = self._canary_identity_from_row(row)
+                cleanup_identity = stale_identity
+                phase = "reconcile-archive"
+                if not ops.archive(stale_id, stale_identity):
+                    raise _CanaryFailure(
+                        phase,
+                        "stale canary archive returned false",
+                        kind="write-canary-archive",
+                        task_id=stale_id,
+                    )
+                phase = "reconcile-verify"
+                shown = ops.get(stale_id)
+                if (
+                    not shown
+                    or shown.get("status") != "archived"
+                    or not self._is_canary_row(shown)
+                ):
+                    raise _CanaryFailure(
+                        phase,
+                        "stale canary did not reach verified archived state",
+                        kind="write-canary-verification",
+                        task_id=stale_id,
+                    )
+                reconciled.append(stale_id)
+                cleanup_identity = None
+
+            phase = "create"
+            cleanup_identity = identity
+            task_id = ops.create(identity)
+            if not isinstance(task_id, str) or not task_id.startswith("t_"):
+                raise _CanaryFailure(
+                    "create-receipt",
+                    "create_task returned an invalid task id receipt",
+                    kind="write-canary-verification",
+                )
+
+            phase = "verify-create"
+            shown = ops.get(task_id)
+            if (
+                not shown
+                or shown.get("status") != "blocked"
+                or not self._is_canary_row(shown, identity)
+            ):
+                raise _CanaryFailure(
+                    phase,
+                    "created canary receipt did not match the reserved blocked card",
+                    kind="write-canary-verification",
+                    task_id=task_id,
+                )
+
+            phase = "archive"
+            if not ops.archive(task_id, identity):
+                raise _CanaryFailure(
+                    phase,
+                    "archive_task returned false",
+                    kind="write-canary-archive",
+                    task_id=task_id,
+                )
+
+            phase = "verify-cleanup"
+            shown = ops.get(task_id)
+            if (
+                not shown
+                or shown.get("status") != "archived"
+                or not self._is_canary_row(shown, identity)
+            ):
+                raise _CanaryFailure(
+                    phase,
+                    "canary did not reach verified archived state",
+                    kind="write-canary-verification",
+                    task_id=task_id,
+                )
+            return {
+                "ok": True,
+                "status": "healthy",
+                "task_id": task_id,
+                "reconciled_task_ids": reconciled,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+        except Exception as exc:
+            result = self._canary_failure(phase, exc, task_id)
+            cleanup = (
+                self._best_effort_canary_cleanup(
+                    ops, cleanup_identity, result["task_id"]
+                )
+                if cleanup_identity is not None
+                else {"orphan_task_ids": [], "cleanup_errors": []}
+            )
+            result["orphan_task_ids"] = list(
+                dict.fromkeys(
+                    [*result["orphan_task_ids"], *cleanup["orphan_task_ids"]]
+                )
+            )
+            result["cleanup_errors"] = cleanup["cleanup_errors"]
+            result["reconciled_task_ids"] = reconciled
+            result["duration_ms"] = int((time.monotonic() - started) * 1000)
+            return result
+
+    def _emit_write_canary_event(self, event: dict) -> None:
+        """Out-of-band sink. Never called until all canary transactions finish."""
+        encoded = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        if event["event"] == "recovery":
+            _log.warning("boardd: WRITE CANARY RECOVERY %s", encoded)
+        else:
+            _log.error("boardd: WRITE CANARY ALERT %s", encoded)
+        try:
+            path = os.path.join(os.path.dirname(self.db_realpath), WRITE_CANARY_ALERT_FILE)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(encoded + "\n")
+        except Exception as exc:
+            _log.error("boardd: write-canary alert sink failed: %s", exc)
+
+    def _load_write_canary_alarm(self) -> dict | None:
+        """Restore the last unresolved alarm so restarts cannot reset dedupe."""
+        path = os.path.join(os.path.dirname(self.db_realpath), WRITE_CANARY_ALERT_FILE)
+        last_event = None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        candidate = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("component") == "boardd"
+                        and candidate.get("subsystem") == "write-canary"
+                        and candidate.get("event")
+                        in {"failure", "repeat", "transition", "recovery"}
+                    ):
+                        last_event = candidate
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            _log.warning("boardd: write-canary alarm restore failed: %s", exc)
+            return None
+        if not last_event or last_event.get("event") == "recovery":
+            return None
+        if (
+            last_event.get("event") not in {"failure", "repeat", "transition"}
+            or not last_event.get("fingerprint")
+        ):
+            return None
+        try:
+            emitted_ts = int(
+                last_event.get("last_emitted_ts") or last_event.get("ts") or 0
+            )
+            count = max(1, int(last_event.get("count") or 1))
+            first_ts = int(last_event.get("first_ts") or emitted_ts)
+            last_ts = int(last_event.get("last_ts") or emitted_ts)
+        except (TypeError, ValueError) as exc:
+            _log.warning("boardd: malformed write-canary alarm state ignored: %s", exc)
+            return None
+        return {
+            "ok": False,
+            "status": "failing",
+            **{
+                key: last_event.get(key)
+                for key in (
+                    "kind",
+                    "phase",
+                    "detail",
+                    "error_type",
+                    "error_code",
+                    "task_id",
+                    "orphan_task_ids",
+                    "cleanup_errors",
+                )
+            },
+            "fingerprint": str(last_event["fingerprint"]),
+            "count": count,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "last_emitted_ts": emitted_ts,
+        }
+
+    def _record_write_canary_result(self, result: dict) -> None:
+        now = _now()
+        event = None
+        with self._write_canary_state_lock:
+            if result.get("status") == "suppressed-overlap":
+                self._write_canary_state["overlap_suppressed"] = (
+                    cast(int, self._write_canary_state["overlap_suppressed"]) + 1
+                )
+                return
+            self._write_canary_state["runs"] = (
+                cast(int, self._write_canary_state["runs"]) + 1
+            )
+            self._write_canary_state["last_run_ts"] = now
+            self._write_canary_state["last_task_id"] = result.get("task_id")
+            self._write_canary_state["last_reconciled_task_ids"] = result.get(
+                "reconciled_task_ids", []
+            )
+            if result.get("ok"):
+                self._write_canary_state["status"] = "healthy"
+                self._write_canary_state["last_success_ts"] = now
+                if self._write_canary_alarm is not None:
+                    previous = self._write_canary_alarm
+                    event = {
+                        "component": "boardd",
+                        "subsystem": "write-canary",
+                        "event": "recovery",
+                        "ts": now,
+                        "task_id": result.get("task_id"),
+                        "reconciled_task_ids": result.get("reconciled_task_ids", []),
+                        "previous_fingerprint": previous["fingerprint"],
+                        "previous_count": previous["count"],
+                        "failure_duration_s": max(0, now - previous["first_ts"]),
+                    }
+                self._write_canary_alarm = None
+            else:
+                self._write_canary_state["status"] = "failing"
+                self._write_canary_state["last_failure_ts"] = now
+                fingerprint = "|".join(
+                    str(result.get(key) or "")
+                    for key in ("kind", "phase", "error_code")
+                )
+                previous = self._write_canary_alarm
+                same = previous is not None and previous["fingerprint"] == fingerprint
+                if same and previous is not None:
+                    count = previous["count"] + 1
+                    first_ts = previous["first_ts"]
+                    last_emitted_ts = previous["last_emitted_ts"]
+                else:
+                    count = 1
+                    first_ts = now
+                    last_emitted_ts = 0
+                alarm = {
+                    **result,
+                    "fingerprint": fingerprint,
+                    "count": count,
+                    "first_ts": first_ts,
+                    "last_ts": now,
+                    "last_emitted_ts": last_emitted_ts,
+                }
+                should_emit = (
+                    not same
+                    or self._write_canary_alert_repeat_s == 0
+                    or now - last_emitted_ts >= self._write_canary_alert_repeat_s
+                )
+                if should_emit:
+                    alarm["last_emitted_ts"] = now
+                    event = {
+                        "component": "boardd",
+                        "subsystem": "write-canary",
+                        "event": (
+                            "failure"
+                            if previous is None
+                            else ("repeat" if same else "transition")
+                        ),
+                        "ts": now,
+                        **{
+                            key: alarm.get(key)
+                            for key in (
+                                "kind",
+                                "phase",
+                                "detail",
+                                "error_type",
+                                "error_code",
+                                "task_id",
+                                "orphan_task_ids",
+                                "cleanup_errors",
+                                "fingerprint",
+                                "count",
+                                "first_ts",
+                                "last_ts",
+                                "last_emitted_ts",
+                            )
+                        },
+                    }
+                self._write_canary_alarm = alarm
+        if event is not None:
+            self._emit_write_canary_event(event)
+
+    def run_write_canary_once(self, ops=None) -> dict:
+        """Run one non-overlapping functional probe through the broker socket."""
+        if not self._write_canary_lock.acquire(blocking=False):
+            result = {"ok": True, "status": "suppressed-overlap", "reason": "canary"}
+            self._record_write_canary_result(result)
+            return result
+        maintenance_acquired = False
+        owns_ops = ops is None
+        try:
+            maintenance_acquired = self._maintenance_lock.acquire(blocking=False)
+            if not maintenance_acquired:
+                result = {
+                    "ok": True,
+                    "status": "suppressed-overlap",
+                    "reason": "backup-maintenance",
+                }
+            else:
+                try:
+                    if ops is None:
+                        ops = _BrokerWriteCanaryOps(
+                            self.sock_path, self._write_canary_timeout_s
+                        )
+                    result = self._execute_write_canary(ops)
+                except Exception as exc:
+                    result = self._canary_failure("setup", exc, None)
+                    result.update(
+                        {
+                            "cleanup_errors": [],
+                            "reconciled_task_ids": [],
+                            "duration_ms": 0,
+                        }
+                    )
+                finally:
+                    if owns_ops and ops is not None:
+                        try:
+                            ops.close()
+                        except Exception:
+                            pass
+        finally:
+            if maintenance_acquired:
+                self._maintenance_lock.release()
+            self._write_canary_lock.release()
+        self._record_write_canary_result(result)
+        return result
+
+    def _write_canary_loop(self) -> None:
+        if self._write_canary_mode == "disabled":
+            return
+        if self._stop.wait(self._write_canary_start_delay_s):
+            return
+        while not self._stop.is_set():
+            result = self.run_write_canary_once()
+            if self._write_canary_mode == "once":
+                if result.get("status") != "suppressed-overlap":
+                    return
+                # Test/validation mode promises one actual probe, not one
+                # scheduling attempt. Back off briefly if backup/manual work
+                # owns the maintenance lane, then retry until stopped.
+                if self._stop.wait(0.1):
+                    return
+                continue
+            if self._stop.wait(self._write_canary_interval_s):
+                return
 
     def _broker_flen_check(self) -> None:
         """Torn-extend tripwire, run RIGHT AFTER wal_checkpoint(TRUNCATE) so the
@@ -803,6 +1532,13 @@ class Broker:
         return [dict(r) for r in rows]
 
     def _health(self) -> dict:
+        with self._write_canary_state_lock:
+            canary_state = dict(self._write_canary_state)
+            canary_alarm = (
+                dict(self._write_canary_alarm)
+                if self._write_canary_alarm is not None
+                else None
+            )
         return {
             "db": self.db_realpath,
             "pid": os.getpid(),
@@ -819,6 +1555,18 @@ class Broker:
             "txn_capped": self._txn_capped,
             "txn_open": self._txn_token is not None,
             "integrity_alarm": self._integrity_alarm,
+            "write_canary_ok": (
+                None
+                if canary_state["status"] in {"pending", "disabled"}
+                else canary_alarm is None
+            ),
+            "write_canary": canary_state,
+            "write_canary_alarm": canary_alarm,
+            "health_ok": (
+                self._disk_ok
+                and self._integrity_alarm is None
+                and canary_alarm is None
+            ),
         }
 
     # ---- maintenance loops (enqueue onto the DB thread) ------------------- #
@@ -844,46 +1592,51 @@ class Broker:
         while not self._stop.wait(BACKUP_INTERVAL_S):
             if not self._disk_ok:
                 continue
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            tmp = os.path.join(backups_dir, f".kanban.{ts}.partial")
-            final = os.path.join(backups_dir, f"kanban.{ts}.db")
-            try:
-                # Online backup runs on the DB thread (owned connection).
-                r = self.call_sync({"op": "_backup_to", "args": {"path": tmp}},
-                                   timeout=300)
-                if not r or not r.get("ok"):
-                    _log.warning("boardd: backup failed/timed out: %s", r)
+            # Backups and write canaries share one explicit maintenance lock.
+            # Normal clients remain serialized by the DB queue; this guard only
+            # prevents the periodic canary from starting during backup I/O.
+            with self._maintenance_lock:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                tmp = os.path.join(backups_dir, f".kanban.{ts}.partial")
+                final = os.path.join(backups_dir, f"kanban.{ts}.db")
+                try:
+                    # Online backup runs on the DB thread (owned connection).
+                    r = self.call_sync(
+                        {"op": "_backup_to", "args": {"path": tmp}}, timeout=300
+                    )
+                    if not r or not r.get("ok"):
+                        _log.warning("boardd: backup failed/timed out: %s", r)
+                        try:
+                            if os.path.exists(tmp):
+                                os.unlink(tmp)
+                        except OSError:
+                            pass
+                        continue
+                    # integrity_check of the COPY on a THROWAWAY connection (a
+                    # different file — never the live board, off the DB thread).
+                    vc = sqlite3.connect(tmp)
+                    ok = vc.execute("PRAGMA integrity_check").fetchone()[0]
+                    vc.close()
+                    if ok != "ok":
+                        _log.error("boardd: backup integrity_check FAILED: %s", ok)
+                        os.unlink(tmp)
+                        continue
+                    os.replace(tmp, final)
+                    # rotate
+                    keep = sorted(glob.glob(os.path.join(backups_dir, "kanban.*.db")))
+                    for old in keep[:-BACKUP_KEEP]:
+                        try:
+                            os.unlink(old)
+                        except OSError:
+                            pass
+                    _log.info("boardd: backup ok -> %s", final)
+                except Exception as exc:
+                    _log.warning("boardd: backup error: %s", exc)
                     try:
                         if os.path.exists(tmp):
                             os.unlink(tmp)
                     except OSError:
                         pass
-                    continue
-                # integrity_check of the COPY on a THROWAWAY connection (a
-                # different file — never the live board, off the DB thread).
-                vc = sqlite3.connect(tmp)
-                ok = vc.execute("PRAGMA integrity_check").fetchone()[0]
-                vc.close()
-                if ok != "ok":
-                    _log.error("boardd: backup integrity_check FAILED: %s", ok)
-                    os.unlink(tmp)
-                    continue
-                os.replace(tmp, final)
-                # rotate
-                keep = sorted(glob.glob(os.path.join(backups_dir, "kanban.*.db")))
-                for old in keep[:-BACKUP_KEEP]:
-                    try:
-                        os.unlink(old)
-                    except OSError:
-                        pass
-                _log.info("boardd: backup ok -> %s", final)
-            except Exception as exc:
-                _log.warning("boardd: backup error: %s", exc)
-                try:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-                except OSError:
-                    pass
 
     def _diskguard_loop(self) -> None:
         while not self._stop.wait(0 if self._disk_free < 0 else DISKGUARD_INTERVAL_S):
@@ -987,24 +1740,93 @@ class Broker:
         self._sd_notify("READY=1")
         threading.Thread(target=self._watchdog_loop, name="boardd-watchdog",
                          daemon=True).start()
+        if self._write_canary_mode != "disabled":
+            self._write_canary_thread_obj = threading.Thread(
+                target=self._write_canary_loop,
+                name="boardd-write-canary",
+                daemon=True,
+            )
+            self._write_canary_thread_obj.start()
 
     def serve_forever(self) -> None:
         assert self._server is not None
         self._server.serve_forever(poll_interval=0.5)
 
+    def _signal_shutdown(self, signum=None, frame=None) -> None:
+        """SIGTERM/SIGINT entry: start teardown on a dedicated coordinator thread.
+
+        ``socketserver.BaseServer.shutdown()`` must be invoked from a thread
+        other than the one blocked in ``serve_forever()``. Python delivers
+        signals on the main thread, which is also the serve thread, so calling
+        ``shutdown()`` directly from the handler deadlocks before canary join,
+        DB-thread close, or socket unlink. Spawn once; body is idempotent.
+        """
+        with self._shutdown_coord_lock:
+            if self._shutdown_coord_started:
+                return
+            self._shutdown_coord_started = True
+            self._shutdown_coord_thread = threading.Thread(
+                target=self.shutdown,
+                name="boardd-shutdown-coord",
+                daemon=True,
+            )
+            self._shutdown_coord_thread.start()
+
     def shutdown(self, *_a) -> None:
-        _log.info("boardd: shutdown requested")
-        self._stop.set()
-        if self._server is not None:
-            self._server.shutdown()
-        self.q.put(_STOP)
-        if self._db_thread_obj is not None:
-            self._db_thread_obj.join(timeout=10)
+        """Idempotent ordered teardown: canary join -> server stop -> DB close -> unlink.
+
+        Safe to call from the signal coordinator, from ``main()``'s ``finally``,
+        or directly from unit tests. Concurrent/serial callers either perform
+        the body once or wait for the in-flight teardown to finish.
+        """
+        if not self._shutdown_lock.acquire(blocking=False):
+            # Another thread owns teardown; wait for ordered completion.
+            # Bound wait so a wedged peer cannot hang a second caller forever.
+            self._shutdown_done.wait(
+                timeout=max(15.0, self._write_canary_timeout_s + 12.0)
+            )
+            return
         try:
-            if os.path.exists(self.sock_path):
-                os.unlink(self.sock_path)
-        except OSError:
-            pass
+            if self._shutdown_done.is_set():
+                return
+            _log.info("boardd: shutdown requested")
+            self._stop.set()
+            self._sd_notify("STOPPING=1")
+            if self._write_canary_thread_obj is not None:
+                self._write_canary_thread_obj.join(
+                    timeout=max(1.0, self._write_canary_timeout_s + 1.0)
+                )
+                if self._write_canary_thread_obj.is_alive():
+                    _log.error(
+                        "boardd: write canary did not stop within %.1fs; "
+                        "continuing shutdown",
+                        self._write_canary_timeout_s + 1.0,
+                    )
+                else:
+                    _log.info("boardd: write canary stopped")
+            if self._server is not None:
+                # Must run off the serve_forever thread (see _signal_shutdown).
+                self._server.shutdown()
+                _log.info("boardd: server stopped")
+            self.q.put(_STOP)
+            if self._db_thread_obj is not None:
+                self._db_thread_obj.join(timeout=10)
+                if self._db_thread_obj.is_alive():
+                    _log.error(
+                        "boardd: DB thread did not stop within 10s; "
+                        "continuing socket unlink"
+                    )
+                else:
+                    _log.info("boardd: DB thread stopped")
+            try:
+                if os.path.exists(self.sock_path):
+                    os.unlink(self.sock_path)
+                    _log.info("boardd: socket unlinked")
+            except OSError as exc:
+                _log.warning("boardd: socket unlink failed: %s", exc)
+        finally:
+            self._shutdown_done.set()
+            self._shutdown_lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -1317,6 +2139,36 @@ def main(argv=None) -> int:
     ap.add_argument("--import-schema", action="store_true",
                     help="obtain connection+schema from hermes_cli.kanban_db "
                          "(production: guarantees byte-identical schema/pragmas)")
+    ap.add_argument(
+        "--write-canary-mode",
+        choices=("disabled", "periodic", "once"),
+        default=WRITE_CANARY_MODE,
+        help="functional write probe mode; once is intended for validation/tests",
+    )
+    ap.add_argument(
+        "--write-canary-start-delay",
+        type=float,
+        default=WRITE_CANARY_START_DELAY_S,
+        metavar="SECONDS",
+    )
+    ap.add_argument(
+        "--write-canary-interval",
+        type=float,
+        default=WRITE_CANARY_INTERVAL_S,
+        metavar="SECONDS",
+    )
+    ap.add_argument(
+        "--write-canary-timeout",
+        type=float,
+        default=WRITE_CANARY_TIMEOUT_S,
+        metavar="SECONDS",
+    )
+    ap.add_argument(
+        "--write-canary-alert-repeat",
+        type=float,
+        default=WRITE_CANARY_ALERT_REPEAT_S,
+        metavar="SECONDS",
+    )
     ap.add_argument("--log-level", default=os.environ.get("BOARDD_LOG_LEVEL", "INFO"))
     args = ap.parse_args(argv)
 
@@ -1328,18 +2180,36 @@ def main(argv=None) -> int:
         # default to importing the live schema in production
         args.import_schema = True
 
-    broker = Broker(args.db, args.sock,
-                    schema_sql_file=args.schema_sql_file,
-                    import_schema=args.import_schema)
+    broker = Broker(
+        args.db,
+        args.sock,
+        schema_sql_file=args.schema_sql_file,
+        import_schema=args.import_schema,
+        write_canary_mode=args.write_canary_mode,
+        write_canary_start_delay_s=args.write_canary_start_delay,
+        write_canary_interval_s=args.write_canary_interval,
+        write_canary_timeout_s=args.write_canary_timeout,
+        write_canary_alert_repeat_s=args.write_canary_alert_repeat,
+    )
 
-    signal.signal(signal.SIGTERM, broker.shutdown)
-    signal.signal(signal.SIGINT, broker.shutdown)
+    # Signal handlers only kick a coordinator thread; they must not call
+    # BaseServer.shutdown() on the main/serve thread (deadlock).
+    signal.signal(signal.SIGTERM, broker._signal_shutdown)
+    signal.signal(signal.SIGINT, broker._signal_shutdown)
 
     broker.start()
     try:
         broker.serve_forever()
     finally:
+        # Idempotent: no-op wait if the signal coordinator already tore down.
         broker.shutdown()
+        coord = broker._shutdown_coord_thread
+        if (
+            coord is not None
+            and coord is not threading.current_thread()
+            and coord.is_alive()
+        ):
+            coord.join(timeout=max(15.0, broker._write_canary_timeout_s + 12.0))
     return 0
 
 

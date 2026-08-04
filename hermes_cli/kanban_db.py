@@ -7601,13 +7601,55 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+_ARCHIVE_IDENTITY_FIELDS = ("title", "body", "created_by", "idempotency_key")
+
+
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_identity: Optional[dict[str, str]] = None,
+    recompute_dependents: bool = True,
+) -> bool:
+    """Archive a task, optionally guarded by its complete immutable identity.
+
+    ``expected_identity`` is used by broker maintenance that first discovers a
+    disposable row and later archives it. The guard is part of the same atomic
+    UPDATE as the archive, so a concurrent client cannot repurpose the row
+    between verification and mutation. Maintenance-only disposable rows may
+    set ``recompute_dependents=False`` because they cannot have dependency
+    links; ordinary callers retain the existing readiness recompute.
+    """
+    guard_sql = ""
+    guard_params: list[object] = []
+    if expected_identity is not None:
+        if set(expected_identity) != set(_ARCHIVE_IDENTITY_FIELDS):
+            raise ValueError(
+                "expected_identity must contain exactly: "
+                + ", ".join(_ARCHIVE_IDENTITY_FIELDS)
+            )
+        guard_sql = (
+            " AND title IS ? AND body IS ?"
+            " AND created_by IS ? AND idempotency_key IS ?"
+        )
+        guard_params = [expected_identity[field] for field in _ARCHIVE_IDENTITY_FIELDS]
+    if not recompute_dependents:
+        if expected_identity is None:
+            raise ValueError(
+                "recompute_dependents=False requires an expected_identity guard"
+            )
+        guard_sql += (
+            " AND NOT EXISTS ("
+            "SELECT 1 FROM task_links "
+            "WHERE parent_id = tasks.id OR child_id = tasks.id"
+            ")"
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'" + guard_sql,
+            (task_id, *guard_params),
         )
         if cur.rowcount != 1:
             return False
@@ -7622,8 +7664,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
-    recompute_ready(conn)
+    # for a later dispatcher tick. Reserved maintenance cards have no links and
+    # suppress this global scan so the probe cannot perturb normal queues.
+    if recompute_dependents:
+        recompute_ready(conn)
     return True
 
 
