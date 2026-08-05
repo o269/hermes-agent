@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,6 +102,20 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# These assignees are terminal custody lanes, not executors. Their parked rows
+# move only through an explicit operator action, never list/dispatcher repair.
+TERMINAL_CUSTODY_ASSIGNEES = frozenset({
+    "fable",
+    "s4",
+    "operator-gate",
+    "terminal",
+})
+
+
+def _is_terminal_custody_row(row: Mapping[str, Any]) -> bool:
+    """Return ``True`` for rows parked under terminal/operator custody."""
+    return str(row["assignee"] or "").strip().casefold() in TERMINAL_CUSTODY_ASSIGNEES
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -133,6 +148,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+class ContinuationAuthorizationError(RuntimeError):
+    """Fail-closed rejection for privileged continuation mutations."""
+
+    def __init__(self, code: str, message: Optional[str] = None):
+        self.code = str(code)
+        super().__init__(message or self.code.replace("_", " "))
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1311,6 +1334,21 @@ CREATE TABLE IF NOT EXISTS task_comments (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS kanban_schema_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_pr_ownership (
+    task_id           TEXT NOT NULL,
+    canonical_url     TEXT NOT NULL,
+    first_seen_at     INTEGER NOT NULL,
+    last_seen_at      INTEGER NOT NULL,
+    source_comment_id INTEGER,
+    declared          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, canonical_url)
+);
+
 CREATE TABLE IF NOT EXISTS task_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1389,6 +1427,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pr_ownership_url      ON task_pr_ownership(canonical_url, declared);
+CREATE INDEX IF NOT EXISTS idx_pr_ownership_task_seen ON task_pr_ownership(task_id, last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -2862,6 +2902,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _backfill_task_pr_ownership(conn)
+    _backfill_task_pr_declarations(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3921,6 +3963,19 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assignee = assignee_row["assignee"] if assignee_row else None
+        _record_task_pr_ownership(
+            conn,
+            task_id,
+            body.strip(),
+            observed_at=now,
+            source_comment_id=int(cur.lastrowid or 0),
+            declared=_is_self_authored(author, assignee),
+        )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
 
@@ -4410,13 +4465,17 @@ def recompute_ready(
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
+    parent completes), *except* in three cases:
 
-    1. The most recent block event was a worker-initiated
+    1. The assignee is a terminal-custody lane.  Those rows move only through
+       deliberate ``promote_task`` / ``unblock_task`` calls, even when a raw or
+       legacy hold has no typed ``blocked`` event.
+
+    2. The most recent block event was a worker-initiated
        ``kanban_block`` — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
+    3. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
@@ -4436,12 +4495,17 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if _is_terminal_custody_row(row):
+                # Listing and dispatcher ticks both call recompute_ready. A
+                # terminal-custody row must stay parked until deliberate manual
+                # release, regardless of event provenance.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4506,11 +4570,40 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    # F1-m: ownership-aware precheck before the write txn (reduced port).
-    if _active_pr_custody(conn, task_id, cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW):
+    # Active-PR custody blocks ordinary claims. A valid owner-bound Fable marker
+    # opens exactly one claim and is consumed atomically with the new run.
+    active_prs = _active_pr_custody(
+        conn,
+        task_id,
+        cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    resume_marker = _next_resume_marker(conn, task_id) if active_prs else None
+    if active_prs and resume_marker is None:
         _append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
         return None
     with write_txn(conn):
+        fresh_active_prs = _active_pr_custody(
+            conn,
+            task_id,
+            cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+        )
+        if fresh_active_prs:
+            fresh_marker = _next_resume_marker(conn, task_id)
+            if (
+                resume_marker is None
+                or fresh_marker is None
+                or int(fresh_marker["id"]) != int(resume_marker["id"])
+            ):
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "active_pr_resume_marker_unavailable"},
+                )
+                return None
+            resume_marker = fresh_marker
+        else:
+            resume_marker = None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4606,6 +4699,19 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if resume_marker is not None:
+            _append_event(
+                conn,
+                task_id,
+                _RESUME_MARKER_CONSUMED_KIND,
+                {
+                    "marker_event_id": int(resume_marker["id"]),
+                    "authorized_profile": resume_marker["authorized_profile"],
+                    "assignment_generation": resume_marker["assignment_generation"],
+                    "run_id": run_id,
+                },
+                run_id=run_id,
+            )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -6325,6 +6431,106 @@ def specify_triage_task(
     # idling in 'todo' until the next sweep.
     recompute_ready(conn)
     return True
+
+
+_DECOMPOSITION_HOLD_RE = re.compile(
+    r"(?:\b(?:OPERATOR-GATE|QUIESCE-GATE|FREEZE-GATE|DO-NOT-DECOMPOSE)\b"
+    r"|\bGATE-[A-Z0-9_-]+\b|\bDECISION\s+REQUIRED\b)",
+    re.IGNORECASE,
+)
+
+
+def decomposition_hold_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Explain why a triage card must not be decomposed, or return ``None``.
+
+    Active-PR custody is ownership-aware: a citation cross-posted from another
+    card does not freeze this card, while a PR declared by this card remains a
+    hard hold. This mirrors the dispatcher respawn guard.
+    """
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return f"no such task: {task_id}"
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+        (task_id,),
+    ).fetchone():
+        return "task was already decomposed"
+
+    active_prs = _active_pr_custody(
+        conn,
+        task_id,
+        cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if active_prs:
+        return (
+            f"active PR custody detected ({', '.join(active_prs)}). Finish or close "
+            "the existing PR instead of creating replacement work"
+        )
+
+    for source, text in (("title", row["title"]), ("body", row["body"])):
+        match = _DECOMPOSITION_HOLD_RE.search(text or "")
+        if match:
+            return f"{source} contains control-plane hold {match.group(0)!r}"
+    return None
+
+
+def list_decomposition_eligible_triage_ids(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
+    """Return a bounded triage page without N+1 hold-check reads.
+
+    Only declared in-window PR ownership blocks decomposition. Referenced PRs
+    remain eligible, matching :func:`decomposition_hold_reason`.
+    """
+    bounded_limit = max(1, min(int(limit), 1000))
+    tenant_clause = " AND t.tenant = ?" if tenant is not None else ""
+    params: list[Any] = []
+    if tenant is not None:
+        params.append(tenant)
+    cutoff = int(time.time()) - _RESPAWN_GUARD_PR_WINDOW
+    params.extend((bounded_limit, cutoff))
+    rows = conn.execute(
+        f"""
+        WITH candidates AS (
+            SELECT t.id, t.title, t.body, t.priority, t.created_at
+            FROM tasks AS t
+            WHERE t.status = 'triage'{tenant_clause}
+            ORDER BY t.priority DESC, t.created_at ASC
+            LIMIT ?
+        )
+        SELECT c.id, c.title, c.body,
+               EXISTS (
+                   SELECT 1 FROM task_events AS e
+                   WHERE e.task_id = c.id AND e.kind = 'decomposed'
+               ) AS was_decomposed,
+               EXISTS (
+                   SELECT 1 FROM task_pr_ownership AS own
+                   WHERE own.task_id = c.id
+                     AND own.last_seen_at >= ?
+                     AND own.declared = 1
+               ) AS has_active_pr
+        FROM candidates AS c
+        ORDER BY c.priority DESC, c.created_at ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return [
+        str(row["id"])
+        for row in rows
+        if not bool(row["was_decomposed"])
+        and not bool(row["has_active_pr"])
+        and _DECOMPOSITION_HOLD_RE.search(row["title"] or "") is None
+        and _DECOMPOSITION_HOLD_RE.search(row["body"] or "") is None
+    ]
 
 
 def decompose_triage_task(
@@ -8468,6 +8674,275 @@ def _active_pr_custody(
     """Ordered canonical PR URLs this card actually owns inside the window."""
     owned, _ = _active_pr_candidates(conn, task_id, cutoff=cutoff)
     return tuple(str(record["canonical_url"]) for record in owned)
+
+
+_RESUME_MARKER_KIND = "resume_marker"
+_RESUME_MARKER_CONSUMED_KIND = "resume_marker_consumed"
+_RESUME_MARKER_ACTOR = "fable"
+_DEFAULT_IGNORABLE_REASON_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_BLANK_REASON_CODEPOINTS = frozenset({0x2800})
+
+
+def _normalize_visible_audit_reason(value: Any) -> str:
+    """Return stripped audit text only when it contains visible base ink."""
+    text = str(value or "").strip()
+    for char in text:
+        codepoint = ord(char)
+        if codepoint in _BLANK_REASON_CODEPOINTS:
+            continue
+        if any(
+            first <= codepoint <= last
+            for first, last in _DEFAULT_IGNORABLE_REASON_RANGES
+        ):
+            continue
+        if unicodedata.category(char)[0] in {"L", "N", "P", "S"}:
+            return text
+    return ""
+
+
+def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
+    """Resolve authority from the opened board's canonical SQLite path."""
+    try:
+        main = next(
+            row
+            for row in conn.execute("PRAGMA database_list").fetchall()
+            if row["name"] == "main"
+        )
+        raw_path = str(main["file"] or "").strip()
+        if not raw_path:
+            return None
+        db_path = Path(raw_path).resolve()
+        if (
+            db_path.parent.parent.name == "boards"
+            and db_path.parent.parent.parent.name == "kanban"
+        ):
+            return db_path.parents[3].resolve()
+        return db_path.parent.resolve()
+    except (OSError, StopIteration, sqlite3.Error):
+        return None
+
+
+def _operator_control_plane_active() -> bool:
+    """Return true only inside the root gateway's opaque control-plane lease."""
+    try:
+        from gateway.status import gateway_control_plane_active
+
+        return bool(gateway_control_plane_active())
+    except Exception:
+        return False
+
+
+def _operator_gateway_lock_owned(authority_root: Path) -> bool:
+    """Return true only when this process owns the root gateway runtime lock."""
+    try:
+        from gateway.status import process_owns_gateway_runtime_lock
+
+        return bool(process_owns_gateway_runtime_lock(authority_root))
+    except Exception:
+        return False
+
+
+def _continuation_operator_profiles(authority_root: Path) -> tuple[str, ...]:
+    """Read the operator allowlist from the board's real Hermes root."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    default = DEFAULT_CONFIG.get("kanban", {}).get(
+        "continuation_operator_profiles", "default"
+    )
+    raw: Any = default
+    config_path = authority_root / "config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml
+
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            raw = (data.get("kanban") or {}).get(
+                "continuation_operator_profiles", default
+            )
+        except Exception:
+            return ()
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            value
+            for item in values
+            if (value := str(item or "").strip().casefold())
+        )
+    )
+
+
+def _continuation_operator_context(
+    conn: sqlite3.Connection,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve operator identity and board-bound allowlist at mutation time."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        raise ContinuationAuthorizationError("operator_authority_root_unresolved")
+    if not _operator_control_plane_active():
+        raise ContinuationAuthorizationError("operator_gateway_context_required")
+    if not _operator_gateway_lock_owned(authority_root):
+        raise ContinuationAuthorizationError("operator_gateway_process_required")
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        raise ContinuationAuthorizationError("operator_worker_context_forbidden")
+    profile = str(get_active_profile_name() or "").strip().casefold()
+    if not profile or profile == "custom":
+        raise ContinuationAuthorizationError("operator_profile_unresolved")
+    profiles = _continuation_operator_profiles(authority_root)
+    if profile not in profiles:
+        raise ContinuationAuthorizationError("operator_profile_not_allowed")
+    return profile, profiles
+
+
+def _resume_assignment_generation(conn: sqlite3.Connection, task_id: str) -> int:
+    """Use the append-only assignment event id as an ABA-safe owner generation."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS generation FROM task_events "
+        "WHERE task_id = ? AND kind = 'assigned'",
+        (task_id,),
+    ).fetchone()
+    return int(row["generation"] or 0) if row is not None else 0
+
+
+def _resume_owner(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    profile = str(row["assignee"] or "").strip().casefold()
+    if not profile:
+        return None
+    return profile, _resume_assignment_generation(conn, task_id)
+
+
+def add_resume_marker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> int:
+    """Mint one owner-bound, one-shot active-PR resume marker."""
+    if str(actor or "").strip().casefold() != _RESUME_MARKER_ACTOR:
+        raise ValueError("resume markers may only be set by fable")
+    normalized_reason = _normalize_visible_audit_reason(reason)
+    if not normalized_reason:
+        raise ValueError("resume marker reason must contain visible audit text")
+
+    authorizer, _ = _continuation_operator_context(conn)
+    selected_owner = _resume_owner(conn, task_id)
+    if selected_owner is None:
+        if get_task(conn, task_id) is None:
+            raise ValueError(f"no such task: {task_id}")
+        raise ContinuationAuthorizationError("resume_owner_required")
+
+    with write_txn(conn):
+        fresh_authorizer, _ = _continuation_operator_context(conn)
+        if fresh_authorizer != authorizer:
+            raise ContinuationAuthorizationError("operator_identity_changed")
+        fresh_owner = _resume_owner(conn, task_id)
+        if fresh_owner != selected_owner:
+            raise ContinuationAuthorizationError("resume_owner_changed")
+        authorized_profile, assignment_generation = fresh_owner
+        _append_event(
+            conn,
+            task_id,
+            _RESUME_MARKER_KIND,
+            {
+                "actor": _RESUME_MARKER_ACTOR,
+                "authorized_by": fresh_authorizer,
+                "authorized_profile": authorized_profile,
+                "assignment_generation": assignment_generation,
+                "reason": normalized_reason,
+            },
+        )
+        row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+        if row is None or row["id"] is None:
+            raise RuntimeError("resume marker event was not durable")
+        return int(row["id"])
+
+
+def _next_resume_marker(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the oldest valid owner-bound marker not already consumed."""
+    owner = _resume_owner(conn, task_id)
+    if owner is None:
+        return None
+    authorized_profile, assignment_generation = owner
+
+    consumed_ids: set[int] = set()
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id ASC",
+        (task_id, _RESUME_MARKER_CONSUMED_KIND),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        marker_id = payload.get("marker_event_id") if isinstance(payload, dict) else None
+        if isinstance(marker_id, int) and not isinstance(marker_id, bool):
+            consumed_ids.add(marker_id)
+
+    for row in conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id ASC",
+        (task_id, _RESUME_MARKER_KIND),
+    ).fetchall():
+        marker_id = int(row["id"])
+        if marker_id in consumed_ids:
+            continue
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            str(payload.get("actor") or "").strip().casefold() != _RESUME_MARKER_ACTOR
+            or not str(payload.get("authorized_by") or "").strip()
+            or str(payload.get("authorized_profile") or "").strip().casefold()
+            != authorized_profile
+            or payload.get("assignment_generation") != assignment_generation
+            or not _normalize_visible_audit_reason(payload.get("reason"))
+        ):
+            continue
+        return {
+            "id": marker_id,
+            "authorized_profile": authorized_profile,
+            "assignment_generation": assignment_generation,
+            "reason": str(payload["reason"]).strip(),
+            "created_at": int(row["created_at"]),
+        }
+    return None
+
 
 def _active_pr_guard_detail(
     owned: Sequence[Mapping[str, Any]],

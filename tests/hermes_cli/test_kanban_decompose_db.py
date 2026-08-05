@@ -32,6 +32,30 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
     )
 
 
+def test_decomposition_eligibility_ignores_cross_posted_pr_citations(kanban_home):
+    pr_url = "https://github.com/acme/widget/pull/36"
+    with kb.connect() as conn:
+        referenced_id = _create_triage(
+            conn,
+            title="citation only",
+            assignee="worker",
+        )
+        declared_id = _create_triage(
+            conn,
+            title="owns repair PR",
+            assignee="worker",
+        )
+        kb.add_comment(conn, referenced_id, "observer", f"Related repair: {pr_url}")
+        kb.add_comment(conn, declared_id, "worker", f"AUTHOR COMPLETE {pr_url}")
+
+        assert kb.decomposition_hold_reason(conn, referenced_id) is None
+        assert kb.decomposition_hold_reason(conn, declared_id) is not None
+        eligible = kb.list_decomposition_eligible_triage_ids(conn)
+
+    assert referenced_id in eligible
+    assert declared_id not in eligible
+
+
 def test_decompose_creates_children_and_promotes_root(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a feature")

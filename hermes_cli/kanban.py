@@ -563,6 +563,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
 
+    # --- guarded one-shot active-PR continuation ---
+    p_continuation = sub.add_parser(
+        "continuation",
+        help="Authorize one owner-bound active-PR repair claim",
+        description=(
+            "Resume is a control-plane mutation: invoke it as a /kanban command "
+            "through the live root gateway. Direct shell and Kanban worker "
+            "processes fail closed."
+        ),
+    )
+    continuation_sub = p_continuation.add_subparsers(dest="continuation_action")
+    p_cont_resume = continuation_sub.add_parser(
+        "resume",
+        help="Mint one Fable-only resume marker for the card's current assignee",
+    )
+    p_cont_resume.add_argument("task_id")
+    p_cont_resume.add_argument(
+        "--actor",
+        required=True,
+        help="Must be exactly 'fable'",
+    )
+    p_cont_resume.add_argument(
+        "--reason",
+        required=True,
+        help="Visible repair rationale stored in the immutable task event ledger",
+    )
+    p_cont_resume.add_argument("--json", action="store_true")
+
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
@@ -1056,6 +1084,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
+            "continuation": _cmd_continuation,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "attach":   _cmd_attach,
@@ -2008,6 +2037,46 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
         return 1
     print(f"Unlinked {args.parent_id} -> {args.child_id}")
     return 0
+
+
+def _cmd_continuation(args: argparse.Namespace) -> int:
+    """Mint a guarded, one-shot owner resume marker."""
+    action = getattr(args, "continuation_action", None)
+    if action == "resume":
+        with kb.connect_closing() as conn:
+            event_id = kb.add_resume_marker(
+                conn,
+                args.task_id,
+                actor=args.actor,
+                reason=args.reason,
+            )
+            marker = next(
+                event
+                for event in kb.list_events(conn, args.task_id)
+                if event.id == event_id
+            )
+        payload = dict(marker.payload or {})
+        result = {
+            "event_id": event_id,
+            "task_id": args.task_id,
+            "kind": "resume_marker",
+            **payload,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            print(
+                f"Resume marker {event_id} recorded for {args.task_id}; "
+                f"owner={payload.get('authorized_profile', '(unknown)')}"
+            )
+        return 0
+
+    print(
+        "usage: hermes kanban continuation resume <task_id> "
+        "--actor fable --reason <reason>",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -3250,6 +3319,7 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `continuation resume …`  Fable-only one-shot active-PR repair claim
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

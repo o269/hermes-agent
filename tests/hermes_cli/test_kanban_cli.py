@@ -39,6 +39,91 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _arm_fable_gateway(kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  continuation_operator_profiles: fable\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kb, "_operator_control_plane_active", lambda: True)
+    monkeypatch.setattr(kb, "_operator_gateway_lock_owned", lambda _root: True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "fable",
+    )
+
+
+def test_run_slash_continuation_resume_consumes_marker_once(
+    kanban_home, monkeypatch
+):
+    _arm_fable_gateway(kanban_home, monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="repair active PR", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+            (task_id,),
+        )
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "AUTHOR COMPLETE https://github.com/acme/widget/pull/36",
+        )
+
+    resumed = kc.run_slash(
+        f"continuation resume {task_id} --actor fable "
+        "--reason 'review found a focused repair'"
+    )
+    assert "Resume marker" in resumed
+    assert "owner=worker" in resumed
+
+    claimed = kc.run_slash(f"claim {task_id}")
+    assert f"Claimed {task_id}" in claimed
+    with kb.connect() as conn:
+        markers = [event for event in kb.list_events(conn, task_id) if event.kind == "resume_marker"]
+        consumed = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "resume_marker_consumed"
+        ]
+        assert len(markers) == 1
+        assert len(consumed) == 1
+        assert consumed[0].payload is not None
+        assert consumed[0].payload["marker_event_id"] == markers[0].id
+        assert kb._next_resume_marker(conn, task_id) is None
+
+
+def test_run_slash_continuation_resume_fails_closed(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guarded repair", assignee="worker")
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kb, "_operator_control_plane_active", lambda: False)
+    out = kc.run_slash(
+        f"continuation resume {task_id} --actor fable --reason repair"
+    )
+    assert "operator gateway context required" in out
+
+    _arm_fable_gateway(kanban_home, monkeypatch)
+    out = kc.run_slash(
+        f"continuation resume {task_id} --actor worker --reason repair"
+    )
+    assert "resume markers may only be set by fable" in out
+
+    invisible = "\u180e\u2060\ufe0f\U000e0100"
+    out = kc.run_slash(
+        f"continuation resume {task_id} --actor fable --reason '{invisible}'"
+    )
+    assert "resume marker reason must contain visible audit text" in out
+
+    out = kc.run_slash(
+        "continuation resume t_missing --actor fable --reason repair"
+    )
+    assert "no such task: t_missing" in out
+
+
 
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
