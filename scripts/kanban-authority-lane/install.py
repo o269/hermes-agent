@@ -23,6 +23,11 @@ SOURCE_DIR = Path(__file__).resolve().parent
 # (source, destination relative to HERMES_HOME, mode)
 INSTALL_MANIFEST = (
     (SOURCE_DIR / "authority_lane_policy.py", Path("scripts/authority_lane_policy.py"), 0o644),
+    (
+        SOURCE_DIR / "hermes_pr_destination_guard.py",
+        Path("scripts/hermes_pr_destination_guard.py"),
+        0o755,
+    ),
     (SOURCE_DIR / "kanban_bridge_state.py", Path("scripts/kanban_bridge_state.py"), 0o755),
     (SOURCE_DIR / "kanban_codex_service.sh", Path("scripts/kanban_codex_service.sh"), 0o755),
     (

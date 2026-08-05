@@ -1523,9 +1523,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     The ceiling guards against unbounded growth, not against any growth.
     The block absorbed the load-bearing worker/orchestrator reference
     details (workspace kinds, deliverable artifacts, created-card claims,
-    profile discovery) when the standalone kanban-worker / kanban-orchestrator
-    skills were removed and folded into this always-injected guidance, so the
-    ceiling is sized to fit that content with a little headroom.
+    profile discovery, explicit PR destination safety) when the standalone
+    kanban-worker / kanban-orchestrator skills were removed and folded into this
+    always-injected guidance, so the ceiling is sized to fit that content with a
+    little headroom.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -1535,7 +1536,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_750, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
