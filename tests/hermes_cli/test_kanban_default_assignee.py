@@ -1,8 +1,9 @@
 """Regression tests for #27145 — kanban.default_assignee for unassigned ready tasks.
 
 When the dispatcher hits an unassigned ready task and ``kanban.default_assignee``
-is set, the dispatcher applies the assignment and spawns. Without the config,
-the task is skipped (existing behavior preserved).
+is set to a *spawnable* named profile, the dispatcher applies the assignment and
+spawns. Without the config (or with an unresolvable/default fallback), the task
+is skipped (existing fail-closed behavior preserved).
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB + a real worker profile."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
     # Force-reimport so the fresh HERMES_HOME is picked up.
@@ -24,6 +25,8 @@ def isolated_kanban_home(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    # Named profile required: bare "default" is never a kanban spawn target.
+    os.makedirs(os.path.join(test_home, "profiles", "worker"), exist_ok=True)
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test
@@ -54,9 +57,9 @@ def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):
 
 
 def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_home):
-    """Core #27145 contract: with default_assignee set, an unassigned ready
-    task gets the assignment applied and dispatched on the same tick. The
-    DB row is mutated (assignee column + an 'assigned' event)."""
+    """Core #27145 contract: with a spawnable default_assignee set, an
+    unassigned ready task gets the assignment applied and dispatched on the
+    same tick. The DB row is mutated (assignee column + an 'assigned' event)."""
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
@@ -64,17 +67,17 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
-            default_assignee="default",
+            default_assignee="worker",
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned
     assert len(res.spawned) == 1
     assert res.spawned[0][0] == task_id
-    assert res.spawned[0][1] == "default"
+    assert res.spawned[0][1] == "worker"
 
     with kb.connect_closing() as conn:
         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    assert row["assignee"] == "default"
+    assert row["assignee"] == "worker"
 
     # 'assigned' event emitted for the audit trail
     with kb.connect_closing() as conn:
@@ -84,7 +87,7 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         ))
     assert len(evs) == 1
     payload = json.loads(evs[0][1])
-    assert payload["assignee"] == "default"
+    assert payload["assignee"] == "worker"
     assert payload["source"] == "kanban.default_assignee"
 
 
@@ -100,7 +103,7 @@ def test_dry_run_with_default_assignee_reports_without_mutating(isolated_kanban_
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
-            default_assignee="default",
+            default_assignee="worker",
         )
     assert res.auto_assigned_default == [task_id]
     assert len(res.spawned) == 1
@@ -127,6 +130,22 @@ def test_whitespace_default_assignee_treated_as_none(isolated_kanban_home):
     assert not res.auto_assigned_default
 
 
+def test_bare_default_default_assignee_does_not_auto_assign(isolated_kanban_home):
+    """Fail-closed: kanban.default_assignee=default is not a spawnable target."""
+    kb, _home = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="t1", assignee=None)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False,
+            default_assignee="default",
+        )
+    assert task_id in res.skipped_unassigned
+    assert not res.auto_assigned_default
+    assert not res.spawned
+
+
 def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_home):
     """A task with an explicit assignee must NOT be touched by the
     default_assignee logic — that fallback only applies to genuinely
@@ -134,14 +153,14 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee="default")
+        task_id = kb.create_task(conn, title="t1", assignee="worker")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="someother",
         )
     assert task_id not in res.auto_assigned_default
-    assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
+    assert any(s[0] == task_id and s[1] == "worker" for s in res.spawned)
 
 
 def test_dispatch_result_has_auto_assigned_default_field():

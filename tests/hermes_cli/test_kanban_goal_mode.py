@@ -21,6 +21,10 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import goals
 
 
+def _ensure_worker_profile(kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -122,6 +126,7 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
+    _ensure_worker_profile(kanban_home)
     captured = {}
 
     class _FakeProc:
@@ -137,7 +142,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
         tid = kb.create_task(
             conn,
             title="goal task",
-            assignee="default",
+            assignee="worker",
             goal_mode=True,
             goal_max_turns=5,
         )
@@ -150,6 +155,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
 
 
 def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
+    _ensure_worker_profile(kanban_home)
     captured = {}
 
     class _FakeProc:
@@ -162,7 +168,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="plain", assignee="default")
+        tid = kb.create_task(conn, title="plain", assignee="worker")
         task = kb.get_task(conn, tid)
 
     kb._default_spawn(task, str(kanban_home))

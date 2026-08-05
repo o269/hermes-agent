@@ -11,6 +11,10 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _ensure_worker_profile(kanban_home: Path) -> None:
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+
+
 _NO_DB_OVERRIDE = object()
 
 
@@ -39,6 +43,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ):
         monkeypatch.delenv(name, raising=False)
     kb.init_db()
+    _ensure_worker_profile(home)
     return home
 
 
@@ -300,6 +305,7 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
     stored_skills: object,
     expected: list[str],
 ) -> None:
+    _ensure_worker_profile(kanban_home)
     popen_calls: list[tuple[list[str], dict[str, object]]] = []
 
     class FakeProc:
@@ -318,7 +324,7 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
         task_id = kb.create_task(
             conn,
             title="real DB skills dispatch",
-            assignee="default",
+            assignee="worker",
             skills=cast(Any, created_skills),
         )
         if stored_skills is not _NO_DB_OVERRIDE:
@@ -334,7 +340,7 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
             skill_validator=lambda _profile, _skills: [],
         )
 
-        assert result.spawned == [(task_id, "default", result.spawned[0][2])]
+        assert result.spawned == [(task_id, "worker", result.spawned[0][2])]
         assert result.auto_blocked == []
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -347,7 +353,7 @@ def test_real_db_claim_dispatch_emits_exact_normalized_argv(
     expected_cmd = [
         *kb._resolve_hermes_argv(),
         "-p",
-        "default",
+        "worker",
         "--cli",
         "--accept-hooks",
     ]
@@ -396,6 +402,7 @@ def test_real_db_dispatch_fail_closes_invalid_skills_before_claim(
     stored_skills: object,
     reason: str,
 ) -> None:
+    _ensure_worker_profile(kanban_home)
     popen_calls: list[object] = []
 
     def fail_popen(*args: object, **_kwargs: object) -> None:
@@ -408,7 +415,7 @@ def test_real_db_dispatch_fail_closes_invalid_skills_before_claim(
         task_id = kb.create_task(
             conn,
             title="invalid legacy DB skills",
-            assignee="default",
+            assignee="worker",
             skills=["seed"],
         )
         conn.execute(
@@ -432,7 +439,7 @@ def test_real_db_dispatch_fail_closes_invalid_skills_before_claim(
         error = task.last_failure_error
         assert error is not None
         assert error.startswith(
-            "forced_skill_preflight_error: profile=default; "
+            "forced_skill_preflight_error: profile=worker; "
             "skills=<invalid skill declaration>; error="
         )
         assert f"task {task_id} has invalid skills ({reason})" in error

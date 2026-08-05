@@ -6000,6 +6000,8 @@ class TestSharedBoardPaths:
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
+        # Real named profile required — fail-closed spawn refuses missing dirs.
+        (default_home / "profiles" / "coder").mkdir(parents=True)
 
         captured = {}
 
@@ -6891,11 +6893,19 @@ def test_dispatch_review_spawns_when_ready_empty(
 
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="worker")
+        _set_task_status(conn, t, "review")
+        assert kb.has_spawnable_review(conn) is True
+
+
+def test_has_spawnable_review_false_for_default_assignee(kanban_home):
+    """assignee=default is never a review spawn target (fail-closed)."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="default")
         _set_task_status(conn, t, "review")
-        # default profile should exist in the test env
-        assert kb.has_spawnable_review(conn) is True
+        assert kb.has_spawnable_review(conn) is False
 
 
 def test_has_spawnable_review_false_on_empty(kanban_home):

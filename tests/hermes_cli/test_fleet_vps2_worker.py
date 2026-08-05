@@ -357,9 +357,10 @@ def test_non_vps2_default_spawn_keeps_local_popen_path(
     assert captured["env"]["HERMES_HOME"] == str(profile)
 
 
-def test_spawn_target_import_failure_preserves_local_degraded_fallback(
+def test_spawn_target_import_failure_fails_closed_for_all_lanes(
     isolated_board, monkeypatch
 ):
+    """Partial install must not spawn metered base-config workers."""
     kb = isolated_board
     real_import = builtins.__import__
 
@@ -370,8 +371,9 @@ def test_spawn_target_import_failure_preserves_local_degraded_fallback(
 
     monkeypatch.setattr(builtins, "__import__", fail_optional_spawn_imports)
 
-    assert kb._assignee_has_spawn_target("local-profile") is True
+    assert kb._assignee_has_spawn_target("local-profile") is False
     assert kb._assignee_has_spawn_target("vps2-eng1") is False
+    assert kb._assignee_has_spawn_target("default") is False
 
 
 def test_loss_before_spawn_returns_card_through_canonical_failure_path(

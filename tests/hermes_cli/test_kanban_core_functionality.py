@@ -22,6 +22,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _ensure_named_profile(kanban_home, name: str) -> None:
+    (kanban_home / "profiles" / name).mkdir(parents=True, exist_ok=True)
 from hermes_cli.kanban import run_slash
 
 
@@ -2881,6 +2885,7 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
 
 
 def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "some-profile")
     """The dispatcher no longer auto-loads a bundled kanban skill.
 
     The kanban lifecycle (formerly the kanban-worker/kanban-orchestrator
@@ -2931,6 +2936,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 
 
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "ops")
     """A task runtime cap should raise the worker's terminal default.
 
     This is worker-scoped env only: normal CLI/gateway terminal settings stay
@@ -2970,6 +2976,7 @@ def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monk
 
 
 def test_default_spawn_preserves_longer_terminal_timeout(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "ops")
     """Kanban should never lower an explicitly larger terminal timeout."""
     captured = {}
 
@@ -3003,6 +3010,7 @@ def test_default_spawn_preserves_longer_terminal_timeout(kanban_home, monkeypatc
 
 
 def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "ops")
     """Uncapped tasks keep the existing terminal timeout behavior."""
     captured = {}
 
@@ -3156,6 +3164,7 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
 
 
 def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "linguist")
     """Dispatcher argv must carry one `--skills X` pair per task skill,
     in declared order. No skill is auto-loaded anymore."""
     captured = {}
@@ -3204,6 +3213,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
 
 
 def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
+    _ensure_named_profile(kanban_home, "x")
     """Per-task skills are passed through verbatim — there is no built-in
     kanban skill to dedupe against anymore."""
     captured = {}

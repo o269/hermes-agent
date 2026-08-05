@@ -12930,18 +12930,44 @@ def _preflight_forced_skills(
 
 
 def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
-    """Return whether an assignee has a local profile or configured VPS2 SSH target."""
+    """Return whether an assignee has a local profile or configured VPS2 SSH target.
+
+    Fail-closed contract (fleet incident t_534efda8 / operator ruling 2026-08-05):
+
+    * Unknown / missing named profiles never spawn.
+    * The special name ``default`` is the base HERMES_HOME control plane.
+      ``profile_exists("default")`` is always True by design, which previously
+      let parking-lane / unresolvable ``assignee=default`` cards spawn a
+      metered worker on base config. ``default`` is therefore never a kanban
+      worker spawn target — operators must route to a real named profile.
+    * Partial installs fail closed (no spawn) rather than falling through to
+      base-config defaults.
+    * ``vps2-*`` lanes remain remote-only and nonspawnable without a configured
+      SSH transport.
+    """
     if not assignee:
         return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        canon = normalize_profile_name(assignee)
+    except Exception:
+        canon = str(assignee).strip().lower()
+        if not canon:
+            return False
+
+    # Base control-plane profile is never a worker spawn target.
+    if canon == "default":
+        return False
+
     try:
         from hermes_cli.fleet_vps2_worker import (
             configured_vps2_worker,
             is_vps2_assignee,
         )
     except Exception:
-        # A partial/rolling install must fail closed for remote-only lanes while
-        # retaining the historical degraded-install fallback for local lanes.
-        if assignee.lower().startswith("vps2-"):
+        # Partial/rolling install: remote-only lanes stay nonspawnable.
+        if canon.startswith("vps2-"):
             return False
     else:
         # vps2-* lanes are remote-only. If the transport is disabled or its
@@ -12955,8 +12981,9 @@ def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
     try:
         from hermes_cli.profiles import profile_exists
     except Exception:
-        # Preserve the historical degraded-install behavior for local lanes.
-        return True
+        # Fail closed: never spawn a metered base-config worker when the
+        # profile registry cannot be consulted.
+        return False
     return bool(profile_exists(assignee))
 
 
@@ -13237,20 +13264,13 @@ def _dispatch_once_locked(
             )
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Resolve via the same fail-closed spawn-target predicate used for
+    # explicit assignees — never treat bare ``default`` / missing profiles as
+    # a resolvable fallback that would mint a metered base-config worker.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    _default_assignee_resolved = bool(
+        _default_assignee and _assignee_has_spawn_target(_default_assignee)
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
@@ -14175,6 +14195,15 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    # Fail closed on the base control-plane profile before any subprocess /
+    # env fallback. Named missing profiles are refused below via
+    # resolve_profile_env; vps2 keeps its own RemoteStartError race path
+    # (config may flip between eligibility and spawn).
+    if profile_arg == "default":
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no spawn target "
+            f"(fail-closed; default never spawns a kanban worker)"
+        )
 
     from hermes_cli.fleet_vps2_worker import (
         RemoteStartError,
@@ -14200,12 +14229,13 @@ def _default_spawn(
     if remote_config is None:
         try:
             env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-        except FileNotFoundError:
-            # Profile dir doesn't exist — defer resolution to the CLI's
-            # _apply_profile_override() via HERMES_PROFILE (set below).
-            # This only happens in test fixtures where the isolated
-            # HERMES_HOME never had profiles created.
-            pass
+        except FileNotFoundError as exc:
+            # Fail closed: never fall through to base HERMES_HOME / metered
+            # defaults when the assignee profile cannot be resolved on disk.
+            raise FileNotFoundError(
+                f"Kanban spawn refused: assignee profile {profile_arg!r} "
+                f"is unresolvable"
+            ) from exc
     else:
         env.pop("HERMES_HOME", None)
     if task.tenant:
