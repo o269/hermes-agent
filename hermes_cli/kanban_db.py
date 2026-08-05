@@ -1294,6 +1294,10 @@ class RespawnGuardDecision:
     continuation_denial: Optional[str] = None
     authorized_profile: Optional[str] = None
     authorized_provider: Optional[str] = None
+    # A Fable-authored one-shot marker is a simpler continuation authority for
+    # the card's existing owner.  The marker is consumed atomically by
+    # ``claim_task``; evaluating the guard remains read-only.
+    resume_marker_id: Optional[int] = None
     # Operator-facing diagnosis merged into the ``respawn_guarded`` event. A
     # guard nobody can see is worse than no guard: a suppressed respawn must
     # always name what suppressed it and when that expires.
@@ -4747,6 +4751,7 @@ def claim_task(
     claimer: Optional[str] = None,
     operator_override_reason: Optional[str] = None,
     continuation_authorization_id: Optional[int] = None,
+    resume_marker_id: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4823,10 +4828,18 @@ def claim_task(
         )
     )
     guard_decision = RespawnGuardDecision(
-        continuation_authorization_id=continuation_authorization_id
+        continuation_authorization_id=continuation_authorization_id,
+        resume_marker_id=resume_marker_id,
     )
     if has_active_pr:
-        if continuation_authorization_id is None:
+        if resume_marker_id is not None:
+            selected_marker = _next_resume_marker(conn, task_id)
+            if (
+                selected_marker is None
+                or int(selected_marker["id"]) != int(resume_marker_id)
+            ):
+                guard_decision = RespawnGuardDecision(reason="active_pr")
+        elif continuation_authorization_id is None:
             guard_decision = evaluate_respawn_guard(
                 conn,
                 task_id,
@@ -4873,6 +4886,21 @@ def claim_task(
         # the stale pre-lock timestamp above.
         authorization_now = int(time.time())
         continuation_authorization: Optional[ContinuationAuthorization] = None
+        resume_marker = _next_resume_marker(conn, task_id)
+        if guard_decision.resume_marker_id is not None and (
+            resume_marker is None
+            or int(resume_marker["id"]) != int(guard_decision.resume_marker_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "resume_marker_unavailable",
+                    "marker_event_id": guard_decision.resume_marker_id,
+                },
+            )
+            return None
         if override_reason is not None:
             try:
                 fresh_authorizer, fresh_profiles, fresh_worker = (
@@ -4909,7 +4937,7 @@ def claim_task(
                 task_id,
                 cutoff=authorization_now - _RESPAWN_GUARD_PR_WINDOW,
             )
-            if active_urls:
+            if active_urls and resume_marker is None:
                 authorization_id = guard_decision.continuation_authorization_id
                 denial = "missing_authorization"
                 if authorization_id is not None:
@@ -4968,7 +4996,10 @@ def claim_task(
                             authorization_id=authorization_id,
                         )
                         return None
-            elif guard_decision.continuation_authorization_id is not None:
+            elif (
+                resume_marker is None
+                and guard_decision.continuation_authorization_id is not None
+            ):
                 # The exact active set changed after the external head check.
                 # Do not consume a grant for a different local state.
                 _record_continuation_denial(
@@ -5099,6 +5130,17 @@ def claim_task(
                     "authorization_id": continuation_authorization.id,
                     "run_id": run_id,
                     "prs": [pr.tuple_text for pr in continuation_authorization.prs],
+                },
+                run_id=run_id,
+            )
+        if resume_marker is not None:
+            _append_event(
+                conn,
+                task_id,
+                _RESUME_MARKER_CONSUMED_KIND,
+                {
+                    "marker_event_id": int(resume_marker["id"]),
+                    "run_id": run_id,
                 },
                 run_id=run_id,
             )
@@ -8317,11 +8359,10 @@ def _active_pr_candidates(
     * ``declared`` — the PR came from the card itself: its own work product
       (run summary / metadata / error, or ``tasks.result``) named it, OR its
       own assigned worker posted it in a comment. Always owned.
-    * otherwise — the URL was cross-posted onto this card by another profile.
-      If some OTHER card declared the same PR, the PR provably belongs to that
-      card and this mention is a citation: disowned. If nobody declared it
-      anywhere, the conservative pre-existing behaviour is preserved and it
-      stays owned.
+    * ``referenced`` — every sighting not declared by this card is a citation
+      and is therefore always disowned.  This is true even when no other card
+      has declared the PR: reference-only evidence is never enough to freeze a
+      card or reject its claim.
 
     Both halves of ``declared`` are load-bearing. Replayed against the live
     2,662-card board, work-product custody alone freed 14 cards but 13 of them
@@ -8431,12 +8472,106 @@ def _active_pr_candidates(
             "ORDER BY first_seen_at ASC, task_id ASC LIMIT 1",
             (url, task_id),
         ).fetchone()
-        if other is None:
-            owned.append(record)
-        else:
+        if other is not None:
             record["declared_by"] = str(other["task_id"])
-            disowned.append(record)
+        disowned.append(record)
     return tuple(owned), tuple(disowned)
+
+
+_RESUME_MARKER_KIND = "resume_marker"
+_RESUME_MARKER_CONSUMED_KIND = "resume_marker_consumed"
+_RESUME_MARKER_ACTOR = "fable"
+
+
+def add_resume_marker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> int:
+    """Append one Fable-owned, one-shot active-PR resume marker.
+
+    Event schema::
+
+        kind="resume_marker"
+        payload={"actor": "fable", "reason": "<non-empty>"}
+
+    The marker authorizes exactly one successful ``ready -> running`` claim by
+    the card's existing owner.  ``claim_task`` records a paired
+    ``resume_marker_consumed`` event in the same transaction as the run insert.
+    No caller may mint a marker under another actor name.
+    """
+    normalized_actor = str(actor or "").strip().casefold()
+    normalized_reason = str(reason or "").strip()
+    if normalized_actor != _RESUME_MARKER_ACTOR:
+        raise ValueError("resume markers may only be set by fable")
+    if not normalized_reason:
+        raise ValueError("resume marker reason must be non-empty")
+    with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone() is None:
+            raise ValueError(f"no such task: {task_id}")
+        return _append_event(
+            conn,
+            task_id,
+            _RESUME_MARKER_KIND,
+            {"actor": _RESUME_MARKER_ACTOR, "reason": normalized_reason},
+        )
+
+
+def _next_resume_marker(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the oldest valid unconsumed resume marker for ``task_id``.
+
+    The event ledger is append-only, so consumption is represented by a second
+    event whose payload names ``marker_event_id``.  Parsing in Python avoids a
+    dependency on SQLite's optional JSON1 extension and fails closed for
+    malformed or non-Fable marker rows.
+    """
+    consumed_ids: set[int] = set()
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id ASC",
+        (task_id, _RESUME_MARKER_CONSUMED_KIND),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"] or "null")
+            marker_id = payload.get("marker_event_id") if isinstance(payload, dict) else None
+            if isinstance(marker_id, int) and not isinstance(marker_id, bool):
+                consumed_ids.add(marker_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    for row in conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id ASC",
+        (task_id, _RESUME_MARKER_KIND),
+    ).fetchall():
+        marker_id = int(row["id"])
+        if marker_id in consumed_ids:
+            continue
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        actor = str(payload.get("actor") or "").strip().casefold()
+        reason = str(payload.get("reason") or "").strip()
+        if actor != _RESUME_MARKER_ACTOR or not reason:
+            continue
+        return {
+            "id": marker_id,
+            "actor": _RESUME_MARKER_ACTOR,
+            "reason": reason,
+            "created_at": int(row["created_at"]),
+        }
+    return None
 
 
 def _active_pr_custody(
@@ -12115,7 +12250,10 @@ def _record_disowned_pr_mentions(
             conn,
             task_id,
             "respawn_guard_pr_ignored",
-            {"reason": "pr_declared_by_other_task", "ignored_pr_urls": list(ignored)},
+            {
+                "reason": "pr_reference_only",
+                "ignored_pr_urls": list(ignored),
+            },
         )
 
 
@@ -12155,6 +12293,7 @@ def evaluate_respawn_guard(
         return RespawnGuardDecision(reason="live_worker_process")
 
     now = int(time.time())
+    resume_marker = _next_resume_marker(conn, task_id)
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -12200,7 +12339,7 @@ def evaluate_respawn_guard(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
             "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
-            "'continuation_authorized') "
+            "'continuation_authorized', 'resume_marker') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -12216,17 +12355,25 @@ def evaluate_respawn_guard(
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
     if not owned:
-        # Either no PR was mentioned at all, or every mention provably belongs
-        # to another card. Carry the second case out as ``detail`` on an
+        # Either no PR was mentioned at all, or every mention is reference-only
+        # and therefore disowned. Carry the second case out as ``detail`` on an
         # otherwise-clean decision so the caller can audit it; this function
         # stays read-only, which is what makes ``dry_run`` dispatch honest.
+        marker_id = int(resume_marker["id"]) if resume_marker is not None else None
         if disowned:
             return RespawnGuardDecision(
-                detail=_active_pr_guard_detail((), disowned)
+                resume_marker_id=marker_id,
+                detail=_active_pr_guard_detail((), disowned),
             )
-        return RespawnGuardDecision()
+        return RespawnGuardDecision(resume_marker_id=marker_id)
 
     detail = _active_pr_guard_detail(owned, disowned)
+    if resume_marker is not None:
+        detail["resume_marker_id"] = int(resume_marker["id"])
+        return RespawnGuardDecision(
+            resume_marker_id=int(resume_marker["id"]),
+            detail=detail,
+        )
     authorization = _latest_continuation_authorization(conn, task_id)
     if authorization is None:
         return RespawnGuardDecision(
@@ -12893,6 +13040,7 @@ def _dispatch_once_locked(
                 continuation_authorization_id=(
                     guard_decision.continuation_authorization_id
                 ),
+                resume_marker_id=guard_decision.resume_marker_id,
             )
         except ContinuationAuthorizationError as exc:
             # A consume/expiry race rolls the claim transaction back. Treat it
