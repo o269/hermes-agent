@@ -783,10 +783,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "dispatch",
         help="One dispatcher pass: reclaim stale, promote ready, spawn workers",
     )
+    p_disp.add_argument(
+        "--task-id",
+        dest="task_ids",
+        action="append",
+        default=None,
+        help=(
+            "Dispatch only this exact Ready task id (repeatable). Any explicit "
+            "target set fails closed and never falls back to generic selection"
+        ),
+    )
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Cap total Running workers across the board after this pass")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -2583,9 +2593,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            task_ids=getattr(args, "task_ids", None),
         )
+    targeted_exit = (
+        0
+        if res.targeted
+        and bool(res.requested_outcomes)
+        and all(item.outcome == "spawned" for item in res.requested_outcomes)
+        else 1
+    )
     if getattr(args, "json", False):
-        print(json.dumps({
+        payload: dict[str, object] = {
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -2605,8 +2623,30 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "respawn_guarded": _respawn_guard_details(res),
             "dispositions": res.normalized_dispositions(),
             "auto_assigned_default": res.auto_assigned_default,
-        }, indent=2))
-        return 0
+        }
+        if res.targeted:
+            requested: list[dict[str, object]] = []
+            for item in res.requested_outcomes:
+                row: dict[str, object] = {
+                    "task_id": item.task_id,
+                    "outcome": item.outcome,
+                }
+                if item.assignee is not None:
+                    row["assignee"] = item.assignee
+                if item.workspace is not None:
+                    row["workspace"] = item.workspace
+                if item.detail is not None:
+                    row["detail"] = item.detail
+                if item.current is not None:
+                    row["current"] = item.current
+                requested.append(row)
+            payload.update({
+                "targeted": True,
+                "dry_run": bool(args.dry_run),
+                "requested": requested,
+            })
+        print(json.dumps(payload, indent=2))
+        return targeted_exit if res.targeted else 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2646,6 +2686,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.targeted:
+        print("Requested outcomes:")
+        if not res.requested_outcomes:
+            print("  (empty target set; no generic selection performed)")
+        for item in res.requested_outcomes:
+            details: list[str] = []
+            if item.assignee is not None:
+                details.append(f"assignee={item.assignee}")
+            if item.current is not None:
+                details.append(f"current={item.current}")
+            if item.detail is not None:
+                details.append(f"detail={item.detail}")
+            if item.workspace is not None:
+                details.append(f"workspace={item.workspace}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            print(f"  - {item.task_id}: {item.outcome}{suffix}")
+        return targeted_exit
     return 0
 
 
