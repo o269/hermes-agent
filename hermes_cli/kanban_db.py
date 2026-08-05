@@ -8165,6 +8165,175 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Live concurrency ceiling for ``dispatch_once`` / ``_dispatch_once_locked``.
+# Operator-ratified fleet default is 16 (KEEP live MAX_DISPATCH=16). The R7
+# classifier reference package hardcodes 12 and must NOT be installed over the
+# live reconciler; this constant is the hermes-agent integration surface that
+# keeps the ceiling parameterized (env/config/explicit) with a safe default.
+DEFAULT_MAX_SPAWN = 16
+# Env key consulted when no explicit max_spawn is supplied. Fleet
+# reconciler passes ``--max "$MAX_DISPATCH"`` on the CLI (explicit arg),
+# so we intentionally do NOT read bare MAX_DISPATCH here — that name is
+# host-global and would silently clamp every hermes process on the box.
+_MAX_SPAWN_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_MAX_SPAWN",
+)
+# Synthetic task_id for board-scoped dispatcher config audit events. Not a
+# real card; list_events(conn, DISPATCHER_AUDIT_TASK_ID) surfaces them.
+DISPATCHER_AUDIT_TASK_ID = "__dispatcher__"
+
+
+@dataclass(frozen=True)
+class MaxSpawnResolution:
+    """Result of :func:`resolve_max_spawn_ceiling`.
+
+    ``value`` is always a positive int (never None) — invalid inputs fail
+    closed to :data:`DEFAULT_MAX_SPAWN`. When ``invalid`` is True the caller
+    should emit an audit event (see :func:`_record_max_spawn_audit`).
+    """
+
+    value: int
+    source: str  # explicit | env | default | fail_closed
+    raw: Optional[str] = None
+    env_key: Optional[str] = None
+    invalid: bool = False
+
+
+def _parse_positive_max_spawn(raw: Any) -> Optional[int]:
+    """Return a positive int ceiling, or None when ``raw`` is unset/invalid."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        # bool is a subclass of int; reject True/False explicitly.
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            return None
+        ival = int(raw)
+        return ival if ival >= 1 else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        ival = int(text, 10)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def resolve_max_spawn_ceiling(
+    explicit: Any = None,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> MaxSpawnResolution:
+    """Resolve the live ``max_spawn`` concurrency ceiling.
+
+    Precedence:
+      1. ``explicit`` argument when not None (CLI ``--max``, config value,
+         or a direct ``dispatch_once(..., max_spawn=N)`` call).
+      2. First set env key in :data:`_MAX_SPAWN_ENV_KEYS`.
+      3. :data:`DEFAULT_MAX_SPAWN` (16).
+
+    Invalid non-empty values **fail closed** to :data:`DEFAULT_MAX_SPAWN`
+    and set ``invalid=True`` so the dispatcher can emit an audit event.
+    Unset/empty input is not invalid — it simply falls through to the next
+    source and ultimately the safe default.
+    """
+    env_map: Mapping[str, str] = os.environ if env is None else env
+
+    if explicit is not None:
+        parsed = _parse_positive_max_spawn(explicit)
+        if parsed is not None:
+            return MaxSpawnResolution(
+                value=parsed,
+                source="explicit",
+                raw=str(explicit),
+            )
+        # Explicit was provided but unusable — fail closed.
+        return MaxSpawnResolution(
+            value=DEFAULT_MAX_SPAWN,
+            source="fail_closed",
+            raw=str(explicit),
+            invalid=True,
+        )
+
+    for key in _MAX_SPAWN_ENV_KEYS:
+        raw = env_map.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        parsed = _parse_positive_max_spawn(text)
+        if parsed is not None:
+            return MaxSpawnResolution(
+                value=parsed,
+                source="env",
+                raw=text,
+                env_key=key,
+            )
+        return MaxSpawnResolution(
+            value=DEFAULT_MAX_SPAWN,
+            source="fail_closed",
+            raw=text,
+            env_key=key,
+            invalid=True,
+        )
+
+    return MaxSpawnResolution(
+        value=DEFAULT_MAX_SPAWN,
+        source="default",
+    )
+
+
+def _record_max_spawn_audit(
+    conn: Optional[sqlite3.Connection],
+    resolution: MaxSpawnResolution,
+    *,
+    dry_run: bool = False,
+) -> Optional[int]:
+    """Persist a board-scoped audit event for an invalid max_spawn parse.
+
+    Returns the event id when written, else None. Rate-limited to one event
+    per process tick by the caller (we only record when ``resolution.invalid``).
+    """
+    if not resolution.invalid:
+        return None
+    payload = {
+        "kind": "max_spawn_invalid",
+        "raw": resolution.raw,
+        "env_key": resolution.env_key,
+        "source": resolution.source,
+        "fallback": DEFAULT_MAX_SPAWN,
+        "resolved": resolution.value,
+    }
+    _log.warning(
+        "kanban dispatcher: invalid max_spawn=%r (env_key=%s); "
+        "fail-closed to DEFAULT_MAX_SPAWN=%d",
+        resolution.raw,
+        resolution.env_key,
+        DEFAULT_MAX_SPAWN,
+    )
+    if conn is None or dry_run:
+        return None
+    try:
+        with write_txn(conn):
+            return _append_event(
+                conn,
+                DISPATCHER_AUDIT_TASK_ID,
+                "max_spawn_invalid",
+                payload,
+            )
+    except Exception as exc:  # pragma: no cover - audit must never break dispatch
+        _log.warning(
+            "kanban dispatcher: failed to record max_spawn_invalid audit: %s",
+            exc,
+        )
+        return None
+
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -9742,6 +9911,24 @@ class DispatchResult:
 
     Entries stay in dispatcher priority order and intentionally coexist with
     the legacy compatibility buckets above.
+    """
+    max_spawn_ceiling: Optional[int] = None
+    """Effective live concurrency ceiling applied this tick (always >= 1).
+
+    Resolved by :func:`resolve_max_spawn_ceiling` inside
+    ``_dispatch_once_locked`` — never a bare literal. Defaults to
+    :data:`DEFAULT_MAX_SPAWN` (16) when unset.
+    """
+    max_spawn_resolution: Optional[dict[str, Any]] = None
+    """Structured resolution metadata for telemetry / CLI / tests.
+
+    Keys: ``value``, ``source``, ``raw``, ``env_key``, ``invalid``.
+    Present on every successful tick so operators can confirm the ceiling
+    in effect without re-deriving env/config precedence.
+    """
+    max_spawn_audit_event_id: Optional[int] = None
+    """``task_events.id`` of the ``max_spawn_invalid`` audit row when an
+    invalid ceiling was fail-closed this tick; else None.
     """
     def add_disposition(
         self,
@@ -13098,6 +13285,14 @@ def _dispatch_once_locked(
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
 
+    The ceiling is always resolved through :func:`resolve_max_spawn_ceiling`
+    (never a bare literal inside this function):
+      * explicit positive ``max_spawn`` is honored;
+      * ``None`` falls through env (``HERMES_KANBAN_MAX_SPAWN``) and
+        finally :data:`DEFAULT_MAX_SPAWN` (16);
+      * invalid values fail closed to 16 and emit a ``max_spawn_invalid``
+        audit event on the synthetic ``__dispatcher__`` task id.
+
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
@@ -13107,6 +13302,23 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Parameterize the live concurrency ceiling (default 16). Never leave
+    # a bare literal here — resolve_max_spawn_ceiling owns env/config/default
+    # precedence and fail-closed invalid parse + audit.
+    _max_spawn_res = resolve_max_spawn_ceiling(max_spawn)
+    max_spawn = _max_spawn_res.value
+    result.max_spawn_ceiling = max_spawn
+    result.max_spawn_resolution = {
+        "value": _max_spawn_res.value,
+        "source": _max_spawn_res.source,
+        "raw": _max_spawn_res.raw,
+        "env_key": _max_spawn_res.env_key,
+        "invalid": _max_spawn_res.invalid,
+    }
+    if _max_spawn_res.invalid:
+        result.max_spawn_audit_event_id = _record_max_spawn_audit(
+            conn, _max_spawn_res, dry_run=dry_run,
+        )
     validate_skills = skill_validator or _missing_forced_skills
     board_db, board_slug = _connection_worker_board_identity(conn)
     result.reclaimed = release_stale_claims(conn)
