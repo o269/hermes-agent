@@ -36,6 +36,11 @@ def all_profiles_spawnable(monkeypatch: pytest.MonkeyPatch) -> None:
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setattr(
+        kb,
+        "_assignee_has_spawn_target",
+        lambda assignee: bool(assignee and str(assignee).strip()),
+    )
 
 
 def _move_to_review(conn: sqlite3.Connection, task_id: str) -> None:

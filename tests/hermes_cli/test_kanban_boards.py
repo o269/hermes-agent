@@ -418,6 +418,7 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
+        (fresh_home / "profiles" / "teknium").mkdir(parents=True, exist_ok=True)
         kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
@@ -457,6 +458,7 @@ class TestWorkerSpawnEnv:
             claim_expires=None,
             tenant=None,
         )
+        (fresh_home / "profiles" / "teknium").mkdir(parents=True, exist_ok=True)
         kb._default_spawn(task, str(fresh_home / "ws"), board=None)
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "default"
