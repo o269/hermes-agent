@@ -118,6 +118,18 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# These assignees are terminal custody lanes, not executors.  Their parked rows
+# must move only through an explicit operator action (``promote_task`` or
+# ``unblock_task``), never as a side effect of list/dispatcher reconciliation.
+# Keep this unconditional: raw and legacy rows may predate typed block events or
+# the opt-in authority-profile assignment policy.
+TERMINAL_CUSTODY_ASSIGNEES = frozenset({
+    "fable",
+    "s4",
+    "operator-gate",
+    "terminal",
+})
+
 KANBAN_GATE_KEYWORDS = frozenset({
     "OPERATOR-GATE",
     "OPERATOR-HOLD",
@@ -4584,13 +4596,17 @@ def recompute_ready(
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
+    parent completes), *except* in three cases:
 
-    1. The most recent block event was a worker-initiated
+    1. The assignee is a terminal-custody lane.  Those rows move only through
+       deliberate ``promote_task`` / ``unblock_task`` calls, even when a raw or
+       legacy hold has no typed ``blocked`` event.
+
+    2. The most recent block event was a worker-initiated
        ``kanban_block`` — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
+    3. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
@@ -4617,6 +4633,12 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            assignee = str(row["assignee"] or "").strip().casefold()
+            if assignee in TERMINAL_CUSTODY_ASSIGNEES:
+                # Listing and dispatcher ticks both call recompute_ready.  A
+                # terminal-custody row must therefore stay parked until a
+                # deliberate manual release, regardless of event provenance.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
