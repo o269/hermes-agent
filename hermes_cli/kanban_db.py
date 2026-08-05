@@ -4580,7 +4580,13 @@ def recompute_ready(
     ``review`` so a dependency wait cannot silently restart author execution.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    an existing transaction; it opens its own IMMEDIATE txn(s).
+
+    Option-2 batching (boardd TXN_MAX_S=2.0 / tunnel RTT): candidate scan
+    and parent/sticky/assignment checks run as autocommit reads. Each
+    promotion commits in its own short ``write_txn`` with a CAS re-check so
+    a single multi-card scan cannot hold the broker write lock across the
+    whole todo/blocked set (vps2-dispatch slow-holder class).
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -4608,20 +4614,78 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, title, body, assignee, status, dispatch_origin, "
-            "consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+    # Phase 1 — snapshot candidates outside any write txn. On a broker
+    # connection each statement is an RTT; holding BEGIN across the whole
+    # set is what tripped boardd TXN_MAX_S=2.0 on vps2-dispatch even when
+    # Spawned:0 (promote-only ticks).
+    todo_rows = conn.execute(
+        "SELECT id, title, body, assignee, status, dispatch_origin, "
+        "consecutive_failures, max_retries "
+        "FROM tasks WHERE status IN ('todo', 'blocked')"
+    ).fetchall()
+    for row in todo_rows:
+        task_id = row["id"]
+        cur_status = row["status"]
+        if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            # Worker / operator asked for human review — do not
+            # silently auto-recover.  ``unblock_task`` is the only
+            # legitimate exit (it emits ``"unblocked"`` which flips
+            # this predicate back).
+            continue
+        parents = conn.execute(
+            "SELECT t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?",
+            (task_id,),
         ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+        if not all(p["status"] in ("done", "archived") for p in parents):
+            continue
+        recovery_status = _dispatch_retry_status(row["dispatch_origin"])
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=row["title"],
+            body=row["body"],
+            assignee=row["assignee"],
+            status=recovery_status,
+            has_open_parent=False,
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            # Keep dependency-held authority work safely parked. The
+            # operator/bridge must first route executor work to a
+            # spawnable lane (or leave authority work non-dispatching).
+            continue
+        if cur_status == "blocked":
+            # Don't auto-recover tasks that have hit the
+            # circuit-breaker failure limit.  Without this
+            # guard, a task that repeatedly exhausts its
+            # iteration budget would cycle forever:
+            # block → auto-recover → respawn → budget
+            # exhausted → block → …  The counter must also
+            # be preserved so the breaker can accumulate
+            # across recovery cycles.
+            failures = int(row["consecutive_failures"] or 0)
+            task_limit = row["max_retries"]
+            effective_limit = (
+                int(task_limit) if task_limit is not None
+                else int(failure_limit)
+            )
+            if failures >= effective_limit:
+                continue
+
+        # Phase 2 — per-task write txn. Re-check CAS conditions inside
+        # the lock so concurrent complete/block/unblock cannot race a
+        # stale autocommit snapshot into a wrong promotion.
+        with write_txn(conn):
+            live = conn.execute(
+                "SELECT id, title, body, assignee, status, dispatch_origin, "
+                "consecutive_failures, max_retries "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if live is None or live["status"] != cur_status:
+                continue
+            if live["status"] == "blocked" and _has_sticky_block(conn, task_id):
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4629,51 +4693,43 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                recovery_status = _dispatch_retry_status(row["dispatch_origin"])
-                assignment_denial = _assignment_guard_reason(
-                    conn,
-                    title=row["title"],
-                    body=row["body"],
-                    assignee=row["assignee"],
-                    status=recovery_status,
-                    has_open_parent=False,
-                    task_id=task_id,
+            if not all(p["status"] in ("done", "archived") for p in parents):
+                continue
+            recovery_status = _dispatch_retry_status(live["dispatch_origin"])
+            assignment_denial = _assignment_guard_reason(
+                conn,
+                title=live["title"],
+                body=live["body"],
+                assignee=live["assignee"],
+                status=recovery_status,
+                has_open_parent=False,
+                task_id=task_id,
+            )
+            if assignment_denial is not None:
+                continue
+            if live["status"] == "blocked":
+                failures = int(live["consecutive_failures"] or 0)
+                task_limit = live["max_retries"]
+                effective_limit = (
+                    int(task_limit) if task_limit is not None
+                    else int(failure_limit)
                 )
-                if assignment_denial is not None:
-                    # Keep dependency-held authority work safely parked. The
-                    # operator/bridge must first route executor work to a
-                    # spawnable lane (or leave authority work non-dispatching).
+                if failures >= effective_limit:
                     continue
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (recovery_status, task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
-                        (recovery_status, task_id),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ? "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (recovery_status, task_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                    (recovery_status, task_id),
+                )
+            if cur.rowcount != 1:
+                continue
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
     return promoted
 
 
@@ -11467,15 +11523,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    Option-2 batching (boardd TXN_MAX_S=2.0): process snapshot + exit
+    classification run outside any write txn; each rebound/reclaim commits
+    in its own short ``write_txn`` so multi-candidate ticks cannot hold the
+    broker lock across tunnel RTT.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
+    # Per-crash details collected across per-task write_txns, used after
+    # the mutation loop to run ``_record_task_failure`` (which needs its
+    # own write_txn). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
+    # counter (see the post-loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     board_db, board_slug = _connection_worker_board_identity(conn)
@@ -11522,13 +11583,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         },
     ) if candidates else []
 
-    with write_txn(conn):
-        for row in candidates:
-            run_id = (
-                int(row["current_run_id"])
-                if row["current_run_id"] is not None else None
-            )
-            owned = _owned_worker_processes(
+    # Option-2 batching: classify + ownership decisions OUTSIDE any write
+    # txn (local process I/O + pure snapshot work), then commit each
+    # rebound/reclaim in its own short write_txn. A single multi-candidate
+    # write_txn over the boardd tunnel was a slow-holder source even when
+    # only a few PIDs needed mutation.
+    for row in candidates:
+        run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None else None
+        )
+        owned = _owned_worker_processes(
+            process_snapshot,
+            task_id=row["id"],
+            run_id=run_id,
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_group_started_at=row["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+        if owned:
+            # A surviving exact env holder or live verified group member can
+            # become the durable diagnostic owner. Leaderless-group members
+            # are hold-only: keep the claim but never rebind to an identity
+            # whose process-group generation cannot be proved.
+            signalable = _signalable_worker_processes(
                 process_snapshot,
                 task_id=row["id"],
                 run_id=run_id,
@@ -11539,27 +11620,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 board_db=board_db,
                 board_slug=board_slug,
             )
-            if owned:
-                # A surviving exact env holder or live verified group member can
-                # become the durable diagnostic owner. Leaderless-group members
-                # are hold-only: keep the claim but never rebind to an identity
-                # whose process-group generation cannot be proved.
-                signalable = _signalable_worker_processes(
-                    process_snapshot,
-                    task_id=row["id"],
-                    run_id=run_id,
-                    worker_pgid=row["worker_pgid"],
-                    worker_sid=row["worker_sid"],
-                    worker_boot_id=row["worker_boot_id"],
-                    worker_group_started_at=row["worker_group_started_at"],
-                    board_db=board_db,
-                    board_slug=board_slug,
-                )
-                owner = _best_rebound_owner(
-                    signalable, task_id=row["id"], run_id=run_id or 0,
-                )
-                if owner is None:
-                    continue
+            owner = _best_rebound_owner(
+                signalable, task_id=row["id"], run_id=run_id or 0,
+            )
+            if owner is None:
+                continue
+            with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET worker_pid = ? "
                     "WHERE id = ? AND status = 'running' "
@@ -11607,72 +11673,75 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     },
                     run_id=run_id,
                 )
-                continue
+            continue
 
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
+        pid = int(row["worker_pid"])
+        # Local reap-registry / exit classification — must stay outside the
+        # broker write_txn (no external I/O while holding TXN_MAX_S budget).
+        kind, code = _classify_worker_exit(pid)
+        rate_limited_exit = False
+        if kind == "clean_exit":
+            # Worker subprocess returned 0 but its task is still
+            # ``running`` in the DB — it exited without calling
+            # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
+            # work itself succeeded and only the paperwork was skipped, so
+            # a retry usually completes; the corrective sentence below is
+            # surfaced to the retry worker via the prior-attempt error in
+            # ``build_worker_context`` (guidance approach from #61817).
+            protocol_violation = True
+            error_text = (
+                "worker exited cleanly (rc=0) without calling "
+                "kanban_complete or kanban_block — protocol violation. "
+                "If the prior run already did the work, verify it and "
+                "report the result via kanban_complete; a run that ends "
+                "without a terminal kanban call counts as failed no "
+                "matter what it did."
+            )
+            event_kind = "protocol_violation"
+            event_payload = {
+                "pid": pid,
+                "claimer": row["claim_lock"],
+                "exit_code": code,
+                # Durable marker for _protocol_violation_streak: _end_run
+                # copies this payload into the run metadata, which is how
+                # the violation-only retry budget is derived later.
+                "protocol_violation": True,
+            }
+        elif kind == "rate_limited":
+            # Worker bailed because the provider rate-limited / exhausted
+            # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
+            # the task is fine, the account just hit a wall. Release it
+            # back to ``ready`` so the respawn guard defers it until the
+            # quota window clears, and crucially do NOT count a failure
+            # (skip ``_record_task_failure``) so a long quota window can't
+            # trip the circuit breaker and permanently block the card.
+            protocol_violation = False
+            rate_limited_exit = True
+            error_text = (
+                f"pid {pid} exited rate-limited (quota wall) — "
+                f"requeued without counting a failure"
+            )
+            event_kind = "rate_limited"
+            event_payload = {
+                "pid": pid,
+                "claimer": row["claim_lock"],
+                "exit_code": code,
+            }
+        else:
+            protocol_violation = False
+            if kind == "nonzero_exit":
+                error_text = f"pid {pid} exited with code {code}"
+            elif kind == "signaled":
+                error_text = f"pid {pid} killed by signal {code}"
             else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+                error_text = f"pid {pid} not alive"
+            event_kind = "crashed"
+            event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+            if code is not None and kind != "unknown":
+                event_payload["exit_kind"] = kind
+                event_payload["exit_code"] = code
 
+        with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -11687,54 +11756,56 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     row["current_run_id"],
                 ),
             )
-            if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
+            if cur.rowcount != 1:
+                continue
+            # Rate-limited requeues are a clean release, not a crash —
+            # record the run outcome as ``rate_limited`` so the board
+            # history doesn't show a phantom crash for a quota wall.
+            _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+            ended_run_id = _end_run(
+                conn, row["id"],
+                outcome=_run_outcome, status=_run_outcome,
+                error=error_text,
+                metadata=dict(event_payload),
+            )
+            _append_event(
+                conn, row["id"], event_kind,
+                event_payload,
+                run_id=ended_run_id,
+            )
+            if rate_limited_exit:
+                # Stamp the failure-error column so ``check_respawn_guard``
+                # recognizes this as a quota blocker and defers the
+                # respawn until the window clears — WITHOUT touching
+                # ``consecutive_failures`` (that's the whole point: no
+                # breaker trip on a throttle).
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (error_text[:500], row["id"]),
                 )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
+                rate_limited.append(row["id"])
+            else:
+                if protocol_violation:
+                    # Stamp the failure error now: a below-budget
+                    # violation never reaches ``_record_task_failure``
+                    # (which stamps this column for every other failure
+                    # kind), yet the board UI and the retry worker's
+                    # context still need the violation message + the
+                    # corrective guidance it carries.
                     conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        "UPDATE tasks SET last_failure_error = ? "
+                        "WHERE id = ?",
                         (error_text[:500], row["id"]),
                     )
-                    rate_limited.append(row["id"])
-                else:
-                    if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? "
-                            "WHERE id = ?",
-                            (error_text[:500], row["id"]),
-                        )
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
-    # Outside the main txn: account each crashed task and maybe trip the
-    # breaker (the task transitions ready → blocked with a ``gave_up`` event
-    # on top of the event we already emitted).
+                crashed.append(row["id"])
+                crash_details.append(
+                    (row["id"], pid, row["claim_lock"],
+                     protocol_violation, error_text)
+                )
+
+    # After per-task mutations: account each crashed task and maybe trip
+    # the breaker (the task transitions ready → blocked with a ``gave_up``
+    # event on top of the event we already emitted).
     #
     # Protocol-violation crashes (clean exit, no terminal tool call) get a
     # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
