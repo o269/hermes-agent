@@ -45,6 +45,11 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_assignment_policy import (
+    LaneEligibilityPolicy,
+    lane_eligibility_reason,
+    receipted_lane_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,45 +291,68 @@ def _resolve_default_assignee(
     return None
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
-    """Return (roster_for_prompt, valid_assignee_names).
+def _build_roster(
+    *,
+    lane_policy: Optional[LaneEligibilityPolicy] = None,
+    authority_profiles: tuple[str, ...] = (),
+) -> tuple[list[dict], set[str]]:
+    """Return only currently eligible local and receipted remote lanes."""
 
-    Each roster entry includes the profile's capability description and its
-    configured provider/model defaults. The defaults are routing context, not
-    hard constraints. The
-    valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
-    """
-    roster: list[dict] = []
-    valid: set[str] = set()
+    roster_by_name: dict[str, dict] = {}
+    authority_names = {name.casefold() for name in authority_profiles}
     fleet_named_lanes_only = _fleet_named_lanes_only()
     try:
         all_profiles = profiles_mod.list_profiles()
     except Exception as exc:
         logger.warning("decompose: failed to list local profiles: %s", exc)
         all_profiles = []
-    for p in all_profiles:
+    for profile in all_profiles:
+        name = profile.name.strip()
         # ``default`` is Hermes' implicit root profile, not a named fleet lane.
-        # Treating it as routable on the shared fleet board recreated the exact
-        # custody-loss bug this validation is meant to prevent.
-        if fleet_named_lanes_only and p.name == "default":
+        if fleet_named_lanes_only and name == "default":
             continue
-        desc = (p.description or "").strip()
-        roster.append({
-            "name": p.name,
-            "description": desc or f"(no description; profile named {p.name!r})",
+        # Authority profiles are explicit non-spawnable custody lanes, never
+        # decomposition targets. Existing root custody is preserved separately.
+        if name.casefold() in authority_names:
+            continue
+        if lane_policy is not None:
+            denial = lane_eligibility_reason(name, policy=lane_policy)
+            if denial:
+                logger.info("decompose: excluding lane %s (%s)", name, denial)
+                continue
+        desc = (profile.description or "").strip()
+        roster_by_name[name] = {
+            "name": name,
+            "description": desc or f"(no description; profile named {name!r})",
             "has_description": bool(desc),
-            "provider": p.provider,
-            "model": p.model,
-        })
-        valid.add(p.name)
-    return roster, valid
+            "provider": profile.provider,
+            "model": profile.model,
+        }
+
+    # Remote executors are intentionally absent from the local profile store.
+    # A fresh canonical receipt is their routability proof.
+    if lane_policy is not None:
+        for name in sorted(receipted_lane_names(lane_policy)):
+            if name in roster_by_name or name.casefold() in authority_names:
+                continue
+            roster_by_name[name] = {
+                "name": name,
+                "description": f"remote lane with fresh health receipt ({name})",
+                "has_description": False,
+                "provider": None,
+                "model": None,
+            }
+
+    roster = list(roster_by_name.values())
+    return roster, set(roster_by_name)
 
 
 def resolve_orchestration_profiles(
     cfg: dict,
     *,
     existing_assignee: Optional[str] = None,
+    lane_policy: Optional[LaneEligibilityPolicy] = None,
+    authority_profiles: tuple[str, ...] = (),
 ) -> OrchestrationProfileResolution:
     """Resolve routes from the current configured profile set.
 
@@ -332,7 +360,10 @@ def resolve_orchestration_profiles(
     Historical task/run rows are intentionally absent: a retired profile cannot
     remain routing authority merely because it completed work in the past.
     """
-    roster, valid_names = _build_roster()
+    roster, valid_names = _build_roster(
+        lane_policy=lane_policy,
+        authority_profiles=authority_profiles,
+    )
     try:
         active_profile = (profiles_mod.get_active_profile_name() or "").strip() or None
     except Exception:
@@ -494,6 +525,15 @@ def decompose_task(
         hold_reason = (
             kb.decomposition_hold_reason(conn, task_id) if task is not None else None
         )
+        try:
+            lane_policy = kb.lane_eligibility_policy(conn)
+            authority_profiles = kb.assignment_authority_profiles(conn)
+        except kb.AssignmentPolicyConfigError as exc:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"lane assignment policy unavailable: {exc}; task left unchanged",
+            )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -519,6 +559,8 @@ def decompose_task(
     resolution = resolve_orchestration_profiles(
         cfg,
         existing_assignee=task.assignee,
+        lane_policy=lane_policy,
+        authority_profiles=authority_profiles,
     )
     roster = resolution.roster
     valid_names = resolution.valid_names
@@ -598,17 +640,16 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        # The prompt roster is only an inference-time hint. The DB helper calls
-        # this resolver inside its write transaction so a profile removed
-        # during the LLM call cannot receive this task.
-        def live_valid_assignees() -> set[str]:
-            return resolve_orchestration_profiles(
-                _load_config(),
-                existing_assignee=task.assignee,
-            ).valid_names
-
         try:
             with kb.connect_closing() as conn:
+                def live_valid_assignees() -> set[str]:
+                    return resolve_orchestration_profiles(
+                        _load_config(),
+                        existing_assignee=task.assignee,
+                        lane_policy=kb.lane_eligibility_policy(conn),
+                        authority_profiles=kb.assignment_authority_profiles(conn),
+                    ).valid_names
+
                 ok = kb.specify_triage_task(
                     conn,
                     task_id,
@@ -631,7 +672,7 @@ def decompose_task(
                         expected_assignment_generation=task.assignment_generation,
                     )
                 promoted = kb.get_task(conn, task_id)
-        except ValueError as exc:
+        except (ValueError, kb.AssignmentPolicyConfigError) as exc:
             return DecomposeOutcome(task_id, False, f"DB rejected single task: {exc}")
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
@@ -731,15 +772,17 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, str(exc))
 
     try:
-        # The graph writer invokes this resolver inside its transaction and
-        # rolls back the whole graph if any selected/root route disappeared.
-        def live_valid_assignees() -> set[str]:
-            return resolve_orchestration_profiles(
-                _load_config(),
-                existing_assignee=task.assignee,
-            ).valid_names
-
         with kb.connect_closing() as conn:
+            # Re-read inside the graph transaction. If a receipt expires during
+            # the LLM call, the whole graph is rejected without partial rows.
+            def live_valid_assignees() -> set[str]:
+                return resolve_orchestration_profiles(
+                    _load_config(),
+                    existing_assignee=task.assignee,
+                    lane_policy=kb.lane_eligibility_policy(conn),
+                    authority_profiles=kb.assignment_authority_profiles(conn),
+                ).valid_names
+
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,

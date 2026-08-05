@@ -2019,23 +2019,115 @@ def _ev(conn, task_id, kind, payload=None, run_id=None):
     )
 
 
+def _assignment_guard_denial(
+    conn,
+    *,
+    task_id,
+    title,
+    body,
+    assignee,
+    status,
+    old_title=None,
+    old_body=None,
+    old_assignee=None,
+    old_status=None,
+):
+    """Ask the connection's canonical policy UDF for an actionable denial."""
+
+    has_open_parent = bool(
+        conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    )
+    try:
+        row = conn.execute(
+            "SELECT kanban_assignment_guard(?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                title,
+                body,
+                assignee,
+                status,
+                old_title,
+                old_body,
+                old_assignee,
+                old_status,
+                int(has_open_parent),
+            ),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        # Standalone-schema test mode deliberately omits kanban_db UDFs. The
+        # production import-schema path always registers this function.
+        if "no such function" in str(exc).casefold():
+            return None
+        raise
+    return str(row[0]).strip() if row and row[0] else None
+
+
 def _h_create_task(broker, conn, a):
     title = a.get("title")
     if not title or not str(title).strip():
         raise ValueError("title is required")
     tid = a.get("id") or _new_task_id()
     status = a.get("status", "running")
+    assignee = _canon_assignee(a.get("assignee"))
+    denial = _assignment_guard_denial(
+        conn,
+        task_id=tid,
+        title=str(title),
+        body=a.get("body"),
+        assignee=assignee,
+        status=status,
+    )
+    if denial:
+        raise ValueError(f"kanban assignment policy: {denial}")
     reasoning_effort = _canon_reasoning_effort(a.get("reasoning_effort"))
     conn.execute(
         "INSERT INTO tasks (id, title, body, assignee, status, priority, "
         "created_by, created_at, workspace_kind, reasoning_effort) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (tid, str(title), a.get("body"), _canon_assignee(a.get("assignee")),
+        (tid, str(title), a.get("body"), assignee,
          status, int(a.get("priority", 0)), _canon_assignee(a.get("created_by")),
          _now(), a.get("workspace_kind", "scratch"), reasoning_effort),
     )
     _ev(conn, tid, "created", {"title": str(title)})
     return {"id": tid, "status": status}
+
+
+def _h_assign_task(broker, conn, a):
+    task_id = a["task_id"]
+    assignee = _canon_assignee(a.get("assignee"))
+    existing = conn.execute(
+        "SELECT title, body, assignee, status, claim_lock FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if existing is None:
+        raise ValueError(f"unknown task {task_id}")
+    if existing["claim_lock"] is not None and existing["status"] == "running":
+        raise ValueError(f"cannot reassign {task_id}: currently running (claimed)")
+    denial = _assignment_guard_denial(
+        conn,
+        task_id=task_id,
+        title=existing["title"],
+        body=existing["body"],
+        assignee=assignee,
+        status=existing["status"],
+        old_title=existing["title"],
+        old_body=existing["body"],
+        old_assignee=existing["assignee"],
+        old_status=existing["status"],
+    )
+    if denial:
+        raise ValueError(f"kanban assignment policy: {denial}")
+    conn.execute(
+        "UPDATE tasks SET assignee=?, consecutive_failures=0, "
+        "last_failure_error=NULL WHERE id=?",
+        (assignee, task_id),
+    )
+    _ev(conn, task_id, "assigned", {"assignee": assignee})
+    return {"ok": True, "task_id": task_id, "assignee": assignee}
 
 
 def _h_add_comment(broker, conn, a):
@@ -2078,6 +2170,26 @@ def _h_set_body(broker, conn, a):
 def _h_set_status(broker, conn, a):
     """Mirror of the `kb` CLI setstatus (per-seat direct-opener reroute)."""
     task_id, st = a["task_id"], a["status"]
+    existing = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if existing is None:
+        raise ValueError(f"card {task_id} not found (status NOT changed to {st})")
+    denial = _assignment_guard_denial(
+        conn,
+        task_id=task_id,
+        title=existing["title"],
+        body=existing["body"],
+        assignee=existing["assignee"],
+        status=st,
+        old_title=existing["title"],
+        old_body=existing["body"],
+        old_assignee=existing["assignee"],
+        old_status=existing["status"],
+    )
+    if denial:
+        raise ValueError(f"kanban assignment policy: {denial}")
     now = _now()
     if st == "running":
         cur = conn.execute(
@@ -2151,6 +2263,24 @@ def _h_claim(broker, conn, a):
 
 
 _EXEC_WHITELIST = {"update", "insert", "delete"}
+_TASKS_INSERT_RE = re.compile(
+    r'^\s*insert(?:\s+or\s+\w+)?\s+into\s+["`\[]?tasks["`\]]?\b',
+    re.IGNORECASE,
+)
+_TASKS_UPDATE_RE = re.compile(
+    r'^\s*update(?:\s+or\s+\w+)?\s+["`\[]?tasks["`\]]?\b',
+    re.IGNORECASE,
+)
+_ASSIGNMENT_STATE_SET_RE = re.compile(
+    r'(?:["`\[])?(?:title|body|assignee|status)(?:["`\]])?\s*=',
+    re.IGNORECASE,
+)
+
+
+def _exec_mutates_assignment_state(sql: str) -> bool:
+    if _TASKS_INSERT_RE.search(sql):
+        return True
+    return bool(_TASKS_UPDATE_RE.search(sql) and _ASSIGNMENT_STATE_SET_RE.search(sql))
 
 
 def _h_exec(broker, conn, a):
@@ -2168,6 +2298,10 @@ def _h_exec(broker, conn, a):
     first = sql.lstrip().split(None, 1)[0].lower() if sql.strip() else ""
     if first not in _EXEC_WHITELIST:
         raise ValueError(f"exec rejects {first!r}; only {sorted(_EXEC_WHITELIST)}")
+    if _exec_mutates_assignment_state(sql):
+        raise ValueError(
+            "exec rejects assignment-state mutation; use a typed Kanban broker API"
+        )
     cur = conn.execute(sql, params)
     # round-trip the REAL lastrowid so a raw INSERT never silently returns None
     # (MEDIUM). BrokerConnection surfaces this on its cursor.
@@ -2176,6 +2310,7 @@ def _h_exec(broker, conn, a):
 
 _MUTATION_HANDLERS = {
     "create_task": _h_create_task,
+    "assign_task": _h_assign_task,
     "add_comment": _h_add_comment,
     "set_workspace_path": _h_set_workspace_path,
     "set_branch_name": _h_set_branch_name,

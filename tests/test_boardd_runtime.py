@@ -216,6 +216,80 @@ def _run_kanban_db_script(db_path: Path, socket_path: Path, code: str) -> dict:
     return json.loads(result.stdout)
 
 
+def test_typed_client_exact_dead_lane_bypass_is_atomic_and_positive_control_works(
+    tmp_path: Path,
+):
+    receipts = tmp_path / "lane-health"
+    receipts.mkdir()
+    probed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (receipts / "codex1.env").write_text(
+        f"LANE_OK=true\nPROBED_AT={probed_at}\nPROVIDER=test\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n"
+        "  authority_profiles: fable\n"
+        f"  lane_health_receipts_dir: {receipts}\n"
+        "  lane_health_max_age_seconds: 86400\n"
+        "  de_rostered_profile_prefixes: kimi\n",
+        encoding="utf-8",
+    )
+
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        before = client.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"]
+        with pytest.raises(BoarddError, match="lane_derostered:kimi1"):
+            client.create_task(
+                id="t_dead0001",
+                title="[AUTHOR] exact dead-lane typed-client bypass",
+                assignee="kimi1",
+                status="ready",
+            )
+        assert client.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == before
+        assert client.get_task("t_dead0001") is None
+        assert client.query(
+            "SELECT id, worker_pid FROM tasks WHERE id=?", ["t_dead0001"]
+        ) == []
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM task_runs WHERE task_id=?", ["t_dead0001"]
+        )[0]["n"] == 0
+
+        created = client.create_task(
+            id="t_good0001",
+            title="[AUTHOR] healthy typed-client positive control",
+            assignee="codex1",
+            status="ready",
+        )
+        assert created == {"id": "t_good0001", "status": "ready"}
+        assert client.get_task("t_good0001")["assignee"] == "codex1"
+
+        with pytest.raises(BoarddError, match="lane_derostered:kimi1"):
+            client.assign_task("t_good0001", "kimi1")
+        assert client.get_task("t_good0001")["assignee"] == "codex1"
+
+        archived = client.create_task(
+            id="t_dead0002",
+            title="[AUTHOR] dead-lane terminal history",
+            assignee="kimi1",
+            status="done",
+        )
+        assert archived == {"id": "t_dead0002", "status": "done"}
+        with pytest.raises(BoarddError, match="lane_derostered:kimi1"):
+            client.set_status("t_dead0002", "ready")
+        terminal = client.get_task("t_dead0002")
+        assert terminal["status"] == "done"
+        assert terminal["worker_pid"] is None
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM task_runs WHERE task_id=?", ["t_dead0002"]
+        )[0]["n"] == 0
+
+        with pytest.raises(BoarddError, match="typed Kanban broker API"):
+            client.exec_write(
+                "UPDATE tasks SET assignee=? WHERE id=?",
+                ["kimi1", "t_good0001"],
+            )
+        assert client.get_task("t_good0001")["assignee"] == "codex1"
+
+
 def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (
         client,
