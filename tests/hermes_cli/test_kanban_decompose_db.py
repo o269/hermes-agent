@@ -278,6 +278,42 @@ def test_active_pr_custody_blocks_decomposition_with_repair_guidance(kanban_home
         assert task.assignee == "worker"
 
 
+def test_batched_triage_eligibility_keeps_references_and_excludes_declared_prs(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        referenced_id = _create_triage(
+            conn,
+            title="review companion change",
+            assignee="worker",
+        )
+        declared_id = _create_triage(
+            conn,
+            title="continue owned change",
+            assignee="worker",
+        )
+        kb.add_comment(
+            conn,
+            referenced_id,
+            "reviewer",
+            "Related PR: https://github.com/acme/widgets/pull/43",
+        )
+        kb.add_comment(
+            conn,
+            declared_id,
+            "worker",
+            "Opened https://github.com/acme/widgets/pull/44 for this card.",
+        )
+
+        assert kb.decomposition_hold_reason(conn, referenced_id) is None
+        assert kb.decomposition_hold_reason(conn, declared_id) is not None
+
+        ids = kb.list_decomposition_eligible_triage_ids(conn)
+
+        assert referenced_id in ids
+        assert declared_id not in ids
+
+
 def test_append_task_gate_preserves_status_and_assignee(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="PR17 cross-agent preflight", assignee="fable")

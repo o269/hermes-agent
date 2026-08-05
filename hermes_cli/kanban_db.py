@@ -7285,15 +7285,7 @@ def list_decomposition_eligible_triage_ids(
                    SELECT 1 FROM task_pr_ownership AS own
                    WHERE own.task_id = c.id
                      AND own.last_seen_at >= ?
-                     AND (
-                         own.declared = 1
-                         OR NOT EXISTS (
-                             SELECT 1 FROM task_pr_ownership AS other
-                             WHERE other.canonical_url = own.canonical_url
-                               AND other.task_id <> c.id
-                               AND other.declared = 1
-                         )
-                     )
+                     AND own.declared = 1
                ) AS has_active_pr
         FROM candidates AS c
         ORDER BY c.priority DESC, c.created_at ASC
@@ -8533,11 +8525,11 @@ def add_resume_marker(
     transferred by reassigning the card.
     """
     normalized_actor = str(actor or "").strip().casefold()
-    normalized_reason = str(reason or "").strip()
+    normalized_reason = _normalize_visible_audit_reason(reason)
     if normalized_actor != _RESUME_MARKER_ACTOR:
         raise ValueError("resume markers may only be set by fable")
     if not normalized_reason:
-        raise ValueError("resume marker reason must be non-empty")
+        raise ContinuationAuthorizationError("resume_marker_reason_required")
 
     authorizer, operator_profiles, worker_task_id = (
         _continuation_operator_context(conn)
