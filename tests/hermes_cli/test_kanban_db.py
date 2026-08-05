@@ -2406,8 +2406,15 @@ def test_declared_active_pr_still_rejects_claim_without_resume_marker(kanban_hom
         assert task.status == "ready"
 
 
-def test_declared_active_pr_resume_marker_claims_once_and_is_consumed(kanban_home):
+def test_declared_active_pr_resume_marker_claims_once_and_is_consumed(
+    kanban_home, monkeypatch
+):
     """A Fable marker lets the existing owner resume and is consumed atomically."""
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("fable",), None),
+    )
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="resume own PR", assignee="alice")
         kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
@@ -2417,6 +2424,17 @@ def test_declared_active_pr_resume_marker_claims_once_and_is_consumed(kanban_hom
             actor="fable",
             reason="author has approved follow-up work",
         )
+        marker = next(
+            event for event in kb.list_events(conn, task_id) if event.id == marker_id
+        )
+        assert marker.kind == "resume_marker"
+        assert marker.payload == {
+            "actor": "fable",
+            "authorized_by": "fable",
+            "authorized_profile": "alice",
+            "assignment_generation": 0,
+            "reason": "author has approved follow-up work",
+        }
 
         decision = kb.evaluate_respawn_guard(conn, task_id)
         assert decision.reason is None
@@ -2438,8 +2456,13 @@ def test_declared_active_pr_resume_marker_claims_once_and_is_consumed(kanban_hom
         assert consumed[0].run_id == claimed.current_run_id
 
 
-def test_resume_marker_cannot_spawn_twice(kanban_home):
+def test_resume_marker_cannot_spawn_twice(kanban_home, monkeypatch):
     """Reclaiming the first run does not make its consumed marker reusable."""
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("fable",), None),
+    )
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="single-use marker", assignee="alice")
         kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
@@ -2467,6 +2490,51 @@ def test_resume_marker_cannot_spawn_twice(kanban_home):
         assert consumed == [
             {"marker_event_id": marker_id, "run_id": first.current_run_id}
         ]
+
+
+def test_resume_marker_requires_operator_context_and_stays_with_owner(
+    kanban_home, monkeypatch
+):
+    """Workers cannot self-mint markers and reassignment invalidates old intent."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner-bound marker", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), "t_worker"),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as denied:
+            kb.add_resume_marker(
+                conn,
+                task_id,
+                actor="fable",
+                reason="worker must not mint this",
+            )
+        assert denied.value.code == "worker_authorization_forbidden"
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), None),
+        )
+        marker_id = kb.add_resume_marker(
+            conn,
+            task_id,
+            actor="fable",
+            reason="resume alice's existing work",
+        )
+        assert kb.assign_task(conn, task_id, "bob")
+
+        assert kb.evaluate_respawn_guard(conn, task_id).reason == "active_pr"
+        assert kb.claim_task(conn, task_id) is None
+        assert not any(
+            event.kind == "resume_marker_consumed"
+            and event.payload is not None
+            and event.payload.get("marker_event_id") == marker_id
+            for event in kb.list_events(conn, task_id)
+        )
 
 
 def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):

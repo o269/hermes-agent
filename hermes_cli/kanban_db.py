@@ -8495,12 +8495,20 @@ def add_resume_marker(
     Event schema::
 
         kind="resume_marker"
-        payload={"actor": "fable", "reason": "<non-empty>"}
+        payload={
+            "actor": "fable",
+            "authorized_by": "<operator profile>",
+            "authorized_profile": "<current task assignee>",
+            "assignment_generation": <current generation>,
+            "reason": "<non-empty>",
+        }
 
     The marker authorizes exactly one successful ``ready -> running`` claim by
     the card's existing owner.  ``claim_task`` records a paired
     ``resume_marker_consumed`` event in the same transaction as the run insert.
-    No caller may mint a marker under another actor name.
+    The operator identity and owner generation are revalidated under the writer
+    lock so a dispatched worker cannot self-mint a marker and a marker cannot be
+    transferred by reassigning the card.
     """
     normalized_actor = str(actor or "").strip().casefold()
     normalized_reason = str(reason or "").strip()
@@ -8508,17 +8516,73 @@ def add_resume_marker(
         raise ValueError("resume markers may only be set by fable")
     if not normalized_reason:
         raise ValueError("resume marker reason must be non-empty")
+
+    authorizer, operator_profiles, worker_task_id = (
+        _continuation_operator_context(conn)
+    )
+    denial = _continuation_operator_denial(
+        conn,
+        task_id,
+        authorizer,
+        operator_profiles,
+        invoking_worker_task_id=worker_task_id,
+    )
+    if denial is not None:
+        raise ContinuationAuthorizationError(denial)
+
+    selected_task = conn.execute(
+        "SELECT assignee, assignment_generation FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if selected_task is None:  # pragma: no cover - fenced by the denial above
+        raise ValueError(f"no such task: {task_id}")
+    selected_profile = str(selected_task["assignee"] or "").strip().casefold()
+    selected_generation = int(selected_task["assignment_generation"] or 0)
+    if not selected_profile:
+        raise ContinuationAuthorizationError("resume_owner_required")
+
     with write_txn(conn):
-        if conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?",
+        fresh_authorizer, fresh_profiles, fresh_worker = (
+            _continuation_operator_context(conn)
+        )
+        if fresh_authorizer != authorizer:
+            raise ContinuationAuthorizationError("operator_identity_changed")
+        raced_denial = _continuation_operator_denial(
+            conn,
+            task_id,
+            fresh_authorizer,
+            fresh_profiles,
+            invoking_worker_task_id=fresh_worker,
+        )
+        if raced_denial is not None:
+            raise ContinuationAuthorizationError(raced_denial)
+
+        task = conn.execute(
+            "SELECT assignee, assignment_generation FROM tasks WHERE id = ?",
             (task_id,),
-        ).fetchone() is None:
+        ).fetchone()
+        if task is None:  # pragma: no cover - fenced by the denial check above
             raise ValueError(f"no such task: {task_id}")
+        authorized_profile = str(task["assignee"] or "").strip().casefold()
+        if not authorized_profile:
+            raise ContinuationAuthorizationError("resume_owner_required")
+        assignment_generation = int(task["assignment_generation"] or 0)
+        if (
+            authorized_profile != selected_profile
+            or assignment_generation != selected_generation
+        ):
+            raise ContinuationAuthorizationError("resume_owner_changed")
         return _append_event(
             conn,
             task_id,
             _RESUME_MARKER_KIND,
-            {"actor": _RESUME_MARKER_ACTOR, "reason": normalized_reason},
+            {
+                "actor": _RESUME_MARKER_ACTOR,
+                "authorized_by": fresh_authorizer,
+                "authorized_profile": authorized_profile,
+                "assignment_generation": assignment_generation,
+                "reason": normalized_reason,
+            },
         )
 
 
@@ -8533,6 +8597,17 @@ def _next_resume_marker(
     dependency on SQLite's optional JSON1 extension and fails closed for
     malformed or non-Fable marker rows.
     """
+    task = conn.execute(
+        "SELECT assignee, assignment_generation FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return None
+    authorized_profile = str(task["assignee"] or "").strip().casefold()
+    assignment_generation = int(task["assignment_generation"] or 0)
+    if not authorized_profile:
+        return None
+
     consumed_ids: set[int] = set()
     for row in conn.execute(
         "SELECT payload FROM task_events "
@@ -8562,12 +8637,28 @@ def _next_resume_marker(
         if not isinstance(payload, dict):
             continue
         actor = str(payload.get("actor") or "").strip().casefold()
+        authorized_by = str(payload.get("authorized_by") or "").strip().casefold()
+        marker_profile = str(
+            payload.get("authorized_profile") or ""
+        ).strip().casefold()
+        marker_generation = payload.get("assignment_generation")
         reason = str(payload.get("reason") or "").strip()
-        if actor != _RESUME_MARKER_ACTOR or not reason:
+        if (
+            actor != _RESUME_MARKER_ACTOR
+            or not authorized_by
+            or marker_profile != authorized_profile
+            or not isinstance(marker_generation, int)
+            or isinstance(marker_generation, bool)
+            or marker_generation != assignment_generation
+            or not reason
+        ):
             continue
         return {
             "id": marker_id,
             "actor": _RESUME_MARKER_ACTOR,
+            "authorized_by": authorized_by,
+            "authorized_profile": authorized_profile,
+            "assignment_generation": assignment_generation,
             "reason": reason,
             "created_at": int(row["created_at"]),
         }
