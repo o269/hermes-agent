@@ -2666,6 +2666,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "respawn_guarded": res.normalized_respawn_guard_details(),
+            "dispositions": res.normalized_dispositions(),
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2687,6 +2689,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    for line in res.disposition_log_lines():
+        print(line)
+    for line in res.respawn_guard_log_lines():
+        print(line)
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

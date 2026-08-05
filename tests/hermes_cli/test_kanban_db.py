@@ -1583,3 +1583,67 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_dispatch_disposition_spawns_reference_only_pr_card(
+    kanban_home, all_assignees_spawnable
+):
+    """A companion-PR citation stays spawnable and receives one disposition."""
+    pr_url = "https://github.com/o269/hermes-agent/pull/40"
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="PR owner", assignee="owner")
+        kb.add_comment(conn, owner, "owner", f"AUTHOR COMPLETE: {pr_url}")
+        cited = kb.create_task(conn, title="related work", assignee="alice")
+        kb.add_comment(conn, cited, "coordinator", f"Companion PR: {pr_url}")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    assert cited in spawned
+    assert not [entry for entry in result.respawn_guarded if entry[0] == cited]
+    cited_dispositions = [
+        entry for entry in result.dispositions if entry.task_id == cited
+    ]
+    assert len(cited_dispositions) == 1
+    assert cited_dispositions[0].outcome == "spawned"
+
+
+def test_evaluate_respawn_guard_defers_cross_post_audit_until_recorded(
+    kanban_home,
+):
+    """Evaluation is read-only; real-tick recording keeps the 97c audit."""
+    pr_url = "https://github.com/o269/hermes-agent/pull/40"
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="PR owner", assignee="owner")
+        kb.add_comment(conn, owner, "owner", f"AUTHOR COMPLETE: {pr_url}")
+        cited = kb.create_task(conn, title="related work", assignee="alice")
+        kb.add_comment(conn, cited, "coordinator", f"Companion PR: {pr_url}")
+
+        decision = kb.evaluate_respawn_guard(conn, cited)
+
+        def ignored():
+            return [
+                event
+                for event in kb.list_events(conn, cited)
+                if event.kind == "respawn_guard_pr_ignored"
+            ]
+
+        assert decision.reason is None
+        assert decision.detail == {
+            "pr_url": None,
+            "pr_urls": [],
+            "ownership": None,
+            "source_comment_id": None,
+            "expires_at": None,
+            "window_seconds": kb._RESPAWN_GUARD_PR_WINDOW,
+            "ignored_pr_urls": [{"pr_url": pr_url, "declared_by": owner}],
+        }
+        assert ignored() == []
+
+        kb.record_respawn_guard_decision(conn, cited, decision)
+        kb.record_respawn_guard_decision(conn, cited, decision)
+
+        assert len(ignored()) == 1

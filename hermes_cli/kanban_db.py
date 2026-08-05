@@ -88,7 +88,7 @@ import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -7305,6 +7305,32 @@ def _canonical_pr_urls_from_comments(
 
 
 
+@dataclass(frozen=True)
+class DispatchDisposition:
+    """One terminal outcome for a card in the tick's Ready snapshot."""
+
+    task_id: str
+    outcome: str
+    reason: Optional[str] = None
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "detail": dict(self.detail),
+        }
+
+
+@dataclass(frozen=True)
+class RespawnGuardDecision:
+    """Detailed local-lineage respawn-guard result."""
+
+    reason: Optional[str] = None
+    detail: Optional[dict[str, Any]] = None
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -7363,6 +7389,252 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    respawn_guard_details: list[dict[str, Any]] = field(default_factory=list)
+    """Structured operator diagnostics, one per guarded Ready card."""
+    dispositions: list[DispatchDisposition] = field(default_factory=list)
+    """Exactly one terminal disposition for each Ready row snapped this tick."""
+
+    def add_respawn_guard(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        detail: Optional[Mapping[str, Any]] = None,
+        phase: Optional[str] = None,
+    ) -> None:
+        """Record a guarded task in legacy and operator-visible forms."""
+        self.respawn_guarded.append((task_id, reason))
+        diagnostic = dict(detail or {})
+        diagnostic.update({"task_id": task_id, "reason": reason})
+        if phase is not None:
+            diagnostic["phase"] = phase
+        self.respawn_guard_details.append(diagnostic)
+
+    def normalized_respawn_guard_details(self) -> list[dict[str, Any]]:
+        """Return one structured diagnostic for every guarded respawn."""
+        details = [dict(entry) for entry in self.respawn_guard_details]
+        return [
+            {
+                **(details[index] if index < len(details) else {}),
+                "task_id": task_id,
+                "reason": reason,
+            }
+            for index, (task_id, reason) in enumerate(self.respawn_guarded)
+        ]
+
+    def respawn_guard_log_lines(self) -> list[str]:
+        """Render stable, grep-friendly suppression log lines."""
+        lines: list[str] = []
+        for detail in self.normalized_respawn_guard_details():
+            fields = [
+                f"SKIP {detail['task_id']}",
+                f"respawn_guarded={detail['reason']}",
+            ]
+            pr_details = detail.get("pr_details")
+            rendered_pr_detail = False
+            if isinstance(pr_details, Sequence) and not isinstance(
+                pr_details, (str, bytes)
+            ):
+                for pr_detail in pr_details:
+                    if not isinstance(pr_detail, Mapping) or not pr_detail.get(
+                        "pr_url"
+                    ):
+                        continue
+                    fields.append(f"pr={pr_detail['pr_url']}")
+                    if pr_detail.get("expires_at") is not None:
+                        fields.append(f"expires={pr_detail['expires_at']}")
+                    rendered_pr_detail = True
+            if not rendered_pr_detail:
+                if detail.get("pr_url"):
+                    fields.append(f"pr={detail['pr_url']}")
+                if detail.get("expires_at") is not None:
+                    fields.append(f"expires={detail['expires_at']}")
+            if detail.get("phase"):
+                fields.append(f"phase={detail['phase']}")
+            if detail.get("continuation_denial"):
+                fields.append(f"denial={detail['continuation_denial']}")
+            lines.append(" ".join(fields))
+        return lines
+
+    def add_disposition(
+        self,
+        task_id: str,
+        outcome: str,
+        *,
+        reason: Optional[str] = None,
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Append one Ready-card disposition, rejecting duplicates eagerly."""
+        if outcome not in {"spawned", "skipped", "held"}:
+            raise ValueError(f"invalid dispatch disposition outcome: {outcome}")
+        if outcome != "spawned" and not reason:
+            raise ValueError(f"{outcome} dispatch disposition requires a reason")
+        if any(entry.task_id == task_id for entry in self.dispositions):
+            raise RuntimeError(f"duplicate dispatch disposition for {task_id}")
+        self.dispositions.append(
+            DispatchDisposition(
+                task_id=task_id,
+                outcome=outcome,
+                reason=reason,
+                detail=dict(detail or {}),
+            )
+        )
+
+    def validate_dispositions(self, ready_task_ids: Sequence[str]) -> None:
+        """Enforce exact cardinality and priority order for the Ready snapshot."""
+        expected = list(ready_task_ids)
+        actual = [entry.task_id for entry in self.dispositions]
+        if actual != expected or len(actual) != len(set(actual)):
+            raise RuntimeError(
+                "dispatch disposition invariant violated: "
+                f"expected={expected!r} actual={actual!r}"
+            )
+
+    def normalized_dispositions(self) -> list[dict[str, Any]]:
+        return [entry.as_dict() for entry in self.dispositions]
+
+    def disposition_log_lines(self) -> list[str]:
+        """Render stable, priority-ordered plain-text disposition lines."""
+        lines: list[str] = []
+        for entry in self.dispositions:
+            fields = [f"DISPOSITION {entry.task_id}", entry.outcome]
+            if entry.reason:
+                label = "guard" if entry.outcome == "held" else "reason"
+                fields.append(f"{label}={entry.reason}")
+            if entry.detail:
+                fields.append(
+                    "detail="
+                    + json.dumps(
+                        dict(entry.detail),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+            lines.append(" ".join(fields))
+        return lines
+
+
+_DISPOSITION_EVENT_DETAIL_KEYS = (
+    "assignee",
+    "auto_blocked",
+    "claim_reason",
+    "continuation_authorization_id",
+    "continuation_denial",
+    "current",
+    "current_status",
+    "error_type",
+    "expires_at",
+    "last_seen_at",
+    "limit",
+    "ownership",
+    "phase",
+    "pr_url",
+    "profile",
+    "resume_marker_id",
+    "running_task_id",
+    "source",
+    "source_comment_id",
+    "source_status",
+    "window_seconds",
+)
+
+
+def _compact_dispatch_disposition_detail(
+    detail: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bound persisted diagnostics to known non-secret operator fields."""
+    compact: dict[str, Any] = {}
+    for key in _DISPOSITION_EVENT_DETAIL_KEYS:
+        if not detail:
+            break
+        value = detail.get(key)
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            compact[key] = value
+    return compact
+
+
+def _record_ready_disposition(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    task_id: str,
+    outcome: str,
+    *,
+    reason: Optional[str] = None,
+    detail: Optional[Mapping[str, Any]] = None,
+    dry_run: bool,
+) -> None:
+    """Record one Ready-card result and persist a compact real-tick event."""
+    diagnostic = dict(detail or {})
+    result.add_disposition(
+        task_id,
+        outcome,
+        reason=reason,
+        detail=diagnostic,
+    )
+    if dry_run:
+        return
+    payload: dict[str, Any] = {"outcome": outcome}
+    if reason is not None:
+        payload["reason"] = reason
+    compact_detail = _compact_dispatch_disposition_detail(diagnostic)
+    if compact_detail:
+        payload["detail"] = compact_detail
+    with write_txn(conn):
+        _append_event(conn, task_id, "dispatch_disposition", payload)
+
+
+def _claim_rejection_disposition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    after_event_id: int,
+    assignee: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Classify a failed claim from events emitted by the atomic claim path."""
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND id > ? ORDER BY id DESC",
+        (task_id, after_event_id),
+    ).fetchall()
+    decoded: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        decoded.append((row["kind"], payload))
+    for kind, payload in decoded:
+        if kind == "respawn_guarded":
+            reason = str(payload.get("reason") or "claim_guarded")
+            return "held", reason, {"assignee": assignee, **payload}
+    for kind, payload in decoded:
+        if kind in {"claim_rejected", "operator_claim_denied"}:
+            claim_reason = str(payload.get("reason") or "")
+            if claim_reason.startswith("active_pr"):
+                detail: dict[str, Any] = {}
+                check_respawn_guard(conn, task_id, detail_out=detail)
+                return "held", "active_pr", {
+                    "assignee": assignee,
+                    "claim_reason": claim_reason,
+                    **detail,
+                }
+            return "skipped", "claim_rejected", {
+                "assignee": assignee,
+                "claim_reason": claim_reason or None,
+                **_compact_dispatch_disposition_detail(payload),
+            }
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return "skipped", "claim_rejected", {
+        "assignee": assignee,
+        "current_status": current["status"] if current is not None else "missing",
+    }
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8984,6 +9256,8 @@ def _record_disowned_pr_mentions(
     conn: sqlite3.Connection,
     task_id: str,
     detail: Mapping[str, Any],
+    *,
+    now: Optional[int] = None,
 ) -> None:
     """Emit one audit event when PR mentions were considered and rejected.
 
@@ -8994,11 +9268,12 @@ def _record_disowned_pr_mentions(
     ignored = detail.get("ignored_pr_urls")
     if not ignored:
         return
+    observed_at = int(time.time()) if now is None else int(now)
     recent = conn.execute(
         "SELECT 1 FROM task_events "
         "WHERE task_id = ? AND kind = 'respawn_guard_pr_ignored' "
         "AND created_at >= ? LIMIT 1",
-        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        (task_id, observed_at - _RESPAWN_GUARD_PR_WINDOW),
     ).fetchone()
     if recent is not None:
         return
@@ -9012,7 +9287,9 @@ def _record_disowned_pr_mentions(
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str,
-    *, detail_out: Optional[dict] = None,
+    *,
+    detail_out: Optional[dict] = None,
+    audit_disowned_mentions: bool = True,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -9098,6 +9375,13 @@ def check_respawn_guard(
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+            if detail_out is not None:
+                detail_out.update(
+                    {
+                        "expires_at": int(ended_at) + rl_cooldown,
+                        "window_seconds": rl_cooldown,
+                    }
+                )
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -9134,6 +9418,13 @@ def check_respawn_guard(
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
+            if detail_out is not None:
+                detail_out.update(
+                    {
+                        "expires_at": completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW,
+                        "window_seconds": _RESPAWN_GUARD_SUCCESS_WINDOW,
+                    }
+                )
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -9149,9 +9440,63 @@ def check_respawn_guard(
         detail = _active_pr_guard_detail((), disowned)
         if detail_out is not None:
             detail_out.update(detail)
-        _record_disowned_pr_mentions(conn, task_id, detail)
+        if audit_disowned_mentions:
+            _record_disowned_pr_mentions(conn, task_id, detail, now=now)
 
     return None
+
+
+def evaluate_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    process_snapshot: Optional[Iterable[Any]] = None,
+) -> RespawnGuardDecision:
+    """Return actionable guard diagnostics without writing audit events."""
+    del process_snapshot  # The local release keeps its existing DB/PID guard path.
+    detail: dict[str, Any] = {}
+    reason = check_respawn_guard(
+        conn,
+        task_id,
+        detail_out=detail,
+        audit_disowned_mentions=False,
+    )
+    return RespawnGuardDecision(reason=reason, detail=detail or None)
+
+
+def record_respawn_guard_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision: RespawnGuardDecision,
+    *,
+    phase: str = "dispatch",
+) -> None:
+    """Persist a visible guard event, or one rate-limited citation audit."""
+    if decision.reason is None:
+        if decision.detail:
+            _record_disowned_pr_mentions(
+                conn,
+                task_id,
+                decision.detail,
+                now=int(time.time()),
+            )
+        return
+    payload: dict[str, Any] = {"reason": decision.reason, "phase": phase}
+    if decision.detail:
+        payload.update(decision.detail)
+    with write_txn(conn):
+        _append_event(conn, task_id, "respawn_guarded", payload)
+
+
+def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
+    """Preserve the local-lineage profile predicate behind one dispatch hook."""
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return True
+    return bool(profile_exists(assignee))
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -9175,15 +9520,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
@@ -9201,14 +9538,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_has_spawn_target(row["assignee"]) for row in rows)
 
 
 def dispatch_once(
@@ -9381,6 +9711,20 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
+            for row in ready_rows:
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="max_in_progress",
+                    detail={
+                        "limit": max_in_progress,
+                        "current": int(in_progress),
+                    },
+                    dry_run=dry_run,
+                )
+            result.validate_dispositions([row["id"] for row in ready_rows])
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -9425,7 +9769,19 @@ def _dispatch_once_locked(
             _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="max_spawn",
+                detail={
+                    "limit": max_spawn,
+                    "current": running_count + spawned,
+                },
+                dry_run=dry_run,
+            )
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -9457,18 +9813,38 @@ def _dispatch_once_locked(
                                     "source": "kanban.default_assignee",
                                 },
                             )
-                    except Exception:
+                    except Exception as exc:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
                             "to task %s",
                             _default_assignee, row["id"], exc_info=True,
                         )
                         result.skipped_unassigned.append(row["id"])
+                        _record_ready_disposition(
+                            conn,
+                            result,
+                            row["id"],
+                            "skipped",
+                            reason="default_assignment_failed",
+                            detail={
+                                "assignee": _default_assignee,
+                                "error_type": type(exc).__name__,
+                            },
+                            dry_run=dry_run,
+                        )
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "skipped",
+                    reason="unassigned",
+                    dry_run=dry_run,
+                )
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
@@ -9480,11 +9856,7 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _assignee_has_spawn_target(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -9492,6 +9864,15 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="nonspawnable_assignee",
+                detail={"assignee": row_assignee},
+                dry_run=dry_run,
+            )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -9505,6 +9886,19 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="per_profile_cap",
+                    detail={
+                        "assignee": row_assignee,
+                        "current": current,
+                        "limit": _per_profile_cap,
+                    },
+                    dry_run=dry_run,
+                )
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -9514,21 +9908,42 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+        guard_decision = evaluate_respawn_guard(conn, row["id"])
+        if not dry_run and (
+            guard_decision.reason is not None or guard_decision.detail
+        ):
+            record_respawn_guard_decision(conn, row["id"], guard_decision)
+        if guard_decision.reason is not None:
+            result.add_respawn_guard(
+                row["id"],
+                guard_decision.reason,
+                detail=guard_decision.detail,
+                phase="ready",
+            )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason=guard_decision.reason,
+                detail={
+                    "assignee": row_assignee,
+                    **(guard_decision.detail or {}),
+                },
+                dry_run=dry_run,
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "spawned",
+                detail={"assignee": row_assignee, "source": "dry_run"},
+                dry_run=True,
+            )
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -9538,8 +9953,36 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        claim_event_floor = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                (row["id"],),
+            ).fetchone()[0]
+        )
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            outcome, reason, detail = _claim_rejection_disposition(
+                conn,
+                row["id"],
+                after_event_id=claim_event_floor,
+                assignee=row_assignee,
+            )
+            if outcome == "held":
+                result.add_respawn_guard(
+                    row["id"],
+                    reason,
+                    detail=detail,
+                    phase="claim",
+                )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                outcome,
+                reason=reason,
+                detail=detail,
+                dry_run=False,
+            )
             continue
         try:
             resolved_branch_name = None
@@ -9554,6 +9997,19 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="workspace_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -9584,6 +10040,17 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "spawned",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "source": "worker_spawn",
+                },
+                dry_run=False,
+            )
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -9599,6 +10066,21 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="spawn_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
+
+    result.validate_dispositions([row["id"] for row in ready_rows])
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
