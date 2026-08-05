@@ -9643,6 +9643,24 @@ def authorize_continuation(
     return authorization
 
 
+@dataclass(frozen=True)
+class DispatchDisposition:
+    """One terminal outcome for a card in the tick's Ready snapshot."""
+
+    task_id: str
+    outcome: str
+    reason: Optional[str] = None
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "detail": dict(self.detail),
+        }
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -9719,6 +9737,70 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    dispositions: list[DispatchDisposition] = field(default_factory=list)
+    """Exactly one terminal disposition for each Ready row snapped this tick.
+
+    Entries stay in dispatcher priority order and intentionally coexist with
+    the legacy compatibility buckets above.
+    """
+    def add_disposition(
+        self,
+        task_id: str,
+        outcome: str,
+        *,
+        reason: Optional[str] = None,
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Append one Ready-card disposition, rejecting duplicates eagerly."""
+        if outcome not in {"spawned", "skipped", "held"}:
+            raise ValueError(f"invalid dispatch disposition outcome: {outcome}")
+        if outcome != "spawned" and not reason:
+            raise ValueError(f"{outcome} dispatch disposition requires a reason")
+        if any(entry.task_id == task_id for entry in self.dispositions):
+            raise RuntimeError(f"duplicate dispatch disposition for {task_id}")
+        self.dispositions.append(
+            DispatchDisposition(
+                task_id=task_id,
+                outcome=outcome,
+                reason=reason,
+                detail=dict(detail or {}),
+            )
+        )
+
+    def validate_dispositions(self, ready_task_ids: Sequence[str]) -> None:
+        """Enforce exact cardinality and priority order for the Ready snapshot."""
+        expected = list(ready_task_ids)
+        actual = [entry.task_id for entry in self.dispositions]
+        if actual != expected or len(actual) != len(set(actual)):
+            raise RuntimeError(
+                "dispatch disposition invariant violated: "
+                f"expected={expected!r} actual={actual!r}"
+            )
+
+    def normalized_dispositions(self) -> list[dict[str, Any]]:
+        return [entry.as_dict() for entry in self.dispositions]
+
+    def disposition_log_lines(self) -> list[str]:
+        """Render stable, priority-ordered plain-text disposition lines."""
+        lines: list[str] = []
+        for entry in self.dispositions:
+            fields = [f"DISPOSITION {entry.task_id}", entry.outcome]
+            if entry.reason:
+                label = "guard" if entry.outcome == "held" else "reason"
+                fields.append(f"{label}={entry.reason}")
+            if entry.detail:
+                fields.append(
+                    "detail="
+                    + json.dumps(
+                        dict(entry.detail),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+            lines.append(" ".join(fields))
+        return lines
 
     def add_respawn_guard(
         self,
@@ -9781,6 +9863,128 @@ class DispatchResult:
                 fields.append(f"denial={detail['continuation_denial']}")
             lines.append(" ".join(fields))
         return lines
+
+
+_DISPOSITION_EVENT_DETAIL_KEYS = (
+    "assignee",
+    "auto_blocked",
+    "claim_reason",
+    "continuation_authorization_id",
+    "continuation_denial",
+    "current",
+    "current_status",
+    "error_type",
+    "expires_at",
+    "last_seen_at",
+    "limit",
+    "ownership",
+    "phase",
+    "pr_url",
+    "profile",
+    "resume_marker_id",
+    "running_task_id",
+    "source",
+    "source_comment_id",
+    "source_status",
+    "window_seconds",
+)
+
+
+def _compact_dispatch_disposition_detail(
+    detail: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bound persisted diagnostics to known non-secret operator fields."""
+    compact: dict[str, Any] = {}
+    for key in _DISPOSITION_EVENT_DETAIL_KEYS:
+        if not detail:
+            break
+        value = detail.get(key)
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            compact[key] = value
+    return compact
+
+
+def _record_ready_disposition(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    task_id: str,
+    outcome: str,
+    *,
+    reason: Optional[str] = None,
+    detail: Optional[Mapping[str, Any]] = None,
+    dry_run: bool,
+) -> None:
+    """Record one Ready-card result and persist a compact real-tick event."""
+    diagnostic = dict(detail or {})
+    result.add_disposition(
+        task_id,
+        outcome,
+        reason=reason,
+        detail=diagnostic,
+    )
+    if dry_run:
+        return
+    payload: dict[str, Any] = {"outcome": outcome}
+    if reason is not None:
+        payload["reason"] = reason
+    compact_detail = _compact_dispatch_disposition_detail(diagnostic)
+    if compact_detail:
+        payload["detail"] = compact_detail
+    with write_txn(conn):
+        _append_event(conn, task_id, "dispatch_disposition", payload)
+
+
+def _claim_rejection_disposition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    after_event_id: int,
+    assignee: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Classify a failed claim from events emitted by the atomic claim path."""
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND id > ? ORDER BY id DESC",
+        (task_id, after_event_id),
+    ).fetchall()
+    decoded: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        decoded.append((row["kind"], payload))
+    # The guard recorder appends continuation_denied after respawn_guarded.
+    # Prefer the richer guard event even though it is one event older.
+    for kind, payload in decoded:
+        if kind == "respawn_guarded":
+            reason = str(payload.get("reason") or "claim_guarded")
+            return "held", reason, {"assignee": assignee, **payload}
+    for kind, payload in decoded:
+        if kind == "continuation_denied":
+            return "held", "active_pr", {
+                "assignee": assignee,
+                "continuation_denial": payload.get("reason"),
+                "continuation_authorization_id": payload.get("authorization_id"),
+                "phase": payload.get("phase"),
+            }
+    for kind, payload in decoded:
+        if kind in {"claim_rejected", "operator_claim_denied"}:
+            return "skipped", "claim_rejected", {
+                "assignee": assignee,
+                "claim_reason": payload.get("reason"),
+                **_compact_dispatch_disposition_detail(payload),
+            }
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return "skipped", "claim_rejected", {
+        "assignee": assignee,
+        "current_status": current["status"] if current is not None else "missing",
+    }
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -12332,6 +12536,8 @@ def _record_disowned_pr_mentions(
     conn: sqlite3.Connection,
     task_id: str,
     detail: Mapping[str, Any],
+    *,
+    now: Optional[int] = None,
 ) -> None:
     """Emit one audit event when PR mentions were considered and rejected.
 
@@ -12342,11 +12548,12 @@ def _record_disowned_pr_mentions(
     ignored = detail.get("ignored_pr_urls")
     if not ignored:
         return
+    observed_at = int(time.time()) if now is None else int(now)
     recent = conn.execute(
         "SELECT 1 FROM task_events "
         "WHERE task_id = ? AND kind = 'respawn_guard_pr_ignored' "
         "AND created_at >= ? LIMIT 1",
-        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        (task_id, observed_at - _RESPAWN_GUARD_PR_WINDOW),
     ).fetchone()
     if recent is not None:
         return
@@ -12522,7 +12729,12 @@ def record_respawn_guard_decision(
         # Silence here is what made the old guard undiagnosable in both
         # directions.
         if decision.detail:
-            _record_disowned_pr_mentions(conn, task_id, decision.detail)
+            _record_disowned_pr_mentions(
+                conn,
+                task_id,
+                decision.detail,
+                now=int(time.time()),
+            )
         return
     # A guard nobody can see is worse than no guard. The reconciler only ever
     # reported STARVED, so a suppressed respawn looked like missing capacity or
@@ -12950,6 +13162,20 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
+            for row in ready_rows:
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="max_in_progress",
+                    detail={
+                        "limit": max_in_progress,
+                        "current": int(in_progress),
+                    },
+                    dry_run=dry_run,
+                )
+            result.validate_dispositions([row["id"] for row in ready_rows])
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -13027,7 +13253,19 @@ def _dispatch_once_locked(
             _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="max_spawn",
+                detail={
+                    "limit": max_spawn,
+                    "current": running_count + spawned,
+                },
+                dry_run=dry_run,
+            )
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -13059,24 +13297,53 @@ def _dispatch_once_locked(
                                     "source": "kanban.default_assignee",
                                 },
                             )
-                    except Exception:
+                    except Exception as exc:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
                             "to task %s",
                             _default_assignee, row["id"], exc_info=True,
                         )
                         result.skipped_unassigned.append(row["id"])
+                        _record_ready_disposition(
+                            conn,
+                            result,
+                            row["id"],
+                            "skipped",
+                            reason="default_assignment_failed",
+                            detail={
+                                "assignee": _default_assignee,
+                                "error_type": type(exc).__name__,
+                            },
+                            dry_run=dry_run,
+                        )
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "skipped",
+                    reason="unassigned",
+                    dry_run=dry_run,
+                )
                 continue
         # Spawn only through the canonical target predicate.  A target is either
         # a local profile or the configured attached-SSH VPS2 transport; terminal
         # control-plane lanes remain nonspawnable and pull claims themselves.
         if not _assignee_has_spawn_target(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="nonspawnable_assignee",
+                detail={"assignee": row_assignee},
+                dry_run=dry_run,
+            )
             continue
         # A live owner for THIS card is left to the same-card respawn guard
         # below. Only a distinct active card profile-caps this candidate.
@@ -13086,9 +13353,32 @@ def _dispatch_once_locked(
             result.skipped_per_profile_capped.append(
                 (row["id"], row_assignee, len(active_cards))
             )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="per_profile_cap",
+                detail={
+                    "assignee": row_assignee,
+                    "current": len(active_cards),
+                    "limit": 1,
+                    "active_task_ids": sorted(other_active_cards),
+                },
+                dry_run=dry_run,
+            )
             continue
         preflight_task = get_task(conn, row["id"])
         if preflight_task is None:
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="task_missing",
+                detail={"assignee": row_assignee},
+                dry_run=dry_run,
+            )
             continue
         if not _preflight_forced_skills(
             conn,
@@ -13100,6 +13390,15 @@ def _dispatch_once_locked(
             dry_run=dry_run,
         ):
             result.forced_skill_blocked.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="forced_skill_preflight",
+                detail={"assignee": row_assignee},
+                dry_run=dry_run,
+            )
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -13130,13 +13429,40 @@ def _dispatch_once_locked(
                 detail=guard_decision.detail,
                 phase="ready",
             )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason=guard_decision.reason,
+                detail={
+                    "assignee": row_assignee,
+                    **(guard_decision.detail or {}),
+                },
+                dry_run=dry_run,
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "spawned",
+                detail={"assignee": row_assignee, "source": "dry_run"},
+                dry_run=True,
+            )
+            spawned += 1
             _per_profile_active_cards.setdefault(row_assignee, set()).add(
                 row["id"]
             )
             continue
+        claim_event_floor = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                (row["id"],),
+            ).fetchone()[0]
+        )
         try:
             claimed = claim_task(
                 conn,
@@ -13177,8 +13503,39 @@ def _dispatch_once_locked(
                 raced,
                 phase="claim_exception",
             )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="active_pr",
+                detail={"assignee": row_assignee, **(raced.detail or {})},
+                dry_run=False,
+            )
             continue
         if claimed is None:
+            outcome, reason, detail = _claim_rejection_disposition(
+                conn,
+                row["id"],
+                after_event_id=claim_event_floor,
+                assignee=row_assignee,
+            )
+            if outcome == "held":
+                result.add_respawn_guard(
+                    row["id"],
+                    reason,
+                    detail=detail,
+                    phase="claim",
+                )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                outcome,
+                reason=reason,
+                detail=detail,
+                dry_run=False,
+            )
             continue
         if _release_post_claim_live_worker_guard(
             conn,
@@ -13194,6 +13551,15 @@ def _dispatch_once_locked(
                 "live_worker_process",
                 phase="ready",
             )
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "held",
+                reason="live_worker_process",
+                detail={"assignee": claimed.assignee or row_assignee},
+                dry_run=False,
+            )
             continue
         try:
             resolved_branch_name = None
@@ -13208,6 +13574,19 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="workspace_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -13249,6 +13628,17 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "spawned",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "source": "worker_spawn",
+                },
+                dry_run=False,
+            )
             spawned += 1
             if claimed.assignee:
                 _per_profile_active_cards.setdefault(claimed.assignee, set()).add(
@@ -13261,6 +13651,21 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="spawn_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
+
+    result.validate_dispositions([row["id"] for row in ready_rows])
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

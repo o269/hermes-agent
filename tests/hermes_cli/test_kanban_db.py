@@ -2680,6 +2680,11 @@ def test_dispatch_spawns_card_that_only_cites_another_cards_pr(
     assert not [
         entry for entry in result.respawn_guarded if entry[0] == cited
     ]
+    cited_dispositions = [
+        entry for entry in result.dispositions if entry.task_id == cited
+    ]
+    assert len(cited_dispositions) == 1
+    assert cited_dispositions[0].outcome == "spawned"
 
 
 def test_continuation_exact_authorization_consumes_atomically_and_passes_once(
