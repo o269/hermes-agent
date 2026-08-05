@@ -1759,7 +1759,13 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
 
     with kb.connect() as conn:
         p = kb.create_task(conn, title="p", assignee="alice")
-        c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
+        c = kb.create_task(
+            conn,
+            title="c",
+            body="Resource-Class: light",
+            assignee="bob",
+            parents=[p],
+        )
         # Finish parent outside dispatch; promotion happens inside.
         kb.complete_task(conn, p)
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
@@ -1823,8 +1829,18 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
 
     with kb.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
-        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
-        ready_b = kb.create_task(conn, title="ready-b", assignee="carol")
+        ready_a = kb.create_task(
+            conn,
+            title="ready-a",
+            body="Resource-Class: light",
+            assignee="bob",
+        )
+        ready_b = kb.create_task(
+            conn,
+            title="ready-b",
+            body="Resource-Class: light",
+            assignee="carol",
+        )
         kb.claim_task(conn, running)
 
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
@@ -1873,7 +1889,12 @@ def _create_continuation_task(
     *pr_tuples: str,
     assignee: str = "engineer",
 ) -> str:
-    task_id = kb.create_task(conn, title="repair active PR", assignee=assignee)
+    task_id = kb.create_task(
+        conn,
+        title="repair active PR",
+        body="Resource-Class: light",
+        assignee=assignee,
+    )
     for raw in pr_tuples:
         pr = kb.parse_continuation_pr_tuple(raw)
         kb.add_comment(conn, task_id, assignee, f"Opened {pr.canonical_url}")
@@ -2668,7 +2689,12 @@ def test_dispatch_spawns_card_that_only_cites_another_cards_pr(
     spawned: list[str] = []
     with kb.connect() as conn:
         _card_declaring_pr(conn, _COMPANION_PR)
-        cited = kb.create_task(conn, title="engine work", assignee="alice")
+        cited = kb.create_task(
+            conn,
+            title="engine work",
+            body="Resource-Class: light",
+            assignee="alice",
+        )
         kb.add_comment(conn, cited, "cursor2", f"companion FE PR: {_COMPANION_PR}")
 
         result = kb.dispatch_once(
@@ -4961,7 +4987,12 @@ def test_dispatch_respawn_guard_allows_clean_task(
         spawned_ids.append(task.id)
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="clean-task", assignee="alice")
+        t = kb.create_task(
+            conn,
+            title="clean-task",
+            body="Resource-Class: light",
+            assignee="alice",
+        )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert t in spawned_ids
@@ -5157,6 +5188,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         tid = kb.create_task(
             conn,
             title="ship",
+            body="Resource-Class: light",
             assignee="sentinel",
             workspace_kind="worktree",
             board="worktree-board",
@@ -5196,6 +5228,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         tid = kb.create_task(
             conn,
             title="ship",
+            body="Resource-Class: light",
             assignee="sentinel",
             workspace_kind="worktree",
             board="worktree-rerun-board",
@@ -6729,9 +6762,24 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(
         t1 = kb.create_task(conn, title="a", assignee="alice")
         kb.claim_task(conn, t1)
         # Three ready tasks — global headroom permits only the first two.
-        kb.create_task(conn, title="b", assignee="bob")
-        kb.create_task(conn, title="c", assignee="carol")
-        kb.create_task(conn, title="d", assignee="dave")
+        kb.create_task(
+            conn,
+            title="b",
+            body="Resource-Class: light",
+            assignee="bob",
+        )
+        kb.create_task(
+            conn,
+            title="c",
+            body="Resource-Class: light",
+            assignee="carol",
+        )
+        kb.create_task(
+            conn,
+            title="d",
+            body="Resource-Class: light",
+            assignee="dave",
+        )
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=3)
 
     assert len(spawns) == 2
@@ -6750,7 +6798,12 @@ def test_dispatch_max_in_progress_none_is_unlimited(
         for title, assignee in zip(
             ["a", "b", "c", "d"], ["alice", "bob", "carol", "dave"]
         ):
-            kb.create_task(conn, title=title, assignee=assignee)
+            kb.create_task(
+                conn,
+                title=title,
+                body="Resource-Class: light",
+                assignee=assignee,
+            )
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=None)
 
     assert len(spawns) == 4
@@ -6820,10 +6873,15 @@ def test_dispatch_review_spawns_with_correct_skills(
 
     def capture_spawn(task, workspace, board=None):
         spawned_tasks.append(task)
-        return 42  # fake PID
+        return None  # no real worker process in this unit test
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
+        t = kb.create_task(
+            conn,
+            title="review me",
+            body="Resource-Class: light",
+            assignee="alice",
+        )
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(
             conn,
@@ -6848,23 +6906,72 @@ def test_dispatch_review_skips_unassigned(kanban_home):
 def test_dispatch_review_counts_toward_max_spawn(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review spawns count against max_spawn alongside ready tasks."""
+    """Fair review admission and subsequent ready admission both honor max_spawn."""
     spawns = []
+    children: list[subprocess.Popen[bytes]] = []
 
-    def fake_spawn(task, workspace, board=None):
+    def fake_spawn(
+        task,
+        workspace,
+        board=None,
+        *,
+        heavy_workspace_lease=None,
+    ):
         spawns.append(task.id)
-        return 42
+        pass_fds = (
+            heavy_workspace_lease.filenos()
+            if heavy_workspace_lease is not None
+            else ()
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            pass_fds=pass_fds,
+        )
+        children.append(child)
+        return child.pid
 
-    with kb.connect() as conn:
-        # Create 2 ready tasks + 1 review task, max_spawn=2
-        t1 = kb.create_task(conn, title="ready 1", assignee="alice")
-        t2 = kb.create_task(conn, title="ready 2", assignee="bob")
-        t3 = kb.create_task(conn, title="review", assignee="alice")
-        _set_task_status(conn, t3, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
-    # Only 2 should spawn (ready tasks get priority in the loop)
-    assert len(res.spawned) == 2
-    assert len(spawns) == 2
+    try:
+        with kb.connect() as conn:
+            # The initial phase turn admits review first, even though ready rows are
+            # encountered first. The next tick admits ready work up to max_spawn.
+            t1 = kb.create_task(conn, title="ready 1", assignee="bob")
+            t2 = kb.create_task(conn, title="ready 2", assignee="carol")
+            t3 = kb.create_task(conn, title="review", assignee="alice")
+            _set_task_status(conn, t3, "review")
+            first = kb.dispatch_once(
+                conn,
+                spawn_fn=fake_spawn,
+                max_spawn=2,
+                max_in_progress=99,
+                skill_validator=lambda _profile, _skills: [],
+            )
+            second = kb.dispatch_once(
+                conn,
+                spawn_fn=fake_spawn,
+                max_spawn=2,
+                max_in_progress=99,
+            )
+            kb.complete_task(conn, t3)
+            third = kb.dispatch_once(
+                conn,
+                spawn_fn=fake_spawn,
+                max_spawn=2,
+                max_in_progress=99,
+            )
+
+        assert [item[0] for item in first.spawned] == [t3]
+        assert [item[0] for item in second.spawned] == [t1]
+        assert [item[0] for item in third.spawned] == [t2]
+        assert len(first.spawned) <= 2
+        assert len(second.spawned) <= 2
+        assert len(third.spawned) <= 2
+        assert spawns == [t3, t1, t2]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        for child in children:
+            child.wait(timeout=5)
 
 
 def test_dispatch_review_spawns_when_ready_empty(
@@ -6875,10 +6982,15 @@ def test_dispatch_review_spawns_when_ready_empty(
 
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
-        return 42
+        return None
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
+        t = kb.create_task(
+            conn,
+            title="review me",
+            body="Resource-Class: light",
+            assignee="alice",
+        )
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(
             conn,

@@ -1512,13 +1512,23 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
+
+    ``status="skipped"`` records a deliberate protective deferral. It does
+    not consume finite repeat budget, is never auto-deleted, and re-arms a
+    one-shot after 60 seconds instead of hot-looping or becoming completed.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
@@ -1528,9 +1538,15 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
+                effective_status = status or ("ok" if success else "error")
+                if effective_status not in {"ok", "error", "skipped"}:
+                    raise ValueError(f"unsupported cron run status: {effective_status}")
+                skipped = effective_status == "skipped"
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
+                job["last_status"] = effective_status
+                job["last_error"] = error if effective_status == "error" else None
+                if skipped:
+                    job["last_skip_at"] = now
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1542,11 +1558,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
                 
-                # Increment completed count.  Finite one-shot jobs are
-                # pre-claimed by claim_dispatch() BEFORE the side effect runs
-                # (issue #38758), which already incremented completed — do not
-                # double-count them here.  Recurring jobs and direct callers
-                # with no pre-run claim still get the legacy increment.
+                # Increment completed count. Finite one-shot jobs are
+                # pre-claimed by claim_dispatch() BEFORE the side effect runs.
+                # A protective skip did not execute the side effect, so roll
+                # that pre-claim back instead of consuming repeat budget.
                 if job.get("repeat"):
                     repeat = job["repeat"]
                     times = repeat.get("times")
@@ -1558,19 +1573,36 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         and times > 0
                         and completed > 0
                     )
-                    if not preclaimed_oneshot:
+                    if skipped:
+                        if preclaimed_oneshot:
+                            completed -= 1
+                            repeat["completed"] = completed
+                    elif not preclaimed_oneshot:
                         completed += 1
                         repeat["completed"] = completed
 
-                    # Check if we've hit the repeat limit
-                    if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
+                    # Check if we've hit the repeat limit. A skip can never
+                    # remove the job because it consumed no execution budget.
+                    if (
+                        not skipped
+                        and times is not None
+                        and times > 0
+                        and completed >= times
+                    ):
                         jobs.pop(i)
                         save_jobs(jobs)
                         return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                # Compute next run. A skipped one-shot is deliberately retried
+                # after a bounded delay; retaining the past due timestamp would
+                # hot-loop every scheduler tick, while None would disable it.
+                kind = job.get("schedule", {}).get("kind")
+                if skipped and kind == "once":
+                    job["next_run_at"] = (
+                        _hermes_now() + timedelta(seconds=60)
+                    ).isoformat()
+                else:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't

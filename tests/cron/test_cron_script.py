@@ -147,6 +147,19 @@ class TestRunJobScript:
         assert "exited with code 1" in output
         assert "error info" in output
 
+    def test_script_exit_75_is_a_protective_skip(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "load_gate.py"
+        script.write_text(
+            "import sys\nprint('load above protective threshold')\nsys.exit(75)\n"
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is None
+        assert "skipped with code 75" in output
+        assert "load above protective threshold" in output
+
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
         from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST

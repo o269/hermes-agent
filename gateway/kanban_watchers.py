@@ -935,6 +935,20 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Host-wide heavy-workspace cap. dispatch_once enforces a hard safety
+        # ceiling of three across profiles/boards even when callers omit this
+        # setting; config may only lower that ceiling.
+        raw_max_heavy = kanban_cfg.get(
+            "max_heavy_workspaces", _kb.HEAVY_WORKSPACE_HOST_CEILING
+        )
+        max_heavy_workspaces = _kb.resolve_heavy_workspace_limit(raw_max_heavy)
+        logger.info(
+            "kanban dispatcher: max_heavy_workspaces=%d "
+            "(host-wide, hard ceiling=%d)",
+            max_heavy_workspaces,
+            _kb.HEAVY_WORKSPACE_HOST_CEILING,
+        )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -953,6 +967,7 @@ class GatewayKanbanWatchersMixin:
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
+        dispatch_board_cursor = 0
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -1024,6 +1039,7 @@ class GatewayKanbanWatchersMixin:
                     board=slug,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
+                    max_heavy_workspaces=max_heavy_workspaces,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
@@ -1073,10 +1089,23 @@ class GatewayKanbanWatchersMixin:
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
             """
+            nonlocal dispatch_board_cursor
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # Rotate the first board every tick. Combined with the persistent
+            # per-board FIFO ticket in dispatch_once, this prevents a busy
+            # lexicographically-first board from always seeing a newly freed
+            # host slot before its peers.
+            boards = sorted(
+                boards,
+                key=lambda item: item.get("slug") or _kb.DEFAULT_BOARD,
+            )
+            if boards:
+                offset = dispatch_board_cursor % len(boards)
+                boards = boards[offset:] + boards[:offset]
+                dispatch_board_cursor = (dispatch_board_cursor + 1) % len(boards)
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -1240,9 +1269,27 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                capacity_deferred = False
                 for slug, res in (results or []):
                     if res is not None:
                         _log_respawn_guard_results(slug, res)
+                        deferred = getattr(
+                            res, "skipped_heavy_workspace_capped", []
+                        ) or []
+                        for tid, limit, reason in deferred:
+                            if reason in {"capacity", "fairness", "phase_fairness"}:
+                                capacity_deferred = True
+                                logger.info(
+                                    "kanban dispatcher [%s]: heavy_workspace_deferred "
+                                    "task=%s limit=%d reason=%s state=queue_wait",
+                                    slug, tid, limit, reason,
+                                )
+                            else:
+                                logger.warning(
+                                    "kanban dispatcher [%s]: heavy_workspace_deferred "
+                                    "task=%s limit=%d reason=%s state=lock_error",
+                                    slug, tid, limit, reason,
+                                )
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually
@@ -1260,9 +1307,12 @@ class GatewayKanbanWatchersMixin:
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                if ready_pending and not any_spawned and not capacity_deferred:
                     bad_ticks += 1
                 else:
+                    # A saturated heavy host is healthy backpressure, not a
+                    # failed dispatcher tick. Keep it distinct from credential /
+                    # PATH failures in stuck telemetry.
                     bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())

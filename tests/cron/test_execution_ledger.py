@@ -121,6 +121,123 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     assert failed["error"] == "provider exploded"
 
 
+def test_skipped_execution_is_terminal_without_error(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("load-gated", source="builtin")
+    executions.mark_execution_running(record["id"])
+
+    skipped = executions.finish_execution(
+        record["id"], success=True, status="skipped"
+    )
+
+    assert skipped is not None
+    assert skipped["status"] == "skipped"
+    assert skipped["finished_at"]
+    assert skipped["error"] is None
+
+
+def test_execution_schema_upgrade_preserves_history_and_adds_skipped(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            "INSERT INTO executions VALUES "
+            "('old','job-old','builtin','proc',1,NULL,'completed',"
+            "'2026-01-01T00:00:00+00:00',NULL,"
+            "'2026-01-01T00:00:01+00:00',NULL)"
+        )
+
+    fresh = executions.create_execution("job-new", source="builtin")
+    skipped = executions.finish_execution(
+        fresh["id"], success=True, status="skipped"
+    )
+
+    old = executions.latest_execution("job-old")
+    assert old is not None
+    assert old["status"] == "completed"
+    assert skipped is not None
+    assert skipped["status"] == "skipped"
+
+
+def test_execution_schema_upgrade_is_cross_process_safe(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    script = """
+import sys
+from pathlib import Path
+from cron import executions
+executions.EXECUTIONS_FILE = Path(sys.argv[1])
+executions.create_execution(sys.argv[2], source="builtin")
+"""
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(executions.EXECUTIONS_FILE),
+                f"job-{index}",
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(8)
+    ]
+    failures: list[str] = []
+    for process in processes:
+        _stdout, stderr = process.communicate(timeout=20)
+        if process.returncode != 0:
+            failures.append(stderr)
+    assert failures == []
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        schema_sql = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='executions'"
+        ).fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0]
+    assert "'skipped'" in schema_sql
+    assert count == 8
+
+
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("still-live", source="builtin")

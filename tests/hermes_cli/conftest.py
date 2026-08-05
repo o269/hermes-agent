@@ -5,6 +5,18 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_heavy_workspace_slots(tmp_path, monkeypatch):
+    """Never let dispatcher unit tests contend with live host workers."""
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        kanban_db,
+        "_heavy_workspace_slots_root",
+        lambda: tmp_path / "heavy-workspace-slots",
+    )
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

@@ -466,6 +466,428 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+# A local Hermes worker can clone, install, build, and run CI after it starts;
+# workspace_kind therefore cannot predict pressure.  Keep a conservative,
+# non-disableable host ceiling and let config lower (never raise) it.  The cap
+# is enforced inside dispatch_once so CLI, gateway, dashboard, and third-party
+# callers all share the same safety boundary.
+HEAVY_WORKSPACE_HOST_CEILING = 3
+_HEAVY_WORKSPACE_SLOT_DIR = ".heavy-workspace-slots"
+_HEAVY_WORKSPACE_LIGHT_MARKER_RE = re.compile(
+    r"(?im)^\s*resource-class\s*:\s*light\s*$"
+)
+_HEAVY_WORKSPACE_DEFER_EVENT_INTERVAL_SECONDS = 300
+# Gateway dispatch defaults to a 60-second cadence; retain a waiter across
+# several missed/jittered ticks so the queue head cannot expire immediately
+# before its next normal refresh. Dead owner PIDs are still removed at once.
+_HEAVY_WORKSPACE_WAITER_STALE_SECONDS = 300
+
+
+class _HeavyWorkspaceLease:
+    """One worker slot plus any shared locks enforcing a lower host limit."""
+
+    def __init__(self, handles: list[Any], slot: int):
+        self._handles = handles
+        self.slot = int(slot)
+
+    def fileno(self) -> int:
+        """Return the primary descriptor for backward-compatible callers."""
+        return self.filenos()[0]
+
+    def filenos(self) -> tuple[int, ...]:
+        """Return every descriptor that the worker must inherit."""
+        if not self._handles:
+            raise ValueError("heavy-workspace lease is closed")
+        return tuple(int(handle.fileno()) for handle in self._handles)
+
+    def close(self) -> None:
+        handles, self._handles = self._handles, []
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _spawn_accepts_heavy_workspace_lease(spawn: Callable[..., Any]) -> bool:
+    """Return whether a custom spawn callback opts into the lease protocol.
+
+    Heavy work cannot safely use the historical two-argument callback contract:
+    by the time such a callback returns, it may already have launched an
+    untracked wrapper or descendant.  Requiring the explicit keyword lets the
+    callback pass the process-owned descriptor to the actual worker before the
+    dispatcher releases its copy.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(spawn)
+    except (TypeError, ValueError):
+        return False
+    return "heavy_workspace_lease" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _pid_holds_heavy_workspace_lease(
+    lease: _HeavyWorkspaceLease,
+    pid: Optional[int],
+) -> bool:
+    """Prove a custom-spawn worker inherited the exact slot descriptor.
+
+    Linux exposes another process's descriptors through ``/proc``.  Comparing
+    device/inode identity prevents a callback from acknowledging the keyword
+    while silently dropping the lease.  Platforms without this proof surface
+    fail closed for custom heavy spawns; the built-in spawn path is trusted
+    because it passes the descriptor itself.
+    """
+    if not pid or pid <= 0 or not _pid_alive(pid):
+        return False
+    try:
+        for fd in lease.filenos():
+            local = os.fstat(fd)
+            remote = os.stat(Path("/proc") / str(pid) / "fd" / str(fd))
+            if (local.st_dev, local.st_ino) != (remote.st_dev, remote.st_ino):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def resolve_heavy_workspace_limit(value: Any = None) -> int:
+    """Return the fail-closed host limit, clamped to the safety ceiling."""
+    if value is None:
+        return HEAVY_WORKSPACE_HOST_CEILING
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        _log.warning(
+            "kanban dispatcher: invalid max_heavy_workspaces=%r; using host ceiling %d",
+            value,
+            HEAVY_WORKSPACE_HOST_CEILING,
+        )
+        return HEAVY_WORKSPACE_HOST_CEILING
+    if parsed < 1:
+        _log.warning(
+            "kanban dispatcher: max_heavy_workspaces=%r is below 1; using host ceiling %d",
+            value,
+            HEAVY_WORKSPACE_HOST_CEILING,
+        )
+        return HEAVY_WORKSPACE_HOST_CEILING
+    if parsed > HEAVY_WORKSPACE_HOST_CEILING:
+        _log.warning(
+            "kanban dispatcher: max_heavy_workspaces=%d exceeds host ceiling %d; clamping",
+            parsed,
+            HEAVY_WORKSPACE_HOST_CEILING,
+        )
+        return HEAVY_WORKSPACE_HOST_CEILING
+    return parsed
+
+
+def configured_heavy_workspace_limit() -> int:
+    """Load the operator limit for status/cron callers, with safe fallback."""
+    try:
+        from hermes_cli.config import load_config
+
+        configured = (load_config().get("kanban") or {}).get(
+            "max_heavy_workspaces"
+        )
+    except Exception:
+        configured = None
+    return resolve_heavy_workspace_limit(configured)
+
+
+def _heavy_workspace_slots_root() -> Path:
+    """Return one canonical per-UID lease directory for the whole host.
+
+    Do not key this safety boundary off ``HERMES_HOME``, profile config, board,
+    or a caller-controlled ``XDG_RUNTIME_DIR``: any of those can differ between
+    simultaneous dispatchers and would split the lock domain. Linux's
+    ``/run/user/<uid>`` is canonical for the host user. Other platforms (and
+    minimal containers without that directory) fall back to a UID-namespaced
+    temp directory.
+    """
+    import tempfile
+
+    uid = getattr(os, "getuid", lambda: 0)()
+    host_runtime = Path("/run/user") / str(uid)
+    if host_runtime.is_dir() and os.access(host_runtime, os.W_OK | os.X_OK):
+        base = host_runtime / "hermes-agent"
+    else:
+        base = Path(tempfile.gettempdir()) / f"hermes-agent-{uid}"
+    return base / _HEAVY_WORKSPACE_SLOT_DIR
+
+
+def _prepare_heavy_workspace_slots_root() -> Optional[Path]:
+    """Create and validate the per-UID lock root, failing closed on tampering."""
+    import stat
+
+    root = _heavy_workspace_slots_root()
+    uid = getattr(os, "getuid", lambda: 0)()
+    try:
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        info = root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+            return None
+        os.chmod(root, 0o700)
+    except OSError:
+        return None
+    return root
+
+
+def _try_acquire_heavy_workspace_lease(
+    limit: int,
+) -> tuple[Optional[_HeavyWorkspaceLease], str]:
+    """Atomically acquire a kernel slot, failing closed when locking is absent.
+
+    A worker takes an exclusive lock for its slot. When configured below the
+    hard ceiling it also takes shared locks on every excluded slot. Higher-limit
+    dispatchers require an exclusive lock on those files, so the lowest active
+    worker limit remains host-wide even when profiles disagree on configuration.
+    """
+    try:
+        import fcntl
+    except (ImportError, OSError):  # pragma: no cover - non-POSIX safety path
+        return None, "lock_unavailable"
+
+    root = _prepare_heavy_workspace_slots_root()
+    if root is None:
+        return None, "lock_unavailable"
+
+    effective_limit = resolve_heavy_workspace_limit(limit)
+    for slot in range(effective_limit):
+        handles: list[Any] = []
+        lock_failed = False
+        for lock_slot in sorted(
+            {slot, *range(effective_limit, HEAVY_WORKSPACE_HOST_CEILING)}
+        ):
+            handle = None
+            try:
+                handle = (root / f"slot-{lock_slot}.lock").open("a+b")
+                mode = fcntl.LOCK_EX if lock_slot == slot else fcntl.LOCK_SH
+                fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+                handles.append(handle)
+            except BlockingIOError:
+                if handle is not None:
+                    handle.close()
+                lock_failed = True
+                break
+            except OSError:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                for acquired in handles:
+                    acquired.close()
+                return None, "lock_unavailable"
+        if lock_failed:
+            for acquired in handles:
+                acquired.close()
+            continue
+        return _HeavyWorkspaceLease(handles, slot), "acquired"
+    return None, "capacity"
+
+
+def _try_acquire_fair_heavy_workspace_lease(
+    limit: int,
+    *,
+    board_key: str,
+    task_id: str,
+) -> tuple[Optional[_HeavyWorkspaceLease], str]:
+    """Acquire a host slot through a persistent FIFO queue shared by boards.
+
+    Each board owns at most one queue ticket.  A later candidate on that board
+    updates the ticket's task label without jumping ahead, so one busy board
+    cannot enqueue its whole backlog ahead of every other board. Dead dispatcher
+    PIDs are removed immediately and inactive tickets age out after five minutes;
+    leases themselves need no stale cleanup because the kernel releases them on
+    process/worker exit.
+    """
+    try:
+        import fcntl
+    except (ImportError, OSError):  # pragma: no cover - non-POSIX safety path
+        return None, "lock_unavailable"
+
+    root = _prepare_heavy_workspace_slots_root()
+    if root is None:
+        return None, "lock_unavailable"
+    guard = None
+    try:
+        guard = (root / "queue.lock").open("a+b")
+        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        if guard is not None:
+            try:
+                guard.close()
+            except OSError:
+                pass
+        return None, "lock_unavailable"
+
+    digest = hashlib.sha256(board_key.encode("utf-8", "replace")).hexdigest()
+    waiter_path = root / f"waiter-{digest}.json"
+    now = time.time()
+    try:
+        waiters: list[tuple[int, str, Path]] = []
+        for path in root.glob("waiter-*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                seen_at = float(payload["seen_at"])
+                enqueued_ns = int(payload["enqueued_ns"])
+                key = str(payload["board_key"])
+                owner_pid = int(payload.get("pid") or 0)
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if (
+                (owner_pid > 0 and not _pid_alive(owner_pid))
+                or now - seen_at > _HEAVY_WORKSPACE_WAITER_STALE_SECONDS
+            ):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            waiters.append((enqueued_ns, key, path))
+
+        existing = next((item for item in waiters if item[1] == board_key), None)
+        enqueued_ns = existing[0] if existing is not None else time.time_ns()
+        payload = {
+            "board_key": board_key,
+            "task_id": task_id,
+            "enqueued_ns": enqueued_ns,
+            "seen_at": now,
+            "pid": os.getpid(),
+        }
+        tmp_path = waiter_path.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(waiter_path)
+        waiters = [item for item in waiters if item[1] != board_key]
+        waiters.append((enqueued_ns, board_key, waiter_path))
+        waiters.sort(key=lambda item: (item[0], item[1]))
+        if waiters[0][1] != board_key:
+            return None, "fairness"
+
+        lease, reason = _try_acquire_heavy_workspace_lease(limit)
+        if lease is not None:
+            try:
+                waiter_path.unlink()
+            except OSError:
+                pass
+        return lease, reason
+    except OSError:
+        return None, "lock_unavailable"
+    finally:
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+        finally:
+            guard.close()
+
+
+def heavy_workspace_capacity_snapshot(limit: Any = None) -> dict[str, Any]:
+    """Return non-mutating host-capacity telemetry for CLI/health/dashboard."""
+    effective_limit = resolve_heavy_workspace_limit(limit)
+    snapshot: dict[str, Any] = {
+        "scope": "host",
+        "state": "ok",
+        "limit": effective_limit,
+        "host_ceiling": HEAVY_WORKSPACE_HOST_CEILING,
+        "in_use": 0,
+        "in_use_host": 0,
+        "available": effective_limit,
+        "active_slots": [],
+        "waiter_count": 0,
+        "waiters": [],
+    }
+    try:
+        import fcntl
+    except (ImportError, OSError):  # pragma: no cover - non-POSIX safety path
+        snapshot.update(state="lock_unavailable", available=0)
+        return snapshot
+
+    root = _prepare_heavy_workspace_slots_root()
+    if root is None:
+        snapshot.update(state="lock_unavailable", available=0)
+        return snapshot
+
+    active_slots: list[int] = []
+    try:
+        for slot in range(HEAVY_WORKSPACE_HOST_CEILING):
+            handle = (root / f"slot-{slot}.lock").open("a+b")
+            try:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # A lower-limit worker holds shared locks on excluded slots
+                    # so a differently configured dispatcher cannot exceed the
+                    # lowest live limit. Those guard locks are not themselves
+                    # active workspaces. Distinguish them from an exclusive
+                    # worker lock with a non-blocking shared probe.
+                    try:
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB
+                        )
+                    except BlockingIOError:
+                        active_slots.append(slot)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+    except OSError:
+        snapshot.update(state="lock_unavailable", available=0)
+        return snapshot
+
+    now = time.time()
+    waiters: list[dict[str, Any]] = []
+    for path in root.glob("waiter-*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            seen_at = float(payload["seen_at"])
+            owner_pid = int(payload.get("pid") or 0)
+            if (
+                (owner_pid > 0 and not _pid_alive(owner_pid))
+                or now - seen_at > _HEAVY_WORKSPACE_WAITER_STALE_SECONDS
+            ):
+                continue
+            waiters.append(
+                {
+                    "board_key": str(payload["board_key"]),
+                    "task_id": str(payload["task_id"]),
+                    "enqueued_ns": int(payload["enqueued_ns"]),
+                    "age_seconds": max(0, int(now - seen_at)),
+                }
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+    waiters.sort(key=lambda item: (item["enqueued_ns"], item["board_key"]))
+
+    in_use = sum(slot < effective_limit for slot in active_slots)
+    # A worker admitted under a higher configured limit can occupy a slot that
+    # this snapshot's lower limit would reserve as a shared guard. Until that
+    # worker exits, no lower-limit lease can safely start even when one of its
+    # nominal slots is empty.
+    higher_slot_active = any(slot >= effective_limit for slot in active_slots)
+    available = (
+        0 if higher_slot_active else max(0, effective_limit - in_use)
+    )
+    snapshot.update(
+        in_use=in_use,
+        in_use_host=len(active_slots),
+        available=available,
+        active_slots=active_slots,
+        waiter_count=len(waiters),
+        waiters=waiters,
+    )
+    return snapshot
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
@@ -9695,6 +10117,14 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_heavy_workspace_capped: list[tuple[str, int, str]] = field(
+        default_factory=list
+    )
+    """Heavy local tasks deferred by host capacity or fair queue ordering.
+
+    Entries are ``(task_id, effective_limit, reason)``. ``capacity`` and
+    ``fairness`` are healthy queue waits; ``lock_unavailable`` is fail-closed
+    overload protection. No reason claims the task or increments failures."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -12960,6 +13390,113 @@ def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
     return bool(profile_exists(assignee))
 
 
+def _is_heavy_local_workspace_task(task: Task) -> bool:
+    """Classify local workspace pressure conservatively and explicitly."""
+    if _HEAVY_WORKSPACE_LIGHT_MARKER_RE.search(task.body or ""):
+        return False
+    if task.assignee:
+        try:
+            from hermes_cli.fleet_vps2_worker import (
+                configured_vps2_worker,
+                is_vps2_assignee,
+            )
+
+            if is_vps2_assignee(task.assignee):
+                return configured_vps2_worker(task.assignee) is None
+        except Exception:
+            # A remote-only lane whose transport cannot resolve is filtered by
+            # _assignee_has_spawn_target before admission. Conservatively treat
+            # any unexpected fall-through as local/heavy.
+            pass
+    return True
+
+
+def _record_heavy_workspace_deferred(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    limit: int,
+    reason: str,
+) -> None:
+    """Emit bounded overload telemetry without turning a wait into a failure."""
+    now = int(time.time())
+    latest = conn.execute(
+        "SELECT created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'heavy_workspace_deferred' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        latest is not None
+        and now - int(latest["created_at"])
+        < _HEAVY_WORKSPACE_DEFER_EVENT_INTERVAL_SECONDS
+    ):
+        return
+    state = (
+        "queue_wait"
+        if reason in {"capacity", "fairness", "phase_fairness"}
+        else "lock_error"
+    )
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "heavy_workspace_deferred",
+            {
+                "scope": "host",
+                "resource_class": "heavy",
+                "limit": int(limit),
+                "reason": reason,
+                "state": state,
+            },
+        )
+
+
+def _heavy_workspace_phase_turn(
+    conn: sqlite3.Connection,
+    *,
+    ready_heavy_pending: bool,
+    review_heavy_pending: bool,
+) -> Optional[str]:
+    """Alternate heavy admission between ready and review when both wait."""
+    if ready_heavy_pending and not review_heavy_pending:
+        return "ready"
+    if review_heavy_pending and not ready_heavy_pending:
+        return "review"
+    if not ready_heavy_pending and not review_heavy_pending:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE kind = 'heavy_workspace_phase_turn' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        try:
+            next_phase = json.loads(row["payload"] or "{}").get("next_phase")
+        except (TypeError, json.JSONDecodeError):
+            next_phase = None
+        if next_phase in {"ready", "review"}:
+            return str(next_phase)
+    # Existing dispatch order historically favored ready, so give review the
+    # first fair turn after upgrade to prevent an already-aged review backlog.
+    return "review"
+
+
+def _advance_heavy_workspace_phase_turn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    attempted_phase: str,
+) -> None:
+    next_phase = "review" if attempted_phase == "ready" else "ready"
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "heavy_workspace_phase_turn",
+            {"attempted_phase": attempted_phase, "next_phase": next_phase},
+        )
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff a ready+assigned+unclaimed task has a spawn target.
 
@@ -12994,6 +13531,7 @@ def dispatch_once(
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    max_heavy_workspaces: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
@@ -13031,6 +13569,7 @@ def dispatch_once(
             dry_run=dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
+            max_heavy_workspaces=max_heavy_workspaces,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
@@ -13048,6 +13587,7 @@ def dispatch_once(
             dry_run=dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
+            max_heavy_workspaces=max_heavy_workspaces,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
@@ -13065,6 +13605,7 @@ def _dispatch_once_locked(
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    max_heavy_workspaces: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
@@ -13081,7 +13622,8 @@ def _dispatch_once_locked(
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      4. For each ready task with an assignee, atomically lease a host slot
+         when it is a heavy local workspace, then claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -13101,14 +13643,25 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    ``max_heavy_workspaces`` is fail-closed and clamped to the host ceiling
+    (three). Local tasks default heavy; an exact ``Resource-Class: light``
+    body line opts out. Excess work remains unclaimed in a cross-board FIFO
+    and does not consume an attempt.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
     result = DispatchResult()
+    max_heavy_workspaces = resolve_heavy_workspace_limit(max_heavy_workspaces)
     validate_skills = skill_validator or _missing_forced_skills
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    custom_heavy_spawn_supported = (
+        spawn_fn is None or _spawn_accepts_heavy_workspace_lease(_spawn)
+    )
     board_db, board_slug = _connection_worker_board_identity(conn)
+    heavy_queue_board_key = str(board_db)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -13153,11 +13706,38 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    review_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    ready_heavy_pending = any(
+        task is not None
+        and bool(row["assignee"])
+        and _assignee_has_spawn_target(row["assignee"])
+        and _is_heavy_local_workspace_task(task)
+        for row in ready_rows
+        for task in [get_task(conn, row["id"])]
+    )
+    review_heavy_pending = any(
+        task is not None
+        and bool(row["assignee"])
+        and _assignee_has_spawn_target(row["assignee"])
+        and _is_heavy_local_workspace_task(task)
+        for row in review_rows
+        for task in [get_task(conn, row["id"])]
+    )
+    heavy_phase_turn = _heavy_workspace_phase_turn(
+        conn,
+        ready_heavy_pending=ready_heavy_pending,
+        review_heavy_pending=review_heavy_pending,
+    )
+    heavy_phase_attempted = False
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
-    if max_in_progress is not None and ready_rows:
+    if max_in_progress is not None and (ready_rows or review_rows):
         in_progress = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
@@ -13182,6 +13762,9 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # Dry-run leases stay live until the preview ends so one free slot cannot
+    # be reused to over-report every queued heavy task as admitted.
+    dry_run_heavy_leases: list[_HeavyWorkspaceLease] = []
     # One-active-card-per-profile invariant (#21582, hardened by R13): track
     # which distinct cards each assignee already has in flight, and refuse to
     # spawn a second card for that assignee. This is unconditional: a global
@@ -13442,7 +14025,119 @@ def _dispatch_once_locked(
                 dry_run=dry_run,
             )
             continue
+        heavy_workspace_lease: Optional[_HeavyWorkspaceLease] = None
+        if _is_heavy_local_workspace_task(preflight_task):
+            if not custom_heavy_spawn_supported:
+                heavy_defer_reason = "lease_protocol"
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="heavy_workspace_" + heavy_defer_reason,
+                    detail={
+                        "assignee": row_assignee,
+                        "scope": "host",
+                        "resource_class": "heavy",
+                        "limit": max_heavy_workspaces,
+                        "queue_reason": heavy_defer_reason,
+                    },
+                    dry_run=dry_run,
+                )
+                continue
+            if heavy_phase_turn not in {None, "ready"} or (
+                ready_heavy_pending
+                and review_heavy_pending
+                and heavy_phase_attempted
+            ):
+                heavy_defer_reason = "phase_fairness"
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="heavy_workspace_" + heavy_defer_reason,
+                    detail={
+                        "assignee": row_assignee,
+                        "scope": "host",
+                        "resource_class": "heavy",
+                        "limit": max_heavy_workspaces,
+                        "queue_reason": heavy_defer_reason,
+                        "phase_turn": heavy_phase_turn,
+                    },
+                    dry_run=dry_run,
+                )
+                continue
+            if ready_heavy_pending and review_heavy_pending:
+                heavy_phase_attempted = True
+                if not dry_run:
+                    _advance_heavy_workspace_phase_turn(
+                        conn,
+                        row["id"],
+                        attempted_phase="ready",
+                    )
+            if dry_run:
+                heavy_workspace_lease, heavy_defer_reason = (
+                    _try_acquire_heavy_workspace_lease(max_heavy_workspaces)
+                )
+            else:
+                heavy_workspace_lease, heavy_defer_reason = (
+                    _try_acquire_fair_heavy_workspace_lease(
+                        max_heavy_workspaces,
+                        board_key=heavy_queue_board_key,
+                        task_id=row["id"],
+                    )
+                )
+            if heavy_workspace_lease is None:
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "held",
+                    reason="heavy_workspace_" + heavy_defer_reason,
+                    detail={
+                        "assignee": row_assignee,
+                        "scope": "host",
+                        "resource_class": "heavy",
+                        "limit": max_heavy_workspaces,
+                        "queue_reason": heavy_defer_reason,
+                    },
+                    dry_run=dry_run,
+                )
+                continue
         if dry_run:
+            if heavy_workspace_lease is not None:
+                dry_run_heavy_leases.append(heavy_workspace_lease)
             result.spawned.append((row["id"], row_assignee, ""))
             _record_ready_disposition(
                 conn,
@@ -13474,6 +14169,8 @@ def _dispatch_once_locked(
                 resume_marker_id=guard_decision.resume_marker_id,
             )
         except ContinuationAuthorizationError as exc:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             # A consume/expiry race rolls the claim transaction back. Treat it
             # like the guard denial it is instead of aborting the whole tick
             # and starving unrelated ready tasks.
@@ -13513,7 +14210,40 @@ def _dispatch_once_locked(
                 dry_run=False,
             )
             continue
+        except Exception as exc:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            task_after_claim_error = get_task(conn, row["id"])
+            auto = False
+            if (
+                task_after_claim_error is not None
+                and task_after_claim_error.status == "running"
+            ):
+                auto = _record_spawn_failure(
+                    conn,
+                    row["id"],
+                    f"claim: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="claim_failure",
+                detail={
+                    "assignee": row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
+            continue
         if claimed is None:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             outcome, reason, detail = _claim_rejection_disposition(
                 conn,
                 row["id"],
@@ -13537,15 +14267,42 @@ def _dispatch_once_locked(
                 dry_run=False,
             )
             continue
-        if _release_post_claim_live_worker_guard(
-            conn,
-            claimed.id,
-            claimed.current_run_id,
-            restore_status="ready",
-            board_db=board_db,
-            board_slug=board_slug,
-            phase="ready",
-        ):
+        try:
+            post_claim_guard_released = _release_post_claim_live_worker_guard(
+                conn,
+                claimed.id,
+                claimed.current_run_id,
+                restore_status="ready",
+                board_db=board_db,
+                board_slug=board_slug,
+                phase="ready",
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                f"post-claim guard: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="post_claim_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
+            continue
+        if post_claim_guard_released:
             result.add_respawn_guard(
                 claimed.id,
                 "live_worker_process",
@@ -13560,6 +14317,8 @@ def _dispatch_once_locked(
                 detail={"assignee": claimed.assignee or row_assignee},
                 dry_run=False,
             )
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             continue
         try:
             resolved_branch_name = None
@@ -13587,26 +14346,83 @@ def _dispatch_once_locked(
                 },
                 dry_run=False,
             )
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(
+                    conn,
+                    claimed.id,
+                    resolved_branch_name
+                    or (claimed.branch_name or "").strip()
+                    or f"wt/{claimed.id}",
+                )
+            _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                f"workspace persist: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="workspace_persist_failure",
+                detail={
+                    "assignee": claimed.assignee or row_assignee,
+                    "auto_blocked": auto,
+                    "error_type": type(exc).__name__,
+                },
+                dry_run=False,
+            )
+            continue
+        try:
+            # Back-compat for light tasks: older spawn_fn signatures accept only
+            # (task, workspace), and board is passed only when supported. Heavy
+            # custom spawns were preflighted above and must accept the lease.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in sig.parameters.values()
+                )
+                spawn_kwargs: dict[str, Any] = {}
+                if "board" in sig.parameters or accepts_kwargs:
+                    spawn_kwargs["board"] = board
+                if "heavy_workspace_lease" in sig.parameters or accepts_kwargs:
+                    spawn_kwargs["heavy_workspace_lease"] = heavy_workspace_lease
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+            except (TypeError, ValueError):
+                if spawn_fn is None:
+                    pid = _spawn(
+                        claimed,
+                        str(workspace),
+                        board=board,
+                        heavy_workspace_lease=heavy_workspace_lease,
+                    )
                 else:
                     pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if (
+                heavy_workspace_lease is not None
+                and spawn_fn is not None
+                and not _pid_holds_heavy_workspace_lease(
+                    heavy_workspace_lease, int(pid) if pid else None
+                )
+            ):
+                raise RuntimeError(
+                    "custom spawn worker did not inherit heavy-workspace lease"
+                )
             if pid:
                 _set_worker_pid(
                     conn,
@@ -13664,6 +14480,11 @@ def _dispatch_once_locked(
                 },
                 dry_run=False,
             )
+        finally:
+            # The worker inherited its own descriptor. Closing the dispatcher's
+            # duplicate prevents capacity leakage if the tick continues or dies.
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
 
     result.validate_dispositions([row["id"] for row in ready_rows])
 
@@ -13676,11 +14497,6 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
     review_process_snapshot = _profile_process_snapshot
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
@@ -13697,6 +14513,9 @@ def _dispatch_once_locked(
             result.skipped_per_profile_capped.append(
                 (row["id"], row["assignee"], len(active_cards))
             )
+            continue
+        review_preflight_task = get_task(conn, row["id"])
+        if review_preflight_task is None:
             continue
         if not _preflight_forced_skills(
             conn,
@@ -13729,29 +14548,131 @@ def _dispatch_once_locked(
                         {"reason": "live_worker_process", "phase": "review"},
                     )
             continue
+        heavy_workspace_lease = None
+        if _is_heavy_local_workspace_task(review_preflight_task):
+            if not custom_heavy_spawn_supported:
+                heavy_defer_reason = "lease_protocol"
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                continue
+            if heavy_phase_turn not in {None, "review"} or (
+                ready_heavy_pending
+                and review_heavy_pending
+                and heavy_phase_attempted
+            ):
+                heavy_defer_reason = "phase_fairness"
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                continue
+            if ready_heavy_pending and review_heavy_pending:
+                heavy_phase_attempted = True
+                if not dry_run:
+                    _advance_heavy_workspace_phase_turn(
+                        conn,
+                        row["id"],
+                        attempted_phase="review",
+                    )
+            if dry_run:
+                heavy_workspace_lease, heavy_defer_reason = (
+                    _try_acquire_heavy_workspace_lease(max_heavy_workspaces)
+                )
+            else:
+                heavy_workspace_lease, heavy_defer_reason = (
+                    _try_acquire_fair_heavy_workspace_lease(
+                        max_heavy_workspaces,
+                        board_key=heavy_queue_board_key,
+                        task_id=row["id"],
+                    )
+                )
+            if heavy_workspace_lease is None:
+                result.skipped_heavy_workspace_capped.append(
+                    (row["id"], max_heavy_workspaces, heavy_defer_reason)
+                )
+                if not dry_run:
+                    _record_heavy_workspace_deferred(
+                        conn,
+                        row["id"],
+                        limit=max_heavy_workspaces,
+                        reason=heavy_defer_reason,
+                    )
+                continue
         if dry_run:
+            if heavy_workspace_lease is not None:
+                dry_run_heavy_leases.append(heavy_workspace_lease)
             result.spawned.append((row["id"], row["assignee"], ""))
             _per_profile_active_cards.setdefault(row["assignee"], set()).add(
                 row["id"]
             )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
+        try:
+            claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        except Exception as exc:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            task_after_claim_error = get_task(conn, row["id"])
+            if (
+                task_after_claim_error is not None
+                and task_after_claim_error.status == "running"
+            ):
+                auto = _record_spawn_failure(
+                    conn,
+                    row["id"],
+                    f"review claim: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(row["id"])
             continue
-        if _release_post_claim_live_worker_guard(
-            conn,
-            claimed.id,
-            claimed.current_run_id,
-            restore_status="review",
-            board_db=board_db,
-            board_slug=board_slug,
-            phase="review",
-        ):
+        if claimed is None:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            continue
+        try:
+            post_claim_guard_released = _release_post_claim_live_worker_guard(
+                conn,
+                claimed.id,
+                claimed.current_run_id,
+                restore_status="review",
+                board_db=board_db,
+                board_slug=board_slug,
+                phase="review",
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                f"review post-claim guard: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            continue
+        if post_claim_guard_released:
             result.add_respawn_guard(
                 claimed.id,
                 "live_worker_process",
                 phase="review",
             )
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             continue
         try:
             resolved_branch_name = None
@@ -13766,26 +14687,70 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        try:
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(
+                    conn,
+                    claimed.id,
+                    resolved_branch_name
+                    or (claimed.branch_name or "").strip()
+                    or f"wt/{claimed.id}",
+                )
+            _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                f"workspace persist: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+            continue
         # Force-load the already-preflighted review skill. The mandatory
         # kanban lifecycle is injected separately into every worker prompt.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in sig.parameters.values()
+                )
+                spawn_kwargs: dict[str, Any] = {}
+                if "board" in sig.parameters or accepts_kwargs:
+                    spawn_kwargs["board"] = board
+                if "heavy_workspace_lease" in sig.parameters or accepts_kwargs:
+                    spawn_kwargs["heavy_workspace_lease"] = heavy_workspace_lease
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+            except (TypeError, ValueError):
+                if spawn_fn is None:
+                    pid = _spawn(
+                        claimed,
+                        str(workspace),
+                        board=board,
+                        heavy_workspace_lease=heavy_workspace_lease,
+                    )
                 else:
                     pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if (
+                heavy_workspace_lease is not None
+                and spawn_fn is not None
+                and not _pid_holds_heavy_workspace_lease(
+                    heavy_workspace_lease, int(pid) if pid else None
+                )
+            ):
+                raise RuntimeError(
+                    "custom spawn worker did not inherit heavy-workspace lease"
+                )
             if pid:
                 _set_worker_pid(
                     conn,
@@ -13812,6 +14777,11 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+        finally:
+            if heavy_workspace_lease is not None:
+                heavy_workspace_lease.close()
+    for lease in dry_run_heavy_leases:
+        lease.close()
     return result
 
 
@@ -14153,6 +15123,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    heavy_workspace_lease: Optional[_HeavyWorkspaceLease] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -14165,6 +15136,10 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    ``heavy_workspace_lease`` is inherited by the local worker.  The kernel
+    releases the slot on normal exit, crash, timeout kill, OOM kill, or
+    dispatcher death; no PID-file cleanup race is required.
     """
     import subprocess
 
@@ -14269,6 +15244,8 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    if heavy_workspace_lease is not None:
+        env["HERMES_HEAVY_WORKSPACE_SLOT"] = str(heavy_workspace_lease.slot)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -14344,6 +15321,9 @@ def _default_spawn(
             )
         else:
             cmd = [*_resolve_hermes_argv(), *worker_argv]
+            inherited_fds: tuple[int, ...] = ()
+            if heavy_workspace_lease is not None:
+                inherited_fds = heavy_workspace_lease.filenos()
             proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
                 cmd,
                 cwd=workspace if os.path.isdir(workspace) else None,
@@ -14351,6 +15331,7 @@ def _default_spawn(
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 env=env,
+                pass_fds=inherited_fds,
                 start_new_session=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             )
@@ -14363,6 +15344,11 @@ def _default_spawn(
     except Exception:
         log_f.close()
         raise
+    else:
+        # Popen/SSH duplicated the descriptor into the child. The dispatcher
+        # must drop its own copy or a long-lived gateway leaks one FD per
+        # successful spawn until it eventually cannot launch any process.
+        log_f.close()
     # The child has inherited the log FD.  For VPS2, the local SSH process keeps
     # the diagnostics FD while the foreground remote worker writes its remote
     # log.  In both cases the Popen PID is the canonical local lifecycle token.
@@ -14390,6 +15376,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_heavy_workspaces: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -14427,6 +15414,7 @@ def run_daemon(
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
+                    max_heavy_workspaces=max_heavy_workspaces,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
@@ -14729,6 +15717,9 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "heavy_workspace": heavy_workspace_capacity_snapshot(
+            configured_heavy_workspace_limit()
+        ),
         "now": now,
     }
 

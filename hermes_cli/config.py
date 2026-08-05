@@ -2915,6 +2915,13 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Host-wide heavy local workspace cap. Every locally spawned card is
+        # heavy by default; only an exact `Resource-Class: light` line in the
+        # card body opts into the light lane. Values may lower but never raise
+        # the hard host ceiling of three. Inherited kernel lock slots enforce
+        # the cap across every profile, board, dashboard, and dispatcher, and
+        # worker exit/crash/OOM/timeout releases capacity automatically.
+        "max_heavy_workspaces": 3,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

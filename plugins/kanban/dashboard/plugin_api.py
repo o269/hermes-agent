@@ -1400,8 +1400,10 @@ def list_active_workers(
     A worker is a ``task_runs`` row whose ``ended_at`` is NULL and whose
     ``worker_pid`` is non-NULL, belonging to a task with ``status='running'``.
 
-    Returns ``{workers: [...], count: N, checked_at: <epoch>}``.  Each
-    worker entry carries enough context for the dashboard to link back to
+    Returns ``{workers: [...], count: N, checked_at: <epoch>,
+    heavy_workspace: {...}}``.  The host-wide capacity snapshot makes current
+    usage, availability, and FIFO waiters visible without triggering dispatch.
+    Each worker entry carries enough context for the dashboard to link back to
     its task without a second round-trip.
     """
     board = _resolve_board(board)
@@ -1447,7 +1449,14 @@ def list_active_workers(
             }
             for row in rows
         ]
-        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+        return {
+            "workers": workers,
+            "count": len(workers),
+            "checked_at": int(time.time()),
+            "heavy_workspace": kanban_db.heavy_workspace_capacity_snapshot(
+                kanban_db.configured_heavy_workspace_limit()
+            ),
+        }
     finally:
         conn.close()
 
@@ -2002,8 +2011,22 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        try:
+            from hermes_cli.config import load_config
+
+            configured_heavy_limit = (
+                (load_config().get("kanban") or {}).get("max_heavy_workspaces")
+            )
+        except Exception:
+            configured_heavy_limit = None
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_heavy_workspaces=kanban_db.resolve_heavy_workspace_limit(
+                configured_heavy_limit
+            ),
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:
