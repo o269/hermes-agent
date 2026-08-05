@@ -10,6 +10,18 @@ Use this procedure when a Kanban worker opened the canonical PR, marked the task
 
 A worker calling `kanban_complete`, a task showing `done`, or model prose saying “ready” never overrides red exact-head CI. Do not move to Review, submit a land request, merge, or deploy while any required check is pending, skipped unexpectedly, canceled, or failed.
 
+## Hermes-Agent PR destination invariant
+
+For Hermes-Agent author lanes, `gh` defaults are advisory and unsafe. The only fleet-default PR target is `o269/hermes-agent` on `main`; public `NousResearch/Hermes-Agent` is rejected unless the card explicitly authorizes an upstream contribution. Before a push or PR receipt, prove all of the following without logging secrets:
+
+- `gh auth status` is available for the acting account;
+- the workspace is a Hermes-Agent clone and `gh repo set-default` is already `o269/hermes-agent` or the receipt says to set it there;
+- every PR-create command is explicit: `gh pr create --repo o269/hermes-agent --base main --head <branch>` (or an explicitly authorized upstream repo);
+- local `origin/main` equals the remote fork `main`, and the author head's merge base is that exact main SHA;
+- changed paths match the card scope, and read-back commands use the same `--repo`.
+
+Use `scripts/kanban-authority-lane/hermes_pr_destination_guard.py` (installed by the same source-controlled authority-lane package) for sanitized init/preflight receipts. The receipt deliberately omits raw commands and environment values so tokens, branch bodies, and secrets cannot leak into board comments or bus handoffs.
+
 ## Canonical-PR repair invariant
 
 - Prefer the existing card, branch, and PR. Never create a duplicate branch or PR merely to escape scheduler friction, and do not create generic `-v2` repair cards as the first response.

@@ -20,6 +20,10 @@ GitHub PR      =  upstreamable artifact (optional, for code lanes)
 
 Hermes Kanban owns lifecycle truth — `ready` → `running` → `blocked` / `done` / `archived`. Worker lanes execute work but never own that truth; everything they do flows back through the kanban kernel via the `kanban_*` tools (or, for non-Hermes external workers, via the API). Reviewers gate the transition from "code change written" to "task done."
 
+### PR destination safety for code lanes
+
+GitHub CLI repository defaults are not custody. A worker that creates or verifies a PR must pass the destination explicitly (`gh pr create --repo <owner/repo> --base main --head <branch>`) and then read it back with the same `--repo`. Hermes-Agent workspaces are additionally guarded: the fleet fork is `o269/hermes-agent`, and public `NousResearch/Hermes-Agent` PRs fail closed unless the task explicitly authorizes an upstream contribution. Lane launchers can use the source-controlled `scripts/kanban-authority-lane/hermes_pr_destination_guard.py` receipt helper to prove the workspace default, target repo, base branch, head/base ancestry, and non-secret handoff receipt before reporting a reviewable PR.
+
 ## What a lane provides
 
 To be a kanban worker lane, an integration must provide three things:

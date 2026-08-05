@@ -2452,6 +2452,57 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        effective_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+        )
+
+        # Fail-closed PR-destination guard for Hermes-Agent workspaces.  This is
+        # intentionally below the generic dangerous-command approval path: a
+        # human approving a broad shell pattern must not accidentally approve a
+        # public-upstream Hermes-Agent PR.  The guard is local-backend only
+        # because it inspects the host git checkout at the effective cwd; remote
+        # and container backends keep their existing behavior instead of probing
+        # a path that may not exist on the host.
+        if env_type == "local":
+            try:
+                from tools.github_pr_destination_guard import (
+                    check_hermes_agent_pr_command,
+                )
+
+                pr_guard = check_hermes_agent_pr_command(
+                    command,
+                    cwd=effective_cwd,
+                    env=os.environ,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Hermes-Agent PR destination guard failed closed for %s: %s",
+                    effective_cwd,
+                    exc,
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Blocked: Hermes-Agent PR destination guard could not "
+                        "verify this command. Re-run with explicit "
+                        "`--repo o269/hermes-agent --base main` from a clean "
+                        "Hermes-Agent workspace, or set the upstream-authorization "
+                        "gate outside the agent process for an intentional public "
+                        "upstream contribution."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+            if not pr_guard.allowed:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": f"Blocked: {pr_guard.message}",
+                    "status": "blocked",
+                    "guard": pr_guard.receipt(),
+                }, ensure_ascii=False)
 
         if background:
             # Spawn a tracked background process via the process registry.
