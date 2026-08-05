@@ -1,0 +1,13 @@
+[Unit]
+Description=Check boardd backup freshness and integrity every five minutes
+Documentation=https://github.com/o269/hermes-agent/blob/main/docs/operations/boardd-backup-monitor.md
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+RandomizedDelaySec=15s
+Persistent=true
+Unit=boardd-backup-monitor.service
+
+[Install]
+WantedBy=timers.target
