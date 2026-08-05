@@ -2037,7 +2037,10 @@ def _h_create_task(broker, conn, a):
     idem = a.get("idempotency_key")
     if idem:
         row = conn.execute(
-            "SELECT id, status FROM tasks WHERE idempotency_key=?", (idem,)
+            "SELECT id, status FROM tasks WHERE idempotency_key=? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idem,),
         ).fetchone()
         if row:
             return {"id": row[0], "status": row[1], "deduplicated": True}

@@ -349,6 +349,92 @@ def test_native_create_idempotency_preserves_newer_fields_and_empty_key_behavior
         assert created_events == [{"n": 1}]
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_idempotency_ignores_archived_task(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        key = "native-archived-key"
+        first = _native_create(
+            client,
+            title="archived keyed create",
+            status="ready",
+            idempotency_key=key,
+        )
+        archived = client.set_status(first["id"], "archived")
+        replacement = _native_create(
+            client,
+            title="replacement keyed create",
+            status="ready",
+            idempotency_key=key,
+        )
+        repeated = _native_create(
+            client,
+            title="must deduplicate to replacement",
+            status="blocked",
+            idempotency_key=key,
+        )
+
+        assert archived == {"rowcount": 1, "status": "archived"}
+        assert replacement["id"] != first["id"]
+        assert replacement["status"] == "ready"
+        assert "deduplicated" not in replacement
+        assert repeated == {
+            "id": replacement["id"],
+            "status": replacement["status"],
+            "deduplicated": True,
+        }
+
+        rows = client.query(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            [key],
+        )
+        assert len(rows) == 2
+        assert {row["id"]: row["status"] for row in rows} == {
+            first["id"]: "archived",
+            replacement["id"]: "ready",
+        }
+        created_events = client.query(
+            "SELECT task_id, COUNT(*) AS n FROM task_events "
+            "WHERE task_id IN (?, ?) AND kind = 'created' "
+            "GROUP BY task_id ORDER BY task_id",
+            sorted([first["id"], replacement["id"]]),
+        )
+        assert created_events == [
+            {"task_id": task_id, "n": 1}
+            for task_id in sorted([first["id"], replacement["id"]])
+        ]
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_idempotency_selects_newest_active_duplicate(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        key = "native-duplicate-key"
+        for task_id, created_at in (("t_duplicate_old", 100), ("t_duplicate_new", 200)):
+            inserted = client.exec_write(
+                "INSERT INTO tasks "
+                "(id, title, status, created_at, idempotency_key) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [task_id, task_id, "ready", created_at, key],
+            )
+            assert inserted["rowcount"] == 1
+
+        repeated = _native_create(
+            client,
+            title="must deterministically select newest duplicate",
+            status="blocked",
+            idempotency_key=key,
+        )
+
+        assert repeated == {
+            "id": "t_duplicate_new",
+            "status": "ready",
+            "deduplicated": True,
+        }
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key = ?",
+            [key],
+        ) == [{"n": 2}]
+
+
 def test_import_schema_adds_reasoning_effort_to_legacy_board(tmp_path: Path):
     legacy_schema = _repo_schema_sql().replace(
         "    reasoning_effort     TEXT,\n",
