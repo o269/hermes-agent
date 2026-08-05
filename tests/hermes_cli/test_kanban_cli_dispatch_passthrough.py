@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -114,6 +115,63 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
             f"invalid max_in_progress={bad_val!r} should fall through to None, "
             f"got {captured.get('max_in_progress')!r}"
         )
+
+
+def test_cli_dispatch_plain_renders_every_disposition_in_priority_order(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult()
+    result.add_disposition(
+        "t_high",
+        "held",
+        reason="active_pr",
+        detail={"pr_url": "https://github.com/o269/hermes-agent/pull/41"},
+    )
+    result.add_disposition("t_mid", "skipped", reason="unassigned")
+    result.add_disposition(
+        "t_low", "spawned", detail={"assignee": "alpha", "source": "dry_run"}
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda _conn, **_kw: result)
+
+    rc = kb_cli._cmd_dispatch(
+        argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    )
+
+    assert rc == 0
+    disposition_lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("DISPOSITION ")
+    ]
+    assert disposition_lines == result.disposition_log_lines()
+
+
+def test_cli_dispatch_json_serializes_every_disposition_in_priority_order(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult()
+    result.add_disposition("t_high", "held", reason="max_spawn", detail={"limit": 1})
+    result.add_disposition("t_low", "skipped", reason="claim_rejected")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda _conn, **_kw: result)
+
+    rc = kb_cli._cmd_dispatch(
+        argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True)
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dispositions"] == result.normalized_dispositions()
+    assert [entry["task_id"] for entry in payload["dispositions"]] == [
+        "t_high",
+        "t_low",
+    ]
 
 
 def test_kanban_swarm_uses_existing_humanizer_skill():

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -216,6 +217,11 @@ def _run_kanban_db_script(db_path: Path, socket_path: Path, code: str) -> dict:
     return json.loads(result.stdout)
 
 
+def _native_create(client: Client, **args) -> dict:
+    """Call boardd's native create handler with a fresh transport operation id."""
+    return client._request("create_task", args, mutation=True)["result"]
+
+
 def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (
         client,
@@ -254,6 +260,179 @@ def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Pa
                 status="running",
                 reasoning_effort="turbo",
             )
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_idempotency_preserves_newer_fields_and_empty_key_behavior(
+    tmp_path: Path,
+):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        first = _native_create(
+            client,
+            title="native keyed create",
+            body="preserve newer fields",
+            assignee="Codex7",
+            status="blocked",
+            created_by="Fable",
+            priority=7,
+            workspace_kind="dir",
+            reasoning_effort="HIGH",
+            idempotency_key="native-key-a",
+        )
+        repeated = _native_create(
+            client,
+            title="must not replace the first title",
+            status="running",
+            idempotency_key="native-key-a",
+        )
+        different = _native_create(
+            client,
+            title="different key",
+            status="ready",
+            idempotency_key="native-key-b",
+        )
+        empty_one = _native_create(
+            client,
+            title="empty key one",
+            status="ready",
+            idempotency_key="",
+        )
+        empty_two = _native_create(
+            client,
+            title="empty key two",
+            status="ready",
+            idempotency_key="",
+        )
+        no_key = _native_create(client, title="no key", status="ready")
+
+        assert repeated == {
+            "id": first["id"],
+            "status": first["status"],
+            "deduplicated": True,
+        }
+        assert first["status"] == "blocked"
+        assert different["id"] != first["id"]
+        assert len(
+            {
+                first["id"],
+                different["id"],
+                empty_one["id"],
+                empty_two["id"],
+                no_key["id"],
+            }
+        ) == 5
+
+        keyed_rows = client.query(
+            "SELECT id, title, body, assignee, status, priority, created_by, "
+            "workspace_kind, reasoning_effort, idempotency_key FROM tasks "
+            "WHERE idempotency_key IN (?, ?) ORDER BY idempotency_key",
+            ["native-key-a", "native-key-b"],
+        )
+        assert len(keyed_rows) == 2
+        assert keyed_rows[0] == {
+            "id": first["id"],
+            "title": "native keyed create",
+            "body": "preserve newer fields",
+            "assignee": "codex7",
+            "status": "blocked",
+            "priority": 7,
+            "created_by": "fable",
+            "workspace_kind": "dir",
+            "reasoning_effort": "high",
+            "idempotency_key": "native-key-a",
+        }
+        created_events = client.query(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+            "AND kind = 'created'",
+            [first["id"]],
+        )
+        assert created_events == [{"n": 1}]
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_idempotency_ignores_archived_task(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        key = "native-archived-key"
+        first = _native_create(
+            client,
+            title="archived keyed create",
+            status="ready",
+            idempotency_key=key,
+        )
+        archived = client.set_status(first["id"], "archived")
+        replacement = _native_create(
+            client,
+            title="replacement keyed create",
+            status="ready",
+            idempotency_key=key,
+        )
+        repeated = _native_create(
+            client,
+            title="must deduplicate to replacement",
+            status="blocked",
+            idempotency_key=key,
+        )
+
+        assert archived == {"rowcount": 1, "status": "archived"}
+        assert replacement["id"] != first["id"]
+        assert replacement["status"] == "ready"
+        assert "deduplicated" not in replacement
+        assert repeated == {
+            "id": replacement["id"],
+            "status": replacement["status"],
+            "deduplicated": True,
+        }
+
+        rows = client.query(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            [key],
+        )
+        assert len(rows) == 2
+        assert {row["id"]: row["status"] for row in rows} == {
+            first["id"]: "archived",
+            replacement["id"]: "ready",
+        }
+        created_events = client.query(
+            "SELECT task_id, COUNT(*) AS n FROM task_events "
+            "WHERE task_id IN (?, ?) AND kind = 'created' "
+            "GROUP BY task_id ORDER BY task_id",
+            sorted([first["id"], replacement["id"]]),
+        )
+        assert created_events == [
+            {"task_id": task_id, "n": 1}
+            for task_id in sorted([first["id"], replacement["id"]])
+        ]
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_idempotency_selects_newest_active_duplicate(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        key = "native-duplicate-key"
+        for task_id, created_at in (("t_duplicate_old", 100), ("t_duplicate_new", 200)):
+            inserted = client.exec_write(
+                "INSERT INTO tasks "
+                "(id, title, status, created_at, idempotency_key) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [task_id, task_id, "ready", created_at, key],
+            )
+            assert inserted["rowcount"] == 1
+
+        repeated = _native_create(
+            client,
+            title="must deterministically select newest duplicate",
+            status="blocked",
+            idempotency_key=key,
+        )
+
+        assert repeated == {
+            "id": "t_duplicate_new",
+            "status": "ready",
+            "deduplicated": True,
+        }
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key = ?",
+            [key],
+        ) == [{"n": 2}]
 
 
 def test_import_schema_adds_reasoning_effort_to_legacy_board(tmp_path: Path):
@@ -482,6 +661,105 @@ def test_rollback_swaps_release_links_without_touching_service(tmp_path: Path):
     assert os.readlink(prefix / "current") == "releases/old"
     assert os.readlink(prefix / "previous") == "releases/new"
     assert "service_mutation=none" in result.stdout
+
+
+def _txn_unit_broker(tmp_path: Path):
+    broker = _unit_broker(tmp_path, mode="disabled")
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute(boardd_runtime.COMMITTED_TXNS_DDL)
+    broker.conn = conn
+    return broker
+
+
+def test_peer_credential_capture_and_failure_are_instrumentation_only():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        holder = type("PeerHolder", (), {"request": left})()
+        peer = boardd_runtime._RequestHandler._peer_cred(holder)
+    finally:
+        left.close()
+        right.close()
+
+    assert peer.startswith(f"pid={os.getpid()} uid={os.getuid()} comm=")
+    assert "\n" not in peer
+
+    class BrokenPeerSocket:
+        def getsockopt(self, *_args):
+            raise OSError("peer lookup unavailable")
+
+    broken_holder = type("BrokenPeerHolder", (), {"request": BrokenPeerSocket()})()
+    assert boardd_runtime._RequestHandler._peer_cred(broken_holder) == (
+        "unknown(peer lookup unavailable)"
+    )
+
+    captured: list[dict] = []
+
+    class FakeBroker:
+        def call_sync(self, req):
+            captured.append(req)
+            return {"ok": True, "result": "pong"}
+
+    handler = object.__new__(boardd_runtime._RequestHandler)
+    handler.server = type("FakeServer", (), {"broker": FakeBroker()})()
+    handler.request = BrokenPeerSocket()
+    handler.rfile = [b'{"op":"ping"}\n']
+    handler.wfile = io.BytesIO()
+    handler.handle()
+
+    assert captured == [{"op": "ping", "_peer": "unknown(peer lookup unavailable)"}]
+    assert json.loads(handler.wfile.getvalue()) == {"ok": True, "result": "pong"}
+
+
+def test_transaction_peer_clears_on_commit_and_rollback(tmp_path: Path):
+    broker = _txn_unit_broker(tmp_path)
+    try:
+        begin = broker._handle({"op": "txn_begin", "_peer": "pid=11 uid=22 comm=a"})
+        assert broker._txn_peer == "pid=11 uid=22 comm=a"
+        assert broker._handle(
+            {"op": "txn_commit", "args": {"txn": begin["result"]["txn"]}}
+        ) == {"ok": True, "result": "committed"}
+        assert broker._txn_peer is None
+
+        begin = broker._handle({"op": "txn_begin", "_peer": "pid=33 uid=44 comm=b"})
+        assert broker._txn_peer == "pid=33 uid=44 comm=b"
+        assert broker._handle(
+            {"op": "txn_rollback", "args": {"txn": begin["result"]["txn"]}}
+        ) == {"ok": True, "result": "rolledback"}
+        assert broker._txn_peer is None
+    finally:
+        broker.conn.close()
+
+
+def test_transaction_timeout_logs_peer_and_clears_instrumentation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    broker = _txn_unit_broker(tmp_path)
+    peer = "pid=55 uid=66 comm=slow-client"
+    try:
+        broker._handle({"op": "txn_begin", "_peer": peer})
+        broker._txn_deadline = time.monotonic() - 1
+        with caplog.at_level(logging.ERROR, logger="boardd"):
+            broker._run_txn_loop()
+        assert peer in caplog.text
+        assert "slow-holder peer=" in caplog.text
+        assert broker._txn_token is None
+        assert broker._txn_peer is None
+    finally:
+        broker.conn.close()
+
+
+def test_transaction_stop_path_clears_peer_instrumentation(tmp_path: Path):
+    broker = _txn_unit_broker(tmp_path)
+    try:
+        broker._handle({"op": "txn_begin", "_peer": "pid=77 uid=88 comm=stop"})
+        broker.q.put(boardd_runtime._STOP)
+        broker._run_txn_loop()
+        assert broker._txn_token is None
+        assert broker._txn_peer is None
+        assert broker.q.get_nowait() is boardd_runtime._STOP
+    finally:
+        broker.conn.close()
 
 
 class _FakeCanaryOps:

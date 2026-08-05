@@ -484,6 +484,7 @@ class Broker:
         self._db_loop_started = False   # watchdog startup grace (HIGH-3)
         # interactive-transaction state (DB thread only)
         self._txn_token = None
+        self._txn_peer = None       # SO_PEERCRED id of the client holding the txn
         self._txn_deadline = 0.0      # idle deadline (refreshed per statement)
         self._txn_started = 0.0       # wall-clock start (absolute cap, NOT refreshed)
         self._txns = 0
@@ -804,6 +805,7 @@ class Broker:
             if self._txn_token is not None:
                 self._run_txn_loop()
         # graceful close
+        self._txn_peer = None
         try:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
@@ -1428,12 +1430,14 @@ class Broker:
                 why = ("idle %.1fs" % TXN_DEADLINE_S) if idle_left <= 0 \
                     else ("absolute cap %.1fs (slow holder)" % TXN_MAX_S)
                 _log.error("boardd: interactive txn %s exceeded %s — ROLLBACK; "
-                           "deferring clients released", self._txn_token, why)
+                           "deferring clients released; slow-holder peer=%s",
+                           self._txn_token, why, self._txn_peer)
                 try:
                     self.conn.execute("ROLLBACK")
                 except Exception:
                     pass
                 self._txn_token = None
+                self._txn_peer = None
                 if abs_left <= 0 and idle_left > 0:
                     self._txn_capped += 1
                 break
@@ -1448,6 +1452,7 @@ class Broker:
                 except Exception:
                     pass
                 self._txn_token = None
+                self._txn_peer = None
                 self.q.put(_STOP)   # re-inject for the outer loop
                 break
             req, holder = item
@@ -1504,6 +1509,7 @@ class Broker:
                         "etype": "DiskGuardError"}
             self.conn.execute("BEGIN IMMEDIATE")
             self._txn_token = secrets.token_hex(8)
+            self._txn_peer = req.get("_peer")
             now = time.monotonic()
             self._txn_deadline = now + TXN_DEADLINE_S
             self._txn_started = now       # absolute cap anchor (NOT refreshed)
@@ -1547,6 +1553,7 @@ class Broker:
                     (tok, _now()))
                 self.conn.execute("COMMIT")
                 self._txn_token = None
+                self._txn_peer = None
                 self._writes_applied += 1
                 self._last_commit_ts = _now()
                 return {"ok": True, "result": "committed"}
@@ -1567,6 +1574,7 @@ class Broker:
                 except Exception:
                     pass
                 self._txn_token = None
+                self._txn_peer = None
             return {"ok": True, "result": "rolledback"}
         if op == "_checkpoint":
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2023,16 +2031,29 @@ def _h_create_task(broker, conn, a):
     title = a.get("title")
     if not title or not str(title).strip():
         raise ValueError("title is required")
+    # A retried native create with the same non-empty key returns the existing
+    # card rather than minting a duplicate. This mirrors the effective runtime
+    # hotfix while preserving all newer handler fields and validation below.
+    idem = a.get("idempotency_key")
+    if idem:
+        row = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key=? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idem,),
+        ).fetchone()
+        if row:
+            return {"id": row[0], "status": row[1], "deduplicated": True}
     tid = a.get("id") or _new_task_id()
     status = a.get("status", "running")
     reasoning_effort = _canon_reasoning_effort(a.get("reasoning_effort"))
     conn.execute(
         "INSERT INTO tasks (id, title, body, assignee, status, priority, "
-        "created_by, created_at, workspace_kind, reasoning_effort) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "created_by, created_at, workspace_kind, reasoning_effort, idempotency_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (tid, str(title), a.get("body"), _canon_assignee(a.get("assignee")),
          status, int(a.get("priority", 0)), _canon_assignee(a.get("created_by")),
-         _now(), a.get("workspace_kind", "scratch"), reasoning_effort),
+         _now(), a.get("workspace_kind", "scratch"), reasoning_effort, idem),
     )
     _ev(conn, tid, "created", {"title": str(title)})
     return {"id": tid, "status": status}
@@ -2272,6 +2293,7 @@ class BrokerServer(socketserver.ThreadingUnixStreamServer):
 class _RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         broker: Broker = self.server.broker
+        peer = self._peer_cred()
         for raw in self.rfile:
             if not raw:
                 continue
@@ -2285,6 +2307,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 self._send({"ok": False, "error": f"bad json: {exc}",
                             "etype": "BadRequest"})
                 continue
+            req["_peer"] = peer
             resp = broker.call_sync(req)
             if resp is None:
                 # DB thread did not answer within HANDLER_TIMEOUT_S. The op may
@@ -2301,6 +2324,31 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             self.wfile.flush()
         except Exception:
             pass
+
+    def _peer_cred(self) -> str:
+        """Return a stable SO_PEERCRED identity for instrumentation only.
+
+        Credential lookup must never affect authorization, transaction state, or
+        normal request handling, so every failure degrades to an unknown marker.
+        """
+        try:
+            import struct
+            import socket as _socket
+
+            pid, uid, _gid = struct.unpack(
+                "3i",
+                self.request.getsockopt(
+                    _socket.SOL_SOCKET, _socket.SO_PEERCRED, 12
+                ),
+            )
+            try:
+                with open(f"/proc/{pid}/comm", encoding="utf-8") as proc_comm:
+                    comm = proc_comm.read().strip()
+            except Exception:
+                comm = "?"
+            return f"pid={pid} uid={uid} comm={comm}"
+        except Exception as exc:
+            return f"unknown({exc})"
 
 
 # --------------------------------------------------------------------------- #
