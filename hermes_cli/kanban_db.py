@@ -837,8 +837,28 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 continue
             if not normed or normed in seen:
                 continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
+            # Boardd acceptance suite creates `acceptance_tmp_<epoch>` boards
+            # during the boardd restart-safe-runtime E2E tests. They are
+            # fire-and-forget test artifacts; surfacing them in the dashboard
+            # board-switcher is pure noise and, when sidecars are root-owned
+            # from `sudo install-boardd-runtime.sh`, causes every page load
+            # to 500 on the writability preflight. Exclude the whole namespace.
+            if normed.startswith("acceptance_tmp_"):
+                continue
+            # The DB/board.json existence probes can raise PermissionError
+            # when a board directory is owned by another principal (e.g. the
+            # boardd single-writer broker owns the authoritative `fleet`
+            # board, 0700). A board we cannot read is still a real board —
+            # treat it as present and let the caller resolve live data
+            # through the broker (boardd) rather than crashing the whole
+            # enumeration. This keeps the fleet board visible in the
+            # dashboard board-switcher even though the mirror is not
+            # directly readable by the serving user.
+            try:
+                has_db = (child / "kanban.db").exists()
+                has_meta = (child / "board.json").exists()
+            except (OSError, PermissionError):
+                has_db = has_meta = True
             if not (has_db or has_meta):
                 continue
             meta = read_board_metadata(normed)
@@ -2322,6 +2342,254 @@ def init_db(
         pass
     return path
 
+
+def _coerce_epoch(value: Any) -> int:
+    """Best-effort epoch seconds from a timestamp column of any drifted type.
+
+    Historical boards carry a handful of ``task_comments.created_at`` values
+    written as ``'YYYY-MM-DD HH:MM:SS'`` text rather than integers. A bare
+    ``int()`` over those raises and aborts the whole migration pass, which
+    makes the DB unopenable rather than merely imprecise — so parse what we
+    can and fall back to 0 (outside every guard window) instead of raising.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(
+                datetime.datetime.strptime(text[: len(fmt) + 6], fmt)
+                .replace(tzinfo=datetime.timezone.utc)
+                .timestamp()
+            )
+        except ValueError:
+            continue
+    return 0
+
+def _is_self_authored(author: Optional[str], assignee: Optional[str]) -> bool:
+    """True when a comment was written by the card's OWN assigned worker.
+
+    This is the structural half of the custody signal, and it is what keeps
+    the ownership rule from over-freeing. The reported defect is a CROSS-POST:
+    some other profile writes a companion PR's URL onto this card. But the
+    overwhelmingly common shape is the opposite — the card's own worker posts
+    ``PR opened: <url>`` as a comment and never mirrors it into a run summary.
+
+    Replayed against the live 2,662-card board, custody-by-work-product alone
+    freed 14 cards, and 13 of them were exactly that: the assigned worker
+    announcing its own PR. Freeing those would drop the guard for cards that
+    genuinely hold an open PR — the two-writers-on-one-PR case the guard exists
+    to prevent. Only the one true cross-post (``assignee=fable``, comment by
+    ``cursor2``) is left unguarded, which is the reported bug.
+
+    Deliberately an exact match on the recorded author, with no prose
+    inspection and no fuzzy profile aliasing: an unknown or absent assignee
+    yields False, which routes the URL through the ordinary
+    "did another card declare this?" path rather than inventing custody.
+    """
+    if not author or not assignee:
+        return False
+    return author.strip() == assignee.strip()
+
+def _record_task_pr_ownership(
+    conn: sqlite3.Connection,
+    task_id: str,
+    body: str,
+    *,
+    observed_at: int,
+    source_comment_id: Optional[int],
+    declared: bool = False,
+) -> None:
+    """Upsert normalized PR ownership for one task comment or work product.
+
+    ``declared`` marks CUSTODY (the card's own run summary / metadata / error
+    or ``tasks.result`` named the PR) as opposed to a prose CITATION. The flag
+    is monotonic: once a card has declared a PR, a later bare mention of the
+    same URL cannot demote it back to a citation.
+    """
+    for url in _canonical_pr_urls_from_text(body):
+        conn.execute(
+            "INSERT INTO task_pr_ownership ("
+            "task_id, canonical_url, first_seen_at, last_seen_at, "
+            "source_comment_id, declared"
+            ") VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, canonical_url) DO UPDATE SET "
+            "last_seen_at = MAX(last_seen_at, excluded.last_seen_at), "
+            "source_comment_id = CASE "
+            "WHEN excluded.last_seen_at >= last_seen_at "
+            "THEN excluded.source_comment_id ELSE source_comment_id END, "
+            "declared = MAX(declared, excluded.declared)",
+            (
+                task_id,
+                url,
+                int(observed_at),
+                int(observed_at),
+                source_comment_id,
+                1 if declared else 0,
+            ),
+        )
+
+def _record_task_pr_declaration(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *texts: Optional[str],
+    observed_at: Optional[int] = None,
+) -> None:
+    """Record PR custody named by this card's own work product.
+
+    Called from the run-closing / result-writing chokepoints. Unlike a comment
+    (which any coordinating worker may write about any PR), a run summary,
+    run metadata, run error, or ``tasks.result`` is produced BY this card's own
+    attempt — so a PR URL there is proof the card owns the PR.
+    """
+    joined = "\n".join(t for t in texts if t)
+    if "/pull/" not in joined:
+        return
+    now = int(time.time()) if observed_at is None else _coerce_epoch(observed_at)
+    _record_task_pr_ownership(
+        conn,
+        task_id,
+        joined,
+        observed_at=now,
+        source_comment_id=None,
+        declared=True,
+    )
+
+def _backfill_task_pr_ownership(conn: sqlite3.Connection) -> None:
+    """One-time, idempotent normalization of historical PR comments."""
+    present = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ("
+            "'kanban_schema_state', 'task_pr_ownership', 'task_comments')"
+        ).fetchall()
+    }
+    if present != {"kanban_schema_state", "task_pr_ownership", "task_comments"}:
+        return
+    marker = "task_pr_ownership_v1"
+    row = conn.execute(
+        "SELECT value FROM kanban_schema_state WHERE key = ?",
+        (marker,),
+    ).fetchone()
+    if row is not None and row["value"] == "complete":
+        return
+    with write_txn(conn):
+        for comment in conn.execute(
+            "SELECT id, task_id, body, created_at FROM task_comments "
+            "ORDER BY id ASC"
+        ).fetchall():
+            _record_task_pr_ownership(
+                conn,
+                str(comment["task_id"]),
+                str(comment["body"] or ""),
+                observed_at=_coerce_epoch(comment["created_at"]),
+                source_comment_id=int(comment["id"]),
+            )
+        conn.execute(
+            "INSERT INTO kanban_schema_state (key, value) VALUES (?, 'complete') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (marker,),
+        )
+
+def _backfill_task_pr_declarations(conn: sqlite3.Connection) -> None:
+    """One-time, idempotent custody upgrade for historical work products.
+
+    ``_backfill_task_pr_ownership`` recorded every PR URL that ever appeared in
+    a comment, all of them as citations. Runs and results predate the
+    ``declared`` column too, so without this pass every historical card looks
+    like it owns nothing and the guard's "another card declared this PR"
+    disambiguation has no data to work with on an existing board.
+
+    Self-authored comments are upgraded here as well rather than in
+    ``_backfill_task_pr_ownership``: that pass carries its own ``_v1`` marker
+    and has already run to completion on every existing board, so amending it
+    would be a no-op exactly where the upgrade is needed.
+    """
+    present = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ("
+            "'kanban_schema_state', 'task_pr_ownership', 'task_runs', 'tasks')"
+        ).fetchall()
+    }
+    if present != {"kanban_schema_state", "task_pr_ownership", "task_runs", "tasks"}:
+        return
+    cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_pr_ownership)")
+    }
+    if "declared" not in cols:
+        return
+    marker = "task_pr_declared_v1"
+    row = conn.execute(
+        "SELECT value FROM kanban_schema_state WHERE key = ?",
+        (marker,),
+    ).fetchone()
+    if row is not None and row["value"] == "complete":
+        return
+    with write_txn(conn):
+        for run in conn.execute(
+            "SELECT task_id, summary, metadata, error, "
+            "       COALESCE(ended_at, started_at, 0) AS seen_at "
+            "FROM task_runs "
+            "WHERE COALESCE(summary, '') || COALESCE(metadata, '') "
+            "      || COALESCE(error, '') LIKE '%/pull/%' "
+            "ORDER BY id ASC"
+        ).fetchall():
+            _record_task_pr_declaration(
+                conn,
+                str(run["task_id"]),
+                run["summary"],
+                run["metadata"],
+                run["error"],
+                observed_at=_coerce_epoch(run["seen_at"]),
+            )
+        task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "result" in task_cols:
+            for task in conn.execute(
+                "SELECT id, result, COALESCE(completed_at, created_at, 0) AS seen_at "
+                "FROM tasks WHERE COALESCE(result, '') LIKE '%/pull/%' "
+                "ORDER BY id ASC"
+            ).fetchall():
+                _record_task_pr_declaration(
+                    conn,
+                    str(task["id"]),
+                    task["result"],
+                    observed_at=_coerce_epoch(task["seen_at"]),
+                )
+        # A comment written by the card's OWN assigned worker is custody, not a
+        # citation — see :func:`_is_self_authored`. Re-scan the bodies rather
+        # than flipping the flag by ``source_comment_id``: that column holds
+        # only the LATEST sighting, so a self-authored announcement followed by
+        # someone else's cross-post of the same URL would be missed.
+        for comment in conn.execute(
+            "SELECT c.id, c.task_id, c.body, c.author, c.created_at "
+            "FROM task_comments c JOIN tasks t ON t.id = c.task_id "
+            "WHERE c.body LIKE '%/pull/%' "
+            "  AND TRIM(COALESCE(c.author, '')) <> '' "
+            "  AND TRIM(COALESCE(c.author, '')) = TRIM(COALESCE(t.assignee, '')) "
+            "ORDER BY c.id ASC"
+        ).fetchall():
+            _record_task_pr_ownership(
+                conn,
+                str(comment["task_id"]),
+                str(comment["body"] or ""),
+                observed_at=_coerce_epoch(comment["created_at"]),
+                source_comment_id=int(comment["id"]),
+                declared=True,
+            )
+        conn.execute(
+            "INSERT INTO kanban_schema_state (key, value) VALUES (?, 'complete') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (marker,),
+        )
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
@@ -4238,6 +4506,10 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    # F1-m: ownership-aware precheck before the write txn (reduced port).
+    if _active_pr_custody(conn, task_id, cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW):
+        _append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
+        return None
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -6783,9 +7055,48 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/"
+    r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+def _canonical_pr_urls_from_text(body: str) -> tuple[str, ...]:
+    """Return ordered, de-duplicated canonical GitHub PR URLs in ``body``."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body or ""):
+        url = (
+            f"https://github.com/{match.group('owner').casefold()}/"
+            f"{match.group('repo').casefold()}/pull/{int(match.group('number'))}"
+        )
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return tuple(urls)
+
+def _canonical_pr_urls_from_comments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[str, ...]:
+    """Extract ordered, de-duplicated canonical PR URLs from task comments."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    rows = conn.execute(
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
+        (task_id, int(cutoff)),
+    ).fetchall()
+    for row in rows:
+        if _coerce_epoch(row["created_at"]) < int(cutoff):
+            continue
+        for url in _canonical_pr_urls_from_text(row["body"] or ""):
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return tuple(urls)
+
 
 
 @dataclass
@@ -8009,7 +8320,225 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def _active_pr_candidates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    """Split in-window PR URLs into ``(owned, disowned)`` custody records.
+
+    A PR URL in a comment is not evidence that this card owns the PR. Workers
+    are explicitly asked to cross-reference companion PRs on related cards, so
+    the raw comment scan turns good coordination hygiene into a silent
+    ``_RESPAWN_GUARD_PR_WINDOW``-long dispatch freeze on the wrong card.
+
+    Ownership is decided per URL:
+
+    * ``declared`` — the PR came from the card itself: its own work product
+      (run summary / metadata / error, or ``tasks.result``) named it, OR its
+      own assigned worker posted it in a comment. Always owned.
+    * otherwise — the URL was cross-posted onto this card by another profile.
+      If some OTHER card declared the same PR, the PR provably belongs to that
+      card and this mention is a citation: disowned. If nobody declared it
+      anywhere, the conservative pre-existing behaviour is preserved and it
+      stays owned.
+
+    Both halves of ``declared`` are load-bearing. Replayed against the live
+    2,662-card board, work-product custody alone freed 14 cards but 13 of them
+    were the assigned worker announcing its own PR in a comment — freeing those
+    would drop the guard for cards that really do hold an open PR. With
+    self-authorship included, exactly one card is freed: the reported
+    cross-post.
+
+    Deliberately NOT filtered by the other card's status: custody does not
+    lapse when the owning card finishes, so a citation of a completed card's
+    PR stays a citation.
+    """
+    # The normalized ownership ledger is authoritative for custody sightings:
+    # work product has no comment row, so a comment-only seed silently drops the
+    # exact result/run declaration the guard exists to protect. Seed from every
+    # in-window ledger row, preserving its nullable source_comment_id and the
+    # last_seen_at-based lease expiry. The comment pass below remains as a
+    # backwards-compatible enrichment for legacy/directly-inserted comments.
+    try:
+        ownership_rows = conn.execute(
+            "SELECT canonical_url, last_seen_at, source_comment_id "
+            "FROM task_pr_ownership "
+            "WHERE task_id = ? AND last_seen_at >= ? "
+            "ORDER BY first_seen_at ASC, canonical_url ASC",
+            (task_id, int(cutoff)),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # A pre-ownership-schema connection retains the historical
+        # comment-only behaviour. Any other read failure is unsafe to ignore:
+        # failing open here can let a second writer claim guarded work.
+        if "no such table: task_pr_ownership" not in str(exc).lower():
+            raise
+        ownership_rows = []
+
+    sightings: dict[str, dict[str, Any]] = {}
+    for row in ownership_rows:
+        seen_at = _coerce_epoch(row["last_seen_at"])
+        if seen_at < int(cutoff):
+            continue
+        url = str(row["canonical_url"])
+        source_comment_id = row["source_comment_id"]
+        sightings[url] = {
+            "canonical_url": url,
+            "source_comment_id": (
+                int(source_comment_id) if source_comment_id is not None else None
+            ),
+            "last_seen_at": seen_at,
+            "expires_at": seen_at + _RESPAWN_GUARD_PR_WINDOW,
+        }
+
+    for row in conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
+        (task_id, int(cutoff)),
+    ).fetchall():
+        seen_at = _coerce_epoch(row["created_at"])
+        # SQLite permits legacy textual timestamps in this INTEGER-affinity
+        # column; the SQL comparison can admit them, so enforce the window
+        # again after canonical coercion.
+        if seen_at < int(cutoff):
+            continue
+        for url in _canonical_pr_urls_from_text(row["body"] or ""):
+            sighting = sightings.get(url)
+            if sighting is None:
+                sightings[url] = {
+                    "canonical_url": url,
+                    "source_comment_id": int(row["id"]),
+                    "last_seen_at": seen_at,
+                    "expires_at": seen_at + _RESPAWN_GUARD_PR_WINDOW,
+                }
+                continue
+            # A newer raw comment can enrich a stale normalized row. On a tie,
+            # preserve the ledger's source: a later same-second work-product
+            # declaration intentionally records source_comment_id=NULL.
+            if seen_at > int(sighting.get("last_seen_at") or 0):
+                sighting["source_comment_id"] = int(row["id"])
+                sighting["last_seen_at"] = seen_at
+                sighting["expires_at"] = seen_at + _RESPAWN_GUARD_PR_WINDOW
+    if not sightings:
+        return (), ()
+
+    try:
+        declared_here = {
+            str(row["canonical_url"])
+            for row in conn.execute(
+                "SELECT canonical_url FROM task_pr_ownership "
+                "WHERE task_id = ? AND declared = 1",
+                (task_id,),
+            ).fetchall()
+        }
+    except sqlite3.Error:
+        # Legacy DB without the ownership table/column: keep the historical
+        # all-URLs-own behaviour rather than silently dropping the guard.
+        return tuple(sightings.values()), ()
+
+    owned: list[dict[str, Any]] = []
+    disowned: list[dict[str, Any]] = []
+    for url, record in sightings.items():
+        if url in declared_here:
+            record["ownership"] = "declared"
+            owned.append(record)
+            continue
+        record["ownership"] = "referenced"
+        other = conn.execute(
+            "SELECT task_id FROM task_pr_ownership "
+            "WHERE canonical_url = ? AND task_id <> ? AND declared = 1 "
+            "ORDER BY first_seen_at ASC, task_id ASC LIMIT 1",
+            (url, task_id),
+        ).fetchone()
+        if other is None:
+            owned.append(record)
+        else:
+            record["declared_by"] = str(other["task_id"])
+            disowned.append(record)
+    return tuple(owned), tuple(disowned)
+
+def _active_pr_custody(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[str, ...]:
+    """Ordered canonical PR URLs this card actually owns inside the window."""
+    owned, _ = _active_pr_candidates(conn, task_id, cutoff=cutoff)
+    return tuple(str(record["canonical_url"]) for record in owned)
+
+def _active_pr_guard_detail(
+    owned: Sequence[Mapping[str, Any]],
+    disowned: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the operator-facing explanation for an ``active_pr`` suppression.
+
+    Carries the exact URL, the comment it came from, how ownership was decided,
+    and when the window lapses — the four facts an operator needs to tell a
+    real active-PR hold apart from a stale one without reading the DB.
+    """
+    last_seen = max(
+        (
+            int(record.get("last_seen_at") or 0)
+            for record in owned
+            if record.get("last_seen_at") is not None
+        ),
+        default=0,
+    )
+    detail: dict[str, Any] = {
+        "pr_url": str(owned[0]["canonical_url"]) if owned else None,
+        "pr_urls": [str(record["canonical_url"]) for record in owned],
+        "ownership": str(owned[0].get("ownership") or "referenced") if owned else None,
+        "source_comment_id": owned[0].get("source_comment_id") if owned else None,
+        "expires_at": (last_seen + _RESPAWN_GUARD_PR_WINDOW) if last_seen else None,
+        "window_seconds": _RESPAWN_GUARD_PR_WINDOW,
+    }
+    if disowned:
+        detail["ignored_pr_urls"] = [
+            {
+                "pr_url": str(record["canonical_url"]),
+                "declared_by": record.get("declared_by"),
+            }
+            for record in disowned
+        ]
+    return detail
+
+def _record_disowned_pr_mentions(
+    conn: sqlite3.Connection,
+    task_id: str,
+    detail: Mapping[str, Any],
+) -> None:
+    """Emit one audit event when PR mentions were considered and rejected.
+
+    Rate-limited to once per ``_RESPAWN_GUARD_PR_WINDOW`` per task so a
+    2-minute dispatcher tick cannot flood ``task_events`` with the same
+    "looked at it, not yours" verdict.
+    """
+    ignored = detail.get("ignored_pr_urls")
+    if not ignored:
+        return
+    recent = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'respawn_guard_pr_ignored' "
+        "AND created_at >= ? LIMIT 1",
+        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchone()
+    if recent is not None:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "respawn_guard_pr_ignored",
+            {"reason": "pr_declared_by_other_task", "ignored_pr_urls": list(ignored)},
+        )
+
+def check_respawn_guard(
+    conn: sqlite3.Connection, task_id: str,
+    *, detail_out: Optional[dict] = None,
+) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
@@ -8133,13 +8662,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Ownership-aware (ported): only a PR the task itself owns (or declared)
+    # blocks respawn; a bare citation of another card's PR no longer freezes.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
+    if owned:
+        if detail_out is not None:
+            detail_out.update(_active_pr_guard_detail(owned, disowned))
+        return "active_pr"
+    if disowned:
+        _record_disowned_pr_mentions(conn, task_id, disowned, now=now)
 
     return None
 
@@ -8961,6 +9493,75 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+_SPAWN_SKILL_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:[/:][A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_SPAWN_SKILL_IDENTIFIER_MAX_LENGTH = 256
+
+
+def _invalid_spawn_skills(task_id: object, reason: str) -> ValueError:
+    """Build a bounded, single-line worker-skill validation error."""
+    task_label = re.sub(r"\s+", " ", str(task_id)).strip() or "<unknown>"
+    if len(task_label) > 64:
+        task_label = f"{task_label[:61]}..."
+    return ValueError(
+        f"task {task_label} has invalid skills ({reason}); expected None, "
+        "list[str]/tuple[str, ...], a JSON-array string, or a "
+        "single/comma-delimited identifier string; identifiers may use only "
+        "letters, digits, '.', '_', '/', ':', and '-'"
+    )
+
+def _normalize_spawn_skills(value: object, *, task_id: object) -> list[str]:
+    """Normalize legacy and typed task skills before building worker argv.
+
+    This is the final trust boundary before a task's values reach ``Popen``.
+    Keep it independent of database decoding so direct ``Task(...)`` callers
+    and legacy broker serializers receive the same fail-closed behavior.
+    """
+    if value is None:
+        return []
+
+    raw_items: Sequence[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+        except (json.JSONDecodeError, RecursionError):
+            if stripped[0] in '[{"':
+                raise _invalid_spawn_skills(
+                    task_id, "malformed JSON-looking value"
+                ) from None
+            raw_items = stripped.split(",")
+        else:
+            if not isinstance(decoded, list):
+                raise _invalid_spawn_skills(task_id, "JSON value must be an array")
+            raw_items = decoded
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raise _invalid_spawn_skills(task_id, "unsupported value type")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise _invalid_spawn_skills(task_id, "members must be strings")
+        name = item.strip()
+        if not name:
+            raise _invalid_spawn_skills(task_id, "members must be non-empty")
+        if (
+            len(name) > _SPAWN_SKILL_IDENTIFIER_MAX_LENGTH
+            or _SPAWN_SKILL_IDENTIFIER_RE.fullmatch(name) is None
+        ):
+            raise _invalid_spawn_skills(task_id, "member is not a valid identifier")
+        if name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -9109,7 +9710,8 @@ def _default_spawn(
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
     if task.skills:
-        for sk in task.skills:
+        spawn_skills = _normalize_spawn_skills(task.skills, task_id=task.id)
+        for sk in spawn_skills:
             if sk:
                 cmd.extend(["--skills", sk])
     if task.model_override:
@@ -10273,3 +10875,45 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# --- boardd single-writer broker shim (HERMES_KANBAN_BROKER=1) ----------------
+# Rebinds the public board functions to broker-backed delegates so callers that
+# touch the FLEET board route through boardd. connect()/connect_closing() are
+# FLEET-GATED (rev7, council GO-FLEET-ONLY): they route to the broker ONLY when
+# the requested open resolves to the fleet DB, and pass every other board
+# (per-seat legacy, default) straight through to the ORIGINAL local sqlite
+# connect. Because this runs at the END of module import, dependent modules that
+# did ``from ... import <fn>`` bind to the rebound function. No effect when the
+# flag is unset.
+#
+# Only the exactly-once-sensitive HOT ops are rebound to native broker ops
+# (applied_ops dedup). Every OTHER write_txn function (create_task, complete_task,
+# block_task, unblock_task, promote_task, reclaim_task, schedule_task, decompose,
+# ...) runs UNCHANGED and atomically through the broker's INTERACTIVE TRANSACTION
+# when — and only when — the connection is a fleet BrokerConnection; no lifecycle
+# policy is reimplemented. _check_file_length_invariant is neutered client-side
+# (it reads the raw db FILE, decoupled from the broker's connection view under WAL
+# -> false torn-extend); the broker runs the authoritative check on its own
+# connection. See boardd_shim.py + INVENTORY §A.
+if os.environ.get("HERMES_KANBAN_BROKER") == "1":
+    try:
+        import sys as _sys
+        from hermes_cli import boardd_shim as _boardd_shim
+        # Capture the GENUINE connect/connect_closing (+ this module, for route
+        # resolution) BEFORE repointing the public names, so the fleet-gate's
+        # non-fleet pass-through calls the real implementation.
+        _boardd_shim._capture_original(_sys.modules[__name__])
+        connect = _boardd_shim.connect
+        connect_closing = _boardd_shim.connect_closing
+        add_comment = _boardd_shim.add_comment
+        claim_task = _boardd_shim.claim_task
+        heartbeat_worker = _boardd_shim.heartbeat_worker
+        set_workspace_path = _boardd_shim.set_workspace_path
+        set_branch_name = _boardd_shim.set_branch_name
+        _check_file_length_invariant = _boardd_shim.noop_flen
+    except Exception as _boardd_shim_err:  # never break the module on shim import
+        import logging as _logging
+        _logging.getLogger("kanban_db").error(
+            "boardd shim install FAILED (%s); DO NOT enable cutover perms while "
+            "this log line is present.", _boardd_shim_err)

@@ -2471,6 +2471,104 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        _kanban_cfg = {}
+
+    # D2 step-2 (2026-08-04, operator GO): bounded auto-decompose tick on the
+    # CLI one-shot dispatch path. Mirrors the gateway _auto_decompose_tick but
+    # (a) runs only from the CLI dispatch command (dispatch_in_gateway is left
+    # untouched — no topology change), (b) is capped by
+    # kanban.auto_decompose_per_tick (default 3), (c) hard-filters fenced
+    # triage cards (assignee == terminal fable marker) before asking the
+    # decomposer, and (d) honors kanban.auto_decompose: false as an off
+    # switch (same live-re-read semantics as the gateway). decompose_task
+    # already applies its own 180s per-call timeout. Boards are iterated with
+    # the same per-board HERMES_KANBAN_BOARD pin as the gateway tick so triage
+    # on non-default boards is seen.
+    import logging as _logging
+    _decomp_logger = _logging.getLogger(__name__)
+    decompose_results = []
+    try:
+        if not getattr(args, "dry_run", False):
+            _decomp_enabled = bool(_kanban_cfg.get("auto_decompose", True))
+            _decomp_per_tick = int(_kanban_cfg.get("auto_decompose_per_tick", 3) or 3)
+            if _decomp_enabled and _decomp_per_tick > 0:
+                from hermes_cli import kanban_decompose as _decomp
+                try:
+                    _boards = kb.list_boards(include_archived=False)
+                except Exception:
+                    _boards = [{"slug": kb.DEFAULT_BOARD}]
+                _attempted = 0
+                for _b in _boards:
+                    if _attempted >= _decomp_per_tick:
+                        break
+                    _slug = _b.get("slug") or kb.DEFAULT_BOARD
+                    _prev_board = os.environ.get("HERMES_KANBAN_BOARD")
+                    try:
+                        os.environ["HERMES_KANBAN_BOARD"] = _slug
+                        try:
+                            _triage_ids = _decomp.list_triage_ids()
+                        except Exception as exc:
+                            _decomp_logger.warning(
+                                "kanban dispatch: list_triage_ids failed on %s (%s)",
+                                _slug, exc,
+                            )
+                            _triage_ids = []
+                        for _tid in _triage_ids:
+                            if _attempted >= _decomp_per_tick:
+                                break
+                            _attempted += 1
+                            # Dual fence filter (operator-approved): skip any
+                            # card whose assignee is the terminal fable marker
+                            # or whose title/body carry explicit fence/hold/
+                            # note markers. The old decomposer returned ALL
+                            # triage rows; this port refuses to route fences,
+                            # holds, notes, or operator-tags.
+                            try:
+                                with kb.connect_closing() as _conn:
+                                    _t = kb.get_task(_conn, _tid)
+                                if _t is None:
+                                    continue
+                                _assignee = (_t.assignee or "").strip().lower()
+                                _title = (_t.title or "").lower()
+                                _body = (_t.body or "").lower()
+                                if _assignee in ("fable", "operator"):
+                                    continue
+                                _fence_markers = (
+                                    "[fence]", "[hold]", "[note]",
+                                    "operator-hold", "nonspawnable",
+                                    "fable-only", "custody", "authority-hold",
+                                    "do-not-decompose",
+                                )
+                                if any(m in _title for m in _fence_markers) or any(
+                                    m in _body for m in _fence_markers
+                                ):
+                                    continue
+                            except Exception:
+                                continue
+                            try:
+                                _outcome = _decomp.decompose_task(
+                                    _tid, author="cli-dispatcher",
+                                )
+                            except Exception as exc:
+                                _decomp_logger.warning(
+                                    "kanban dispatch: decompose_task crashed on %s (%s)",
+                                    _tid, exc,
+                                )
+                                continue
+                            if _outcome.ok:
+                                decompose_results.append(_tid)
+                                _decomp_logger.info(
+                                    "kanban dispatch: auto-decomposed %s (fanout=%s)",
+                                    _tid, bool(getattr(_outcome, "fanout", False)),
+                                )
+                    finally:
+                        if _prev_board is None:
+                            os.environ.pop("HERMES_KANBAN_BOARD", None)
+                        else:
+                            os.environ["HERMES_KANBAN_BOARD"] = _prev_board
+    except Exception as exc:
+        _decomp_logger.warning("kanban dispatch: auto-decompose tick failed (%s)", exc)
+
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,

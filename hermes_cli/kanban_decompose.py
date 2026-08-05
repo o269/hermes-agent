@@ -220,15 +220,93 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     Each roster entry is ``{name, description, has_description}``. The
     valid-set is used after the LLM responds to rewrite invalid
     assignees to the default fallback.
+
+    Roster hygiene (operator doctrine 2026-08-04): a profile is roster-
+    eligible ONLY when it has a lane-health receipt newer than 24h AND is
+    not on the de-rostered denylist. Never route on config alone — a
+    configured profile is not a live lane (kimi1/2/3 proved this: config
+    listed them while the provider was quota-dead).
     """
+    import os as _os
+    from datetime import datetime, timezone
+
+    _LANE_HEALTH_DIR = _os.environ.get(
+        "LANE_HEALTH_DIR", "/home/odai/godmode-bus/lane-health",
+    )
+    # De-rostered until verified live (operator 2026-08-04): kimi provider
+    # quota-exhausted; re-add only on a verified LANE_OK probe receipt.
+    # Lanes are admitted to the roster (and thus auto-assigned) only when they
+    # have a fresh LANE_OK receipt AND are not de-rostered. ``kimi`` was de-rostered
+    # by operator order; grok was de-rostered 2026-08-05 for xAI OAuth outage,
+    # now restored (operator re-authed on blitz-vps 2026-08-05 ~02:45Z).
+    _DE_ROSTER_PREFIXES = ("kimi",)
+
+    def _has_fresh_receipt(name: str) -> bool:
+        """True iff <name>.env exists in lane-health dir with status=LANE_OK
+        and probed_at newer than 24h."""
+        try:
+            rp = _os.path.join(_LANE_HEALTH_DIR, f"{name}.env")
+            if not _os.path.exists(rp):
+                return False
+            ok = False
+            probed = None
+            with open(rp, "r", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("status="):
+                        ok = line.split("=", 1)[1].strip().upper() == "LANE_OK"
+                    elif line.startswith("probed_at="):
+                        try:
+                            probed = datetime.fromisoformat(
+                                line.split("=", 1)[1].strip()
+                            )
+                        except ValueError:
+                            probed = None
+            if not ok:
+                return False
+            if probed is None:
+                return False
+            age = datetime.now(timezone.utc) - probed
+            return age.total_seconds() <= 24 * 3600
+        except Exception:
+            return False
+
     roster: list[dict] = []
     valid: set[str] = set()
     try:
         all_profiles = profiles_mod.list_profiles()
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
-        return roster, valid
+        all_profiles = []
+
+    # Remote lanes (vps2-gemini1/2 etc.) are NOT local profiles but hold
+    # lane-health receipts and are claimed by the remote dispatcher
+    # (vps2-dispatch.service via boardd-tunnel peer). Merge receipt
+    # directory names into the candidate set so the health-gated roster
+    # spans BOTH boxes (operator D3 directive 2026-08-04).
+    receipt_names = set()
+    try:
+        for fn in _os.listdir(_LANE_HEALTH_DIR):
+            if fn.endswith(".env"):
+                receipt_names.add(fn[:-4])
+    except Exception:
+        pass
+
+    local_names = {getattr(p, "name", "") for p in all_profiles}
+    for rn in sorted(receipt_names - local_names):
+        all_profiles.append(type("RP", (), {"name": rn, "description": ""})())
+
     for p in all_profiles:
+        if p.name.startswith(_DE_ROSTER_PREFIXES):
+            logger.info(
+                "decompose: %s de-rostered (operator denylist until LANE_OK probe)", p.name,
+            )
+            continue
+        if not _has_fresh_receipt(p.name):
+            logger.info(
+                "decompose: %s excluded — no lane-health LANE_OK receipt newer than 24h", p.name,
+            )
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
