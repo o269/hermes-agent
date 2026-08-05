@@ -9146,7 +9146,10 @@ def check_respawn_guard(
             detail_out.update(_active_pr_guard_detail(owned, disowned))
         return "active_pr"
     if disowned:
-        _record_disowned_pr_mentions(conn, task_id, disowned, now=now)
+        detail = _active_pr_guard_detail((), disowned)
+        if detail_out is not None:
+            detail_out.update(detail)
+        _record_disowned_pr_mentions(conn, task_id, detail)
 
     return None
 

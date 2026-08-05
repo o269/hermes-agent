@@ -56,6 +56,53 @@ def test_decomposition_eligibility_ignores_cross_posted_pr_citations(kanban_home
     assert declared_id not in eligible
 
 
+def test_respawn_guard_ignores_cross_posted_pr_citations_without_event_flood(
+    kanban_home,
+):
+    pr_url = "https://github.com/acme/widget/pull/36"
+    with kb.connect() as conn:
+        referenced_id = kb.create_task(
+            conn,
+            title="citation only",
+            assignee="worker",
+        )
+        declared_id = kb.create_task(
+            conn,
+            title="owns repair PR",
+            assignee="worker",
+        )
+        kb.add_comment(conn, referenced_id, "observer", f"Related repair: {pr_url}")
+        kb.add_comment(conn, declared_id, "worker", f"AUTHOR COMPLETE {pr_url}")
+
+        detail = {}
+        assert kb.check_respawn_guard(conn, referenced_id, detail_out=detail) is None
+        assert detail["ignored_pr_urls"] == [
+            {"pr_url": pr_url, "declared_by": declared_id}
+        ]
+
+        assert kb.check_respawn_guard(conn, referenced_id) is None
+        ignored_events = [
+            event
+            for event in kb.list_events(conn, referenced_id)
+            if event.kind == "respawn_guard_pr_ignored"
+        ]
+        assert len(ignored_events) == 1
+        assert ignored_events[0].payload == {
+            "reason": "pr_declared_by_other_task",
+            "ignored_pr_urls": [
+                {"pr_url": pr_url, "declared_by": declared_id}
+            ],
+        }
+
+        owner_detail = {}
+        assert (
+            kb.check_respawn_guard(conn, declared_id, detail_out=owner_detail)
+            == "active_pr"
+        )
+        assert owner_detail["pr_url"] == pr_url
+        assert owner_detail["ownership"] == "declared"
+
+
 def test_decompose_creates_children_and_promotes_root(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a feature")
