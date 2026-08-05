@@ -982,7 +982,22 @@ def _consume_codex_event_stream(
     terminal_error: Any = None
     saw_terminal = False
 
+    # Content-free retained-event counters (seat-survival RSS diagnosis).
+    # Never logs event payloads — only counts/byte totals/RSS.
+    _stream_tel = None
+    try:
+        from agent.compression_lifecycle_telemetry import CodexStreamTelemetry
+
+        _stream_tel = CodexStreamTelemetry(log=logger)
+    except Exception:
+        _stream_tel = None
+
     for event in event_iter:
+        if _stream_tel is not None:
+            try:
+                _stream_tel.note_event()
+            except Exception:
+                pass
         if on_event is not None:
             try:
                 on_event(event)
@@ -1031,6 +1046,11 @@ def _consume_codex_event_stream(
             delta_text = _event_field(event, "delta", "")
             if delta_text and active_message_phase == "commentary":
                 commentary_text_deltas.append(delta_text)
+                if _stream_tel is not None:
+                    try:
+                        _stream_tel.note_commentary_delta(delta_text)
+                    except Exception:
+                        pass
                 # Preserve CLI/backward compatibility when no first-class
                 # commentary consumer is installed.
                 if on_commentary_message is None and on_reasoning_delta is not None:
@@ -1046,6 +1066,11 @@ def _consume_codex_event_stream(
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
                 collected_text_deltas.append(delta_text)
+                if _stream_tel is not None:
+                    try:
+                        _stream_tel.note_text_delta(delta_text)
+                    except Exception:
+                        pass
                 if not has_tool_calls:
                     if not first_delta_fired:
                         first_delta_fired = True
@@ -1067,6 +1092,11 @@ def _consume_codex_event_stream(
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
+            if reasoning_text and _stream_tel is not None:
+                try:
+                    _stream_tel.note_reasoning_delta(reasoning_text)
+                except Exception:
+                    pass
             if reasoning_text and on_reasoning_delta is not None:
                 try:
                     on_reasoning_delta(reasoning_text)
@@ -1078,6 +1108,11 @@ def _consume_codex_event_stream(
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
+                if _stream_tel is not None:
+                    try:
+                        _stream_tel.note_output_item_done(done_item)
+                    except Exception:
+                        pass
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
                 if done_phase == "commentary" and on_commentary_message is not None:
@@ -1133,6 +1168,12 @@ def _consume_codex_event_stream(
                 terminal_status = terminal_status or "failed"
             # Stop on terminal event.
             break
+
+    if _stream_tel is not None:
+        try:
+            _stream_tel.close("codex_stream_close")
+        except Exception:
+            pass
 
     # Build the final output list.  Prefer items observed via output_item.done;
     # if none arrived but we streamed plain text deltas (no tool calls), synthesize
