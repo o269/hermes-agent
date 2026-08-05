@@ -103,7 +103,9 @@ from typing import (
 import yaml
 
 from hermes_cli.kanban_assignment_policy import (
+    LaneEligibilityPolicy,
     assignment_guard_reason as _pure_assignment_guard_reason,
+    lane_eligibility_policy_from_config,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1706,20 +1708,11 @@ class AssignmentPolicyConfigError(RuntimeError):
     """Authority-profile config could not be resolved safely for this board."""
 
 
-def _configured_board_profiles(
+def _configured_kanban_policy(
     conn: sqlite3.Connection,
-    key: str,
-    default: object,
-) -> tuple[str, ...]:
-    """Read a profile allowlist from the config bound to ``conn``'s board.
+) -> tuple[Path, dict[str, object]]:
+    """Read canonical Kanban policy config bound to ``conn``'s board."""
 
-    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
-    policy.  The opened SQLite path resolves the canonical root, matching the
-    continuation-authority model. A present but unreadable/malformed config is
-    an enforcement error, never an empty allowlist that disables the fence.
-    """
-
-    raw = default
     authority_root = _continuation_authority_root(conn)
     if authority_root is None:
         raise AssignmentPolicyConfigError("assignment authority root is unresolved")
@@ -1738,16 +1731,37 @@ def _configured_board_profiles(
         raise AssignmentPolicyConfigError(
             f"invalid assignment authority config at {config_path}: root must be a mapping"
         )
-    kanban_config = payload.get("kanban")
-    if kanban_config is None:
-        kanban_config = {}
-    if not isinstance(kanban_config, dict):
+    configured = payload.get("kanban")
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
         raise AssignmentPolicyConfigError(
             f"invalid assignment authority config at {config_path}: kanban must be a mapping"
         )
-    configured = kanban_config.get(key)
-    if configured is not None:
-        raw = configured
+
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    defaults = DEFAULT_CONFIG.get("kanban")
+    merged: dict[str, object] = dict(defaults) if isinstance(defaults, dict) else {}
+    merged.update(configured)
+    return authority_root, merged
+
+
+def _configured_board_profiles(
+    conn: sqlite3.Connection,
+    key: str,
+    default: object,
+) -> tuple[str, ...]:
+    """Read a profile allowlist from the config bound to ``conn``'s board.
+
+    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
+    policy. The opened SQLite path resolves the canonical root. A present but
+    malformed config is an enforcement error, never an empty allowlist that
+    disables the fence.
+    """
+
+    _authority_root, kanban_config = _configured_kanban_policy(conn)
+    raw = kanban_config.get(key, default)
     if isinstance(raw, str):
         raw = raw.split(",")
     if not isinstance(raw, (list, tuple)):
@@ -1775,6 +1789,25 @@ def _authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
     return _configured_board_profiles(conn, "authority_profiles", default)
 
 
+def assignment_authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Return the explicit non-spawnable authority allowlist for this board."""
+
+    return _authority_profiles(conn)
+
+
+def lane_eligibility_policy(conn: sqlite3.Connection) -> LaneEligibilityPolicy:
+    """Return the fail-closed lane policy bound to this board connection."""
+
+    authority_root, kanban_config = _configured_kanban_policy(conn)
+    try:
+        return lane_eligibility_policy_from_config(
+            kanban_config,
+            authority_root=authority_root,
+        )
+    except ValueError as exc:
+        raise AssignmentPolicyConfigError(str(exc)) from exc
+
+
 def _assignment_guard_reason(
     conn: sqlite3.Connection,
     *,
@@ -1789,18 +1822,20 @@ def _assignment_guard_reason(
     old_assignee: Optional[str] = None,
     old_status: Optional[str] = None,
 ) -> Optional[str]:
+    authorities = _authority_profiles(conn)
     return _pure_assignment_guard_reason(
         title=title,
         body=body,
         assignee=assignee,
         status=status,
-        authority_profiles=_authority_profiles(conn),
+        authority_profiles=authorities,
         has_open_parent=has_open_parent,
         task_id=task_id,
         old_title=old_title,
         old_body=old_body,
         old_assignee=old_assignee,
         old_status=old_status,
+        lane_policy=lane_eligibility_policy(conn),
     )
 
 
@@ -1884,12 +1919,13 @@ def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
             conn.rollback()
         raise
 
-    if _authority_profiles(conn):
+    if _authority_profiles(conn) or lane_eligibility_policy(conn).enabled:
         return
 
-    # A valid empty authority allowlist intentionally disables the fence. Drop
-    # both triggers atomically only after configuration parsed successfully,
-    # preserving legacy raw-SQL compatibility for installations not opted in.
+    # Valid empty authority and lane-health policies intentionally disable the
+    # fence. Drop both triggers atomically only after configuration parsed
+    # successfully, preserving legacy raw-SQL compatibility for installations
+    # not opted in.
     try:
         conn.executescript(
             "BEGIN IMMEDIATE;"
@@ -9675,6 +9711,12 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_lane_ineligible: list[tuple[str, str, str]] = field(default_factory=list)
+    """Ready tasks fenced before claim as ``(task_id, assignee, reason)``.
+
+    This is a hard no-spawn outcome backed by the same assignment policy used
+    by typed APIs and SQLite triggers; reasons include the lane name so daemon
+    and CLI receipts are actionable without another board query."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred because their assignee owns another active card.
 
@@ -13080,6 +13122,28 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+
+        candidate_task = get_task(conn, row["id"])
+        if candidate_task is None:
+            continue
+        lane_denial = _assignment_guard_reason(
+            conn,
+            title=candidate_task.title,
+            body=candidate_task.body,
+            assignee=row_assignee,
+            status="ready",
+            has_open_parent=_task_has_open_parent(conn, row["id"]),
+            task_id=row["id"],
+            old_title=candidate_task.title,
+            old_body=candidate_task.body,
+            old_assignee=candidate_task.assignee,
+            old_status=candidate_task.status,
+        )
+        if lane_denial:
+            result.skipped_lane_ineligible.append(
+                (row["id"], row_assignee, lane_denial)
+            )
+            continue
         # Spawn only through the canonical target predicate.  A target is either
         # a local profile or the configured attached-SSH VPS2 transport; terminal
         # control-plane lanes remain nonspawnable and pull claims themselves.

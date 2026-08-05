@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
+from hermes_cli.kanban_assignment_policy import LaneEligibilityPolicy
 
 
 @pytest.fixture
@@ -99,6 +101,47 @@ def test_roster_includes_profile_provider_and_model_defaults(kanban_home):
     assert roster[0]["model"] == "m"
     rendered = decomp._format_roster(roster)
     assert "profile defaults: provider=p, model=m" in rendered
+
+
+def test_roster_excludes_dead_and_derostered_but_adds_receipted_remote(
+    kanban_home,
+    tmp_path,
+):
+    receipts = tmp_path / "lane-health"
+    receipts.mkdir()
+    now = datetime.now(timezone.utc)
+    fresh = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = (now - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (receipts / "codex1.env").write_text(
+        f"LANE_OK=true\nPROBED_AT={fresh}\n", encoding="utf-8"
+    )
+    (receipts / "vps2-eng1.env").write_text(
+        f"status=LANE_OK\nprobed_at={fresh}\n", encoding="utf-8"
+    )
+    (receipts / "stale1.env").write_text(
+        f"LANE_OK=true\nPROBED_AT={stale}\n", encoding="utf-8"
+    )
+    (receipts / "kimi1.env").write_text(
+        f"LANE_OK=true\nPROBED_AT={fresh}\n", encoding="utf-8"
+    )
+    policy = LaneEligibilityPolicy(
+        receipt_dir=receipts,
+        de_rostered_prefixes=("kimi",),
+    )
+    patches = _patch_list_profiles(["codex1", "stale1", "kimi1", "fable"])
+    for item in patches:
+        item.start()
+    try:
+        roster, valid_names = decomp._build_roster(
+            lane_policy=policy,
+            authority_profiles=("fable",),
+        )
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert valid_names == {"codex1", "vps2-eng1"}
+    assert {entry["name"] for entry in roster} == valid_names
 
 
 def test_completed_run_for_retired_profile_does_not_grant_authority(kanban_home):

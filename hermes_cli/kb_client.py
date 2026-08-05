@@ -213,6 +213,14 @@ class Client:
             "id": id}, mutation=True,
             op_id=op_id)["result"]
 
+    def assign_task(self, task_id, assignee, *, op_id=None):
+        return self._request(
+            "assign_task",
+            {"task_id": task_id, "assignee": assignee},
+            mutation=True,
+            op_id=op_id,
+        )["result"]
+
     def add_comment(self, task_id, author, body, *, op_id=None):
         return self._request("add_comment",
                              {"task_id": task_id, "author": author, "body": body},

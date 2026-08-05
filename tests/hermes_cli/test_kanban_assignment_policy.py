@@ -5,14 +5,19 @@ from __future__ import annotations
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_assignment_policy import (
+    LaneEligibilityPolicy,
     assignment_guard_reason,
     is_nonspawnable_contract,
+    lane_eligibility_reason,
+    lane_eligibility_policy_from_config,
+    receipted_lane_names,
 )
 
 
@@ -934,3 +939,168 @@ def test_decompose_partial_graph_is_invisible_to_concurrent_reader(
     assert child_ids is not None
     assert len(child_ids) == 2
     assert _must_get(conn, child_ids[1]).assignee == "fable"
+
+
+def _write_lane_receipt(
+    receipt_dir: Path,
+    profile: str,
+    *,
+    probed_at: datetime,
+    uppercase: bool = True,
+) -> None:
+    stamp = probed_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if uppercase:
+        content = f"LANE_OK=true\nPROBED_AT={stamp}\nPROVIDER=test\n"
+    else:
+        content = f"status=LANE_OK\nprobed_at={stamp}\nprovider=test\n"
+    (receipt_dir / f"{profile}.env").write_text(content, encoding="utf-8")
+
+
+@pytest.fixture
+def lane_guarded_board(tmp_path: Path):
+    root = tmp_path / ".hermes"
+    receipts = root / "lane-health"
+    receipts.mkdir(parents=True)
+    config_path = root / "config.yaml"
+    config_path.write_text(
+        "kanban:\n"
+        "  authority_profiles: fable\n"
+        f"  lane_health_receipts_dir: {receipts}\n"
+        "  lane_health_max_age_seconds: 86400\n"
+        "  de_rostered_profile_prefixes: kimi\n",
+        encoding="utf-8",
+    )
+    now = datetime.now(timezone.utc)
+    _write_lane_receipt(receipts, "codex1", probed_at=now)
+    db_path = root / "kanban.db"
+    conn = kb.connect(db_path)
+    try:
+        yield conn, receipts, config_path, db_path
+    finally:
+        conn.close()
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+
+def test_lane_receipts_support_deployed_and_legacy_formats(tmp_path: Path):
+    receipts = tmp_path / "lane-health"
+    receipts.mkdir()
+    observed_at = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+    _write_lane_receipt(receipts, "codex1", probed_at=observed_at)
+    _write_lane_receipt(
+        receipts,
+        "vps2-eng1",
+        probed_at=observed_at - timedelta(hours=23),
+        uppercase=False,
+    )
+    _write_lane_receipt(
+        receipts,
+        "stale1",
+        probed_at=observed_at - timedelta(hours=25),
+    )
+    _write_lane_receipt(receipts, "kimi1", probed_at=observed_at)
+    policy = LaneEligibilityPolicy(
+        receipt_dir=receipts,
+        de_rostered_prefixes=("kimi",),
+    )
+
+    assert lane_eligibility_reason("codex1", policy=policy, now=observed_at) is None
+    assert lane_eligibility_reason("vps2-eng1", policy=policy, now=observed_at) is None
+    assert lane_eligibility_reason("missing1", policy=policy, now=observed_at) == (
+        "lane_health_receipt_missing:missing1"
+    )
+    assert lane_eligibility_reason("stale1", policy=policy, now=observed_at) == (
+        "lane_health_receipt_stale:stale1"
+    )
+    assert lane_eligibility_reason("kimi1", policy=policy, now=observed_at) == (
+        "lane_derostered:kimi1"
+    )
+    assert receipted_lane_names(policy, now=observed_at) == {"codex1", "vps2-eng1"}
+
+
+def test_lane_policy_rejects_config_that_weakens_24_hour_boundary(tmp_path: Path):
+    with pytest.raises(ValueError, match="between 1 and 86400"):
+        lane_eligibility_policy_from_config(
+            {"lane_health_max_age_seconds": 86401},
+            authority_root=tmp_path,
+        )
+
+
+def test_typed_create_reassign_and_raw_sql_share_lane_guard(lane_guarded_board):
+    conn, receipts, _config_path, _db_path = lane_guarded_board
+    before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(ValueError, match="lane_derostered:kimi1"):
+        kb.create_task(
+            conn,
+            title="[AUTHOR] exact dead-lane bypass",
+            assignee="kimi1",
+        )
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+    healthy_id = kb.create_task(
+        conn,
+        title="[AUTHOR] healthy positive control",
+        assignee="codex1",
+    )
+    assert _must_get(conn, healthy_id).assignee == "codex1"
+
+    _write_lane_receipt(
+        receipts,
+        "grok1",
+        probed_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+    with pytest.raises(ValueError, match="lane_health_receipt_stale:grok1"):
+        kb.assign_task(conn, healthy_id, "grok1")
+    assert _must_get(conn, healthy_id).assignee == "codex1"
+
+    with pytest.raises(sqlite3.IntegrityError, match="assignment policy"):
+        conn.execute(
+            "UPDATE tasks SET assignee='kimi1' WHERE id=?",
+            (healthy_id,),
+        )
+    assert _must_get(conn, healthy_id).assignee == "codex1"
+
+    authority_id = kb.create_task(
+        conn,
+        title="[FABLE][LIVE-APPLY] operator-only cutover",
+        body="NONSPAWNABLE; Fable is sole lander.",
+        assignee="fable",
+        initial_status="blocked",
+    )
+    assert _must_get(conn, authority_id).assignee == "fable"
+
+
+def test_stale_ready_lane_is_fenced_before_claim_or_spawn(lane_guarded_board):
+    conn, receipts, _config_path, _db_path = lane_guarded_board
+    task_id = kb.create_task(
+        conn,
+        title="[AUTHOR] stale lane must never spawn",
+        assignee="codex1",
+    )
+    _write_lane_receipt(
+        receipts,
+        "codex1",
+        probed_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+    spawn_calls: list[str] = []
+
+    def forbidden_spawn(task, workspace):
+        spawn_calls.append(task.id)
+        raise AssertionError("stale lane reached spawn_fn")
+
+    result = kb.dispatch_once(conn, spawn_fn=forbidden_spawn)
+
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert result.skipped_lane_ineligible == [
+        (task_id, "codex1", "lane_health_receipt_stale:codex1")
+    ]
+    row = conn.execute(
+        "SELECT status, current_run_id, worker_pid FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    assert dict(row) == {"status": "ready", "current_run_id": None, "worker_pid": None}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0] == 0

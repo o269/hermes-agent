@@ -2950,6 +2950,13 @@ DEFAULT_CONFIG = {
         # legacy behavior. Comma-delimited for `hermes config set` parity; YAML
         # lists are accepted by the reader too.
         "authority_profiles": "",
+        # Optional centralized executor-lane proof gate. When a receipt directory
+        # is configured, every non-authority assignee needs a fresh LANE_OK
+        # receipt. Prefixes can immediately de-roster a provider family.
+        "lane_health_receipts_dir": "",
+        "lane_health_max_age_seconds": 86400,
+        "lane_health_future_skew_seconds": 300,
+        "de_rostered_profile_prefixes": "",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
