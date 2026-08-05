@@ -533,9 +533,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- guarded one-shot active-PR continuation ---
     p_continuation = sub.add_parser(
         "continuation",
-        help="Authorize/read one-shot repair continuation for exact active PR heads",
+        help="Review, authorize, or resume guarded active-PR repair work",
         description=(
-            "Review/authorize are control-plane mutations: invoke them as "
+            "Review/authorize/resume are control-plane mutations: invoke them as "
             "/kanban commands through the live root gateway. Direct shell, "
             "TUI slash-worker, and Kanban worker processes fail closed."
         ),
@@ -594,6 +594,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Non-empty review rationale stored in the task event ledger",
     )
     p_cont_review.add_argument("--json", action="store_true")
+    p_cont_resume = continuation_sub.add_parser(
+        "resume",
+        help="Mint one Fable-owned marker for the existing assignee's next claim",
+    )
+    p_cont_resume.add_argument("task_id")
+    p_cont_resume.add_argument(
+        "--reason",
+        required=True,
+        help="Non-empty operator rationale stored in the task event ledger",
+    )
+    p_cont_resume.add_argument("--json", action="store_true")
     p_cont_show = continuation_sub.add_parser(
         "show",
         aliases=["status"],
@@ -1957,7 +1968,7 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_continuation(args: argparse.Namespace) -> int:
-    """Authorize or read exact one-shot active-PR continuation grants."""
+    """Review, authorize, resume, or read guarded active-PR continuation state."""
     action = getattr(args, "continuation_action", None)
     if action == "review":
         with kb.connect_closing() as conn:
@@ -2009,6 +2020,26 @@ def _cmd_continuation(args: argparse.Namespace) -> int:
                 print(f"PR: {pr.tuple_text}")
         return 0
 
+    if action == "resume":
+        with kb.connect_closing() as conn:
+            event_id = kb.add_resume_marker(
+                conn,
+                args.task_id,
+                actor="fable",
+                reason=args.reason,
+            )
+        payload = {
+            "event_id": event_id,
+            "task_id": args.task_id,
+            "actor": "fable",
+            "reason": args.reason.strip(),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Recorded one-shot resume marker {event_id} for {args.task_id}")
+        return 0
+
     if action in {"show", "status"}:
         now = int(time.time())
         with kb.connect_closing() as conn:
@@ -2042,7 +2073,7 @@ def _cmd_continuation(args: argparse.Namespace) -> int:
         return 0
 
     print(
-        "usage: hermes kanban continuation <review|authorize|show> ...",
+        "usage: hermes kanban continuation <review|authorize|resume|show> ...",
         file=sys.stderr,
     )
     return 2
@@ -3189,7 +3220,7 @@ Common subcommands:
   `log <id>`            Worker log
   `decompose <id>`      Fan a triage task into dependency-gated child tasks
   `gate <id> <keyword>` Mark a control-plane gate without changing custody
-  `continuation …`      Review/authorize an exact-head active-PR repair
+  `continuation …`      Review/authorize/resume guarded active-PR repair work
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

@@ -286,6 +286,75 @@ def test_run_slash_continuation_repeated_prs_and_consumed_readback(
     assert history[0]["expires_at"] > history[0]["created_at"]
 
 
+def test_run_slash_continuation_resume_mints_one_shot_marker(
+    kanban_home, monkeypatch
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  continuation_operator_profiles: fable\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kb, "_operator_control_plane_active", lambda: True)
+    monkeypatch.setattr(kb, "_operator_gateway_lock_owned", lambda _root: True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "fable")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume repair", assignee="engineer")
+        kb.add_comment(
+            conn,
+            task_id,
+            "engineer",
+            "Opened https://github.com/o269/hermes-agent/pull/34",
+        )
+
+    resumed = json.loads(
+        kc.run_slash(
+            f"continuation resume {task_id} "
+            "--reason 'continue exact reviewed head' --json"
+        )
+    )
+    assert resumed["task_id"] == task_id
+    assert resumed["actor"] == "fable"
+    assert resumed["reason"] == "continue exact reviewed head"
+
+    with kb.connect() as conn:
+        marker = next(
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.id == resumed["event_id"]
+        )
+    assert marker.kind == "resume_marker"
+    assert marker.payload is not None
+    assert marker.payload["authorized_by"] == "fable"
+    assert marker.payload["authorized_profile"] == "engineer"
+
+    assert "Claimed" in kc.run_slash(f"claim {task_id}")
+    with kb.connect() as conn:
+        assert any(
+            event.kind == "resume_marker_consumed"
+            and (event.payload or {}).get("marker_event_id") == resumed["event_id"]
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_run_slash_continuation_resume_fails_outside_root_gateway(
+    kanban_home, monkeypatch
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kb, "_operator_control_plane_active", lambda: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reject direct resume", assignee="engineer")
+
+    out = kc.run_slash(
+        f"continuation resume {task_id} --reason 'direct shell must fail closed'"
+    )
+
+    assert "operator gateway context required" in out
+    with kb.connect() as conn:
+        assert not any(
+            event.kind == "resume_marker" for event in kb.list_events(conn, task_id)
+        )
+
+
 def test_run_slash_operator_claim_override_is_supported(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setattr(
@@ -934,6 +1003,25 @@ def test_run_slash_continuation_review_rejects_invisible_reason(kanban_home, inv
     with kb.connect() as conn:
         events = kb.list_events(conn, task_id)
         assert not [e for e in events if e.kind == "continuation_reviewed"]
+
+
+@pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
+def test_run_slash_continuation_resume_rejects_invisible_reason(kanban_home, invisible):
+    import re
+
+    out = kc.run_slash("create 'invisible resume' --assignee engineer")
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    task_id = match.group(1)
+
+    out = kc.run_slash(
+        f"continuation resume {task_id} --reason '{invisible}'"
+    )
+
+    assert "resume marker reason required" in out
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id)
+        assert not [e for e in events if e.kind == "resume_marker"]
 
 
 @pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
