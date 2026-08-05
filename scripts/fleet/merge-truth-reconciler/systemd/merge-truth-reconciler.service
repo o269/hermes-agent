@@ -1,0 +1,32 @@
+[Unit]
+Description=Fleet merge-truth gate reconciler
+Documentation=file://%h/.local/lib/merge-truth-reconciler/docs/merge-truth-reconciler-runbook.md
+ConditionPathExists=%h/.local/lib/merge-truth-reconciler/merge_truth_reconciler.py
+ConditionPathExists=%h/.local/lib/merge-truth-reconciler/merge_truth_board_helper.py
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/lib/hermes-agent
+Environment=HERMES_KANBAN_BROKER=1
+Environment=BOARDD_SOCK=/run/boardd/boardd.sock
+EnvironmentFile=-%h/.config/merge-truth-reconciler.env
+ExecStart=/usr/bin/python3 %h/.local/lib/merge-truth-reconciler/merge_truth_reconciler.py
+TimeoutStartSec=90
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/merge-truth-reconciler
+ReadWritePaths=%h/godmode-bus/artifacts/merge-truth-reconciler
+ReadWritePaths=%h/godmode-bus/to-claude
+ReadWritePaths=%h/godmode-bus/STATUS-TICKER.md
+# boardd UDS + GitHub HTTPS
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

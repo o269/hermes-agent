@@ -1,0 +1,13 @@
+[Unit]
+Description=Run fleet merge-truth reconciliation every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=1s
+RandomizedDelaySec=3s
+Persistent=true
+Unit=merge-truth-reconciler.service
+
+[Install]
+WantedBy=timers.target
