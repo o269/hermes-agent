@@ -1876,7 +1876,7 @@ def _create_continuation_task(
     task_id = kb.create_task(conn, title="repair active PR", assignee=assignee)
     for raw in pr_tuples:
         pr = kb.parse_continuation_pr_tuple(raw)
-        kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+        kb.add_comment(conn, task_id, assignee, f"Opened {pr.canonical_url}")
     kb.record_continuation_review(
         conn,
         task_id,
@@ -2017,7 +2017,7 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
@@ -2371,24 +2371,177 @@ def test_respawn_guard_keeps_active_pr_for_own_declared_pr(kanban_home):
         assert kb.check_respawn_guard(conn, mine) == "active_pr"
 
 
-def test_respawn_guard_keeps_active_pr_when_nobody_declared_it(kanban_home):
-    """Comment-only handoffs stay guarded — no card declared the PR anywhere.
-
-    This is the common legacy shape ("PR opened: <url>" posted as a comment and
-    never mirrored into a run summary). Dropping the guard here would have
-    reintroduced duplicate PRs, so the conservative default is preserved.
-    """
+def test_referenced_only_pr_never_blocks_direct_claim(kanban_home):
+    """Reference-only custody is always disowned, even without another owner."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="comment-only handoff", assignee="alice")
-        kb.add_comment(conn, t, "worker", f"PR opened: {_OWN_PR}")
-        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        kb.add_comment(conn, t, "reviewer", f"Related PR: {_OWN_PR}")
+
+        owned, disowned = kb._active_pr_candidates(
+            conn,
+            t,
+            cutoff=int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW,
+        )
+
+        assert owned == ()
+        assert len(disowned) == 1
+        assert disowned[0]["ownership"] == "referenced"
+        assert "declared_by" not in disowned[0]
+        assert kb.check_respawn_guard(conn, t) is None
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.status == "running"
+
+
+def test_declared_active_pr_still_rejects_claim_without_resume_marker(kanban_home):
+    """The duplicate-writer guard remains closed for the card's own open PR."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="own PR", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.claim_task(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_declared_active_pr_resume_marker_claims_once_and_is_consumed(
+    kanban_home, monkeypatch
+):
+    """A Fable marker lets the existing owner resume and is consumed atomically."""
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("fable",), None),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume own PR", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
+        marker_id = kb.add_resume_marker(
+            conn,
+            task_id,
+            actor="fable",
+            reason="author has approved follow-up work",
+        )
+        marker = next(
+            event for event in kb.list_events(conn, task_id) if event.id == marker_id
+        )
+        assert marker.kind == "resume_marker"
+        assert marker.payload == {
+            "actor": "fable",
+            "authorized_by": "fable",
+            "authorized_profile": "alice",
+            "assignment_generation": 0,
+            "reason": "author has approved follow-up work",
+        }
+
+        decision = kb.evaluate_respawn_guard(conn, task_id)
+        assert decision.reason is None
+        assert decision.resume_marker_id == marker_id
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert claimed.status == "running"
+
+        consumed = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "resume_marker_consumed"
+        ]
+        assert len(consumed) == 1
+        assert consumed[0].payload == {
+            "marker_event_id": marker_id,
+            "run_id": claimed.current_run_id,
+        }
+        assert consumed[0].run_id == claimed.current_run_id
+
+
+def test_resume_marker_cannot_spawn_twice(kanban_home, monkeypatch):
+    """Reclaiming the first run does not make its consumed marker reusable."""
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("fable",), None),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="single-use marker", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
+        marker_id = kb.add_resume_marker(
+            conn,
+            task_id,
+            actor="fable",
+            reason="one repair attempt",
+        )
+
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        assert kb.reclaim_task(conn, task_id, reason="test first run ended")
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.claim_task(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        consumed = [
+            event.payload
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "resume_marker_consumed"
+        ]
+        assert consumed == [
+            {"marker_event_id": marker_id, "run_id": first.current_run_id}
+        ]
+
+
+def test_resume_marker_requires_operator_context_and_stays_with_owner(
+    kanban_home, monkeypatch
+):
+    """Workers cannot self-mint markers and reassignment invalidates old intent."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner-bound marker", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", f"Opened {_OWN_PR}")
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), "t_worker"),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as denied:
+            kb.add_resume_marker(
+                conn,
+                task_id,
+                actor="fable",
+                reason="worker must not mint this",
+            )
+        assert denied.value.code == "worker_authorization_forbidden"
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), None),
+        )
+        marker_id = kb.add_resume_marker(
+            conn,
+            task_id,
+            actor="fable",
+            reason="resume alice's existing work",
+        )
+        assert kb.assign_task(conn, task_id, "bob")
+
+        assert kb.evaluate_respawn_guard(conn, task_id).reason == "active_pr"
+        assert kb.claim_task(conn, task_id) is None
+        assert not any(
+            event.kind == "resume_marker_consumed"
+            and event.payload is not None
+            and event.payload.get("marker_event_id") == marker_id
+            for event in kb.list_events(conn, task_id)
+        )
 
 
 def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):
     """A suppressed respawn must be diagnosable without reading the DB."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="comment-only handoff", assignee="alice")
-        comment_id = kb.add_comment(conn, t, "worker", f"PR opened: {_OWN_PR}")
+        comment_id = kb.add_comment(conn, t, "alice", f"PR opened: {_OWN_PR}")
         decision = kb.evaluate_respawn_guard(conn, t)
         assert decision.reason == "active_pr"
         kb.record_respawn_guard_decision(conn, t, decision)
@@ -2399,9 +2552,10 @@ def test_respawn_guarded_event_names_the_pr_and_its_expiry(kanban_home):
         ][-1]
 
     payload = guarded.payload
+    assert payload is not None
     assert payload["reason"] == "active_pr"
     assert payload["pr_url"] == _OWN_PR
-    assert payload["ownership"] == "referenced"
+    assert payload["ownership"] == "declared"
     assert payload["source_comment_id"] == comment_id
     assert payload["expires_at"] > int(time.time())
     assert payload["window_seconds"] == kb._RESPAWN_GUARD_PR_WINDOW
@@ -3172,7 +3326,7 @@ def test_continuation_review_events_are_authoritative_across_operators(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="cross-review", assignee="engineer")
         pr = kb.parse_continuation_pr_tuple(first)
-        kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+        kb.add_comment(conn, task_id, "engineer", f"Opened {pr.canonical_url}")
 
         monkeypatch.setattr(
             kb,
@@ -4392,7 +4546,7 @@ def test_continuation_duplicate_card_pr_owner_fails_closed(
         _authorize_continuation(conn, task_id, pr_tuple)
         duplicate_id = kb.create_task(conn, title="duplicate", assignee="security")
         pr = kb.parse_continuation_pr_tuple(pr_tuple)
-        kb.add_comment(conn, duplicate_id, "worker", f"Also owns {pr.canonical_url}")
+        kb.add_comment(conn, duplicate_id, "security", f"Also owns {pr.canonical_url}")
         result = kb.dispatch_once(
             conn,
             spawn_fn=lambda _task, _workspace: None,
@@ -4756,7 +4910,7 @@ def test_dispatch_respawn_guard_skips_active_pr(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)

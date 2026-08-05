@@ -257,7 +257,7 @@ def test_run_slash_continuation_repeated_prs_and_consumed_readback(
         task_id = kb.create_task(conn, title="repair", assignee="engineer")
         for raw in (pr_a, pr_b):
             pr = kb.parse_continuation_pr_tuple(raw)
-            kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+            kb.add_comment(conn, task_id, "engineer", f"Opened {pr.canonical_url}")
 
     reviewed = json.loads(
         kc.run_slash(
