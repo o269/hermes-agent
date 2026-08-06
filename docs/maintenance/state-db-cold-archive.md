@@ -19,7 +19,8 @@ The workflow has separate custody phases:
 - The command never installs a candidate over an active database. Fable is the sole cutover/landing operator.
 - A producer stage must not exist. Existing paths, modes, files, symlinks, and sentinels are refused rather than chmodded, repaired, resumed, or overwritten.
 - Apply accepts only an existing mode-0700 stage with mode-0600 regular artifacts
-  and external exact-byte manifest and producer-receipt SHA-256 approvals.
+  and current-user-owned, single-link, mode-0400 approval copies outside the stage,
+  each accompanied by its exact-byte SHA-256.
 
 ## Required candidate schema and policy
 
@@ -76,15 +77,22 @@ hermes sessions cold-archive \
 
 The producer creates and verifies, in order:
 
-1. an exact local rollback source bundle containing the database and every present `-wal`, `-shm`, and `-journal` sidecar plus a per-member hash manifest;
+1. an exact local rollback source bundle using bounded member names `state.db`,
+   `state.db-wal`, `state.db-shm`, and `state.db-journal` for the database and every
+   present sidecar, plus a per-member hash manifest;
 2. restricted, redacted QMD under safe collision-resistant basenames that cannot escape `cold-qmd/`;
 3. `ROLLBACK-SOURCE-BUNDLE.tar.gz.age`, an opaque encrypted rollback packet;
 4. `RESTRICTED-COLD-QMD.tar.gz.age`, one opaque encrypted packet containing exact IDs, the parent map, QMD, and a file/hash index;
 5. both encrypted packets uploaded, checksum-checked, and exactly read back;
 6. the clear redacted `GATE-B-MANIFEST.json` uploaded last as the sole clear commit marker.
 
-No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Remote operations are limited to immutable/no-clobber `rclone copyto`,
-`rclone check --checksum --one-way`, and exact readback. There is no remote delete, sync, purge, dedupe, move, cleanup, or retention verb.
+No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Uploads use directory-targeted `rclone copy --immutable`
+(not `copyto`, which can replace a destination on supported backends), followed by
+`rclone check --checksum --one-way` and exact `copyto` readback. There is no remote
+delete, sync, purge, dedupe, move, cleanup, or retention verb. The age recipient is
+read once into `restricted/AGE-RECIPIENTS.txt`; rclone config bytes are copied once
+into a private per-operation temporary snapshot. Every subprocess uses only those
+frozen bytes, and their hashes are rechecked around use.
 
 The private age identity must never be stored in the repository, bus, board, stage, or runtime path.
 
@@ -94,9 +102,9 @@ Fable/operator must freeze exact copies of the manifest and final producer recei
 outside the mutable stage and record both hashes:
 
 ```bash
-install -m 0600 /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json \
+install -m 0400 /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json \
   /secure/hermes-state-approvals/GATE-B-MANIFEST.json
-install -m 0600 /secure/hermes-state-archive/<producer>/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
+install -m 0400 /secure/hermes-state-archive/<producer>/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
   /secure/hermes-state-approvals/COLD-ARCHIVE-PRODUCER-RECEIPT.json
 sha256sum /secure/hermes-state-approvals/{GATE-B-MANIFEST,COLD-ARCHIVE-PRODUCER-RECEIPT}.json
 ```
@@ -146,7 +154,8 @@ without deleting again. Existing receipts are never clobbered.
 1. verify the tar SHA-256 from `COLD-ARCHIVE-PRODUCER-RECEIPT.json`;
 2. read `ROLLBACK-BUNDLE-MANIFEST.json` from the tar without unsafe `extractall`;
 3. verify every member basename, byte count, SHA-256, and private mode;
-4. restore the main database plus every copied sidecar under matching basenames;
+4. restore `state.db` as the main database and append each copied fixed suffix
+   (`-wal`, `-shm`, `-journal`) to the chosen restore basename;
 5. open the restored database and require `PRAGMA integrity_check` exactly `ok`, zero foreign-key rows, and logical selected/dependent row parity.
 
 If a candidate has already served new sessions, preserve both the failed candidate and rollback bundle, then stop for an operator decision on delta recovery instead of blindly discarding new rows.
@@ -190,7 +199,8 @@ Before the exact boundary, or forever without a cutover marker, it deletes nothi
 It first fsyncs `SOURCE-BUNDLE-PRUNE-PREPARED.json` with exact member hashes, then
 removes the plaintext members and exclusively creates `SOURCE-BUNDLE-PRUNED.json`.
 Replay recovers from any already-deleted prepared member, so a final-receipt crash is
-idempotent. It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD,
+idempotent. Replay also revalidates the complete cutover/retention/prepare binding and
+fails closed if either plaintext bundle artifact reappears. It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD,
 producer/retention receipts, and every remote object. Marker/hash tampering, missing
 freshly verified remote custody, non-finite/rolled-back clocks, or missing
 candidate-health confirmation fails closed.

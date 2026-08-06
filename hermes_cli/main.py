@@ -15145,7 +15145,7 @@ def main():
                     )
             except ColdArchiveError as exc:
                 print(f"Error: cold archive lifecycle failed closed: {exc}")
-                return 1
+                raise SystemExit(1) from exc
             print(_json.dumps(result, indent=2, sort_keys=True))
             return 0
 
@@ -15192,7 +15192,7 @@ def main():
                 )
             except ColdArchiveError as exc:
                 print(f"Error: cold archive failed closed: {exc}")
-                return 1
+                raise SystemExit(1) from exc
             public_receipt = dict(receipt)
             public_receipt.pop("source_db", None)
             public_receipt.pop("stage_root", None)

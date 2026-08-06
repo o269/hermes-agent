@@ -195,7 +195,7 @@ class FakeRclone:
             step = "check"
         elif verb == "copyto" and source in self.remote:
             step = "readback"
-        elif verb == "copyto":
+        elif verb == "copy":
             step = "upload"
         else:
             raise AssertionError(command)
@@ -206,9 +206,10 @@ class FakeRclone:
             return subprocess.CompletedProcess(command, 1, "", f"forced {step} failure")
         if step == "upload":
             self.upload_count += 1
+            remote_object = destination.rstrip("/") + "/" + Path(source).name
             if self.preexisting_upload_index == self.upload_count:
-                self.remote.setdefault(destination, b"PREEXISTING-REMOTE-OBJECT")
-            if "--immutable" in command and destination in self.remote:
+                self.remote.setdefault(remote_object, b"PREEXISTING-REMOTE-OBJECT")
+            if "--immutable" in command and remote_object in self.remote:
                 return subprocess.CompletedProcess(
                     command, 1, "", "immutable destination already exists"
                 )
@@ -217,7 +218,7 @@ class FakeRclone:
                 data = data[:-1]
             elif self.corrupt_same_size and data:
                 data = bytes([data[0] ^ 0x01]) + data[1:]
-            self.remote[destination] = data
+            self.remote[remote_object] = data
         elif step == "check":
             expected = Path(source).read_bytes()
             success = self.lie_on_check or self.remote.get(destination) == expected
@@ -264,27 +265,49 @@ def _apply(
     producer_receipt: dict[str, Any],
     fake: FakeRclone,
 ) -> dict[str, Any]:
+    approved_manifest = stage.parent / f"{stage.name}-APPROVED-GATE-B-MANIFEST.json"
+    approved_producer = stage.parent / f"{stage.name}-APPROVED-PRODUCER-RECEIPT.json"
+    if not approved_manifest.exists():
+        approved_manifest.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+        os.chmod(approved_manifest, 0o400)
+    if not approved_producer.exists():
+        approved_producer.write_bytes(
+            (stage / "COLD-ARCHIVE-PRODUCER-RECEIPT.json").read_bytes()
+        )
+        os.chmod(approved_producer, 0o400)
     return cold.run_cold_archive_pass(
         source_db=db_path,
         stage_root=stage,
         apply_retention=True,
-        approved_manifest_path=stage / "GATE-B-MANIFEST.json",
+        approved_manifest_path=approved_manifest,
         approved_manifest_sha256=producer_receipt["manifest_file_sha256"],
-        approved_producer_receipt_path=stage
-        / "COLD-ARCHIVE-PRODUCER-RECEIPT.json",
+        approved_producer_receipt_path=approved_producer,
         approved_producer_receipt_sha256=producer_receipt["receipt_sha256"],
         rclone_config=config,
         rclone_runner=fake,
     )
 
 
-def test_current_fork_schema_without_pin_and_activity_fails_closed(
+@pytest.mark.parametrize(
+    ("present_column", "definition", "missing_column"),
+    [
+        ("pinned", "INTEGER", "last_activity_at"),
+        ("last_activity_at", "REAL", "pinned"),
+    ],
+)
+def test_each_required_canonical_policy_column_fails_closed_when_missing(
     tmp_path: Path,
+    present_column: str,
+    definition: str,
+    missing_column: str,
 ) -> None:
-    db_path = tmp_path / "current.db"
+    db_path = tmp_path / f"missing-{missing_column}.db"
     db = _build_current_db(db_path)
     try:
         db.create_session(session_id="old", source="cli")
+        db._conn.execute(
+            f'ALTER TABLE sessions ADD COLUMN "{present_column}" {definition}'
+        )
         db._conn.execute(
             "UPDATE sessions SET archived=1, ended_at=?, started_at=? WHERE id='old'",
             (NOW - 80 * DAY, NOW - 80 * DAY),
@@ -294,7 +317,7 @@ def test_current_fork_schema_without_pin_and_activity_fails_closed(
         db.close()
 
     with pytest.raises(
-        ColdArchiveError, match="missing sessions columns: last_activity_at, pinned"
+        ColdArchiveError, match=rf"missing sessions columns: {missing_column}"
     ):
         cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
 
@@ -336,9 +359,7 @@ def test_apply_deletes_exact_37_day_boundary_but_not_one_second_inside(
             days_ago=37 - 1 / DAY,
             content="insideboundarytoken",
         )
-        _make_session(
-            db, "exact-boundary", days_ago=37, content="exactboundarytoken"
-        )
+        _make_session(db, "exact-boundary", days_ago=37, content="exactboundarytoken")
         _make_session(
             db,
             "outside-by-one",
@@ -386,6 +407,29 @@ def test_null_canonical_activity_or_pin_state_is_not_selectable(tmp_path: Path) 
         "canonical_last_activity_unprovable": 1,
         "pin_state_unprovable": 1,
     }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE sessions SET last_activity_at='NaN' WHERE id='bad-activity'",
+        "UPDATE messages SET timestamp='Infinity' WHERE session_id='bad-activity'",
+    ],
+)
+def test_nonfinite_canonical_activity_fails_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "bad-activity", days_ago=80, content="cold")
+        db._conn.execute(mutation)
+        db._conn.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(ColdArchiveError, match="must be a finite number"):
+        cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
 
 
 def test_rejects_default_named_profile_and_sidecar_hardlink_aliases(
@@ -512,8 +556,7 @@ def test_remote_publish_is_two_opaque_age_packets_then_only_clear_manifest(
         "RESTRICTED-COLD-QMD.tar.gz.age",
         "GATE-B-MANIFEST.json",
     ]
-    remote_names = [command[3].rsplit("/", 1)[-1] for command in uploads]
-    assert remote_names == [
+    assert [Path(report["remote"]).name for report in receipt["remote_publish"]] == [
         "ROLLBACK-SOURCE-BUNDLE.tar.gz.age",
         "RESTRICTED-COLD-QMD.tar.gz.age",
         "GATE-B-MANIFEST.json",
@@ -776,6 +819,12 @@ def test_rollback_bundle_restores_exact_pre_retention_state(tmp_path: Path) -> N
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
     bundle_path = Path(producer["rollback_bundle"]["path"])
     assert producer["rollback_bundle"]["sha256"] == _sha(bundle_path)
+    assert [item["name"] for item in producer["rollback_bundle"]["files"]] == [
+        "state.db",
+        "state.db-wal",
+        "state.db-shm",
+        "state.db-journal",
+    ]
     result = _apply(db_path, stage, config, producer, fake)
     assert result["retention"]["applied"] is True
     assert _logical_snapshot(db_path) != pre_snapshot
@@ -795,12 +844,12 @@ def test_rollback_bundle_restores_exact_pre_retention_state(tmp_path: Path) -> N
             data = member.read()
             assert len(data) == item["bytes"]
             assert hashlib.sha256(data).hexdigest() == item["sha256"]
-            if item["name"] == db_path.name:
+            if item["name"] == "state.db":
                 restore_path.write_bytes(data)
                 os.chmod(restore_path, 0o600)
                 assert item["sha256"] == pre_sha
             else:
-                suffix = item["name"][len(db_path.name) :]
+                suffix = item["name"][len("state.db") :]
                 sidecar_restore = restore_path.with_name(restore_path.name + suffix)
                 sidecar_restore.write_bytes(data)
                 os.chmod(sidecar_restore, 0o600)
@@ -1462,7 +1511,11 @@ def test_each_remote_object_position_rejects_true_partial_readback(
 
     assert fake.upload_count == partial_index
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
-    assert {command[1] for _step, command in fake.commands} <= {"copyto", "check"}
+    assert {command[1] for _step, command in fake.commands} <= {
+        "copy",
+        "copyto",
+        "check",
+    }
 
 
 def test_successful_full_producer_never_calls_apply_or_changes_candidate(
@@ -1537,12 +1590,15 @@ def test_wrong_external_sha_is_rejected_and_external_frozen_copies_are_accepted(
     fake = FakeRclone()
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
 
+    wrong_sha_approval = tmp_path / "wrong-sha-approved-manifest.json"
+    wrong_sha_approval.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+    os.chmod(wrong_sha_approval, 0o400)
     with pytest.raises(ColdArchiveError, match="exact-byte sha256 mismatch"):
         cold.run_cold_archive_pass(
             source_db=db_path,
             stage_root=stage,
             apply_retention=True,
-            approved_manifest_path=stage / "GATE-B-MANIFEST.json",
+            approved_manifest_path=wrong_sha_approval,
             approved_manifest_sha256="0" * 64,
             rclone_config=config,
             rclone_runner=fake,
@@ -1550,12 +1606,12 @@ def test_wrong_external_sha_is_rejected_and_external_frozen_copies_are_accepted(
 
     copied = tmp_path / "approved-manifest.json"
     copied.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
-    os.chmod(copied, 0o600)
+    os.chmod(copied, 0o400)
     approved_producer = tmp_path / "approved-producer.json"
     approved_producer.write_bytes(
         (stage / "COLD-ARCHIVE-PRODUCER-RECEIPT.json").read_bytes()
     )
-    os.chmod(approved_producer, 0o600)
+    os.chmod(approved_producer, 0o400)
     cold.run_cold_archive_pass(
         source_db=db_path,
         stage_root=stage,
@@ -1631,7 +1687,7 @@ def test_rollback_bundle_contains_nonempty_wal_and_restores_wal_backed_row(
             for item in producer["rollback_bundle"]["files"]
             if item["status"] == "copied"
         }
-        assert copied[db_path.name + "-wal"]["bytes"] > 0
+        assert copied["state.db-wal"]["bytes"] > 0
 
         restored = tmp_path / "restored-wal.db"
         bundle = stage / "rollback" / "rollback-source-bundle.tar.gz"
@@ -1641,7 +1697,7 @@ def test_rollback_bundle_contains_nonempty_wal_and_restores_wal_backed_row(
                 assert member is not None
                 data = member.read()
                 assert hashlib.sha256(data).hexdigest() == item["sha256"]
-                suffix = source_name[len(db_path.name) :]
+                suffix = source_name[len("state.db") :]
                 target = restored.with_name(restored.name + suffix)
                 target.write_bytes(data)
                 os.chmod(target, 0o600)
@@ -1674,7 +1730,10 @@ def test_apply_rejects_post_approval_ciphertext_and_receipt_replacement(
     approved = tmp_path / "approved-producer.json"
     stage_receipt = stage / "COLD-ARCHIVE-PRODUCER-RECEIPT.json"
     approved.write_bytes(stage_receipt.read_bytes())
-    os.chmod(approved, 0o600)
+    os.chmod(approved, 0o400)
+    approved_manifest = tmp_path / "approved-manifest.json"
+    approved_manifest.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+    os.chmod(approved_manifest, 0o400)
 
     encrypted = stage / "rollback" / "ROLLBACK-SOURCE-BUNDLE.tar.gz.age"
     encrypted.write_bytes(b"ATTACKER-CIPHERTEXT")
@@ -1696,7 +1755,7 @@ def test_apply_rejects_post_approval_ciphertext_and_receipt_replacement(
             source_db=db_path,
             stage_root=stage,
             apply_retention=True,
-            approved_manifest_path=stage / "GATE-B-MANIFEST.json",
+            approved_manifest_path=approved_manifest,
             approved_manifest_sha256=producer["manifest_file_sha256"],
             approved_producer_receipt_path=approved,
             approved_producer_receipt_sha256=_sha(approved),
@@ -1724,23 +1783,43 @@ def test_forged_final_receipt_cannot_claim_replay(tmp_path: Path) -> None:
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
 
 
-def test_archive_requires_both_fts_roots_and_sync_triggers(tmp_path: Path) -> None:
-    db_path = tmp_path / "candidate.db"
+@pytest.mark.parametrize(
+    "missing_object",
+    [
+        "messages_fts",
+        "messages_fts_delete",
+        "messages_fts_insert",
+        "messages_fts_trigram",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_update",
+        "messages_fts_update",
+    ],
+)
+def test_each_required_fts_root_and_sync_trigger_fails_closed(
+    tmp_path: Path, missing_object: str
+) -> None:
+    db_path = tmp_path / f"candidate-{missing_object}.db"
     db = _build_archive_candidate(db_path)
     try:
         _make_session(db, "eligible", days_ago=90, content="selected")
         assert db._conn is not None
-        for name in sorted(cold._REQUIRED_FTS_OBJECTS):
-            kind = "TRIGGER" if "insert" in name or "delete" in name or "update" in name else "TABLE"
-            db._conn.execute(f'DROP {kind} IF EXISTS "{name}"')
+        kind = (
+            "TRIGGER"
+            if any(token in missing_object for token in ("insert", "delete", "update"))
+            else "TABLE"
+        )
+        db._conn.execute(f'DROP {kind} IF EXISTS "{missing_object}"')
         db._conn.commit()
     finally:
         db.close()
 
-    with pytest.raises(ColdArchiveError, match="required FTS roots/triggers"):
+    with pytest.raises(
+        ColdArchiveError, match=rf"required FTS roots/triggers.*{missing_object}"
+    ):
         cold.run_cold_archive_pass(
             source_db=db_path,
-            stage_root=tmp_path / "stage",
+            stage_root=tmp_path / f"stage-{missing_object}",
             now=NOW,
             hold_sources=[],
             manifest_only=True,
@@ -1777,7 +1856,7 @@ def test_remote_publication_refuses_preexisting_objects_without_clobber(
     finally:
         db.close()
     fake = FakeRclone(preexisting_upload_index=position)
-    with pytest.raises(ColdArchiveError, match="rclone copyto failed"):
+    with pytest.raises(ColdArchiveError, match="rclone immutable copy failed"):
         _producer(tmp_path, db_path, fake, stage_name=f"stage-{position}")
     assert b"PREEXISTING-REMOTE-OBJECT" in fake.remote.values()
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
@@ -1855,7 +1934,9 @@ def test_prune_receipt_failure_recovers_from_prepared_intent(
 
 
 @pytest.mark.skipif(shutil.which("age") is None, reason="age executable not installed")
-def test_encrypted_remote_rollback_decrypts_and_restores_snapshot(tmp_path: Path) -> None:
+def test_encrypted_remote_rollback_decrypts_and_restores_snapshot(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "candidate.db"
     db = _build_archive_candidate(db_path)
     try:
@@ -1908,7 +1989,7 @@ def test_encrypted_remote_rollback_decrypts_and_restores_snapshot(tmp_path: Path
             assert member is not None
             data = member.read()
             assert hashlib.sha256(data).hexdigest() == report["sha256"]
-            suffix = source_name[len(db_path.name) :]
+            suffix = source_name[len("state.db") :]
             target = restored.with_name(restored.name + suffix)
             target.write_bytes(data)
     assert _logical_snapshot(restored) == _logical_snapshot(db_path)
@@ -1986,6 +2067,281 @@ def test_rclone_config_must_be_private_and_unaliased(tmp_path: Path) -> None:
             age_runner=_fake_age,
             rclone_runner=FakeRclone(),
         )
+
+
+def test_external_recipient_and_rclone_config_are_frozen_before_tools_run(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    initial_recipient = b"age1initialfixture\n"
+    initial_config = b"[gdrive]\ntype = drive\n"
+    recipient = tmp_path / "recipient.txt"
+    recipient.write_bytes(initial_recipient)
+    config = tmp_path / "rclone.conf"
+    config.write_bytes(initial_config)
+    os.chmod(config, 0o600)
+    stage = tmp_path / "stage"
+    age_recipient_paths: list[Path] = []
+    fake = FakeRclone()
+    config_mutated = False
+
+    def racing_age(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        age_recipient_paths.append(Path(command[2]))
+        if len(age_recipient_paths) == 1:
+            recipient.write_bytes(b"age1attackerreplacement\n")
+        return _fake_age(command, **kwargs)
+
+    def racing_rclone(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal config_mutated
+        frozen_config = Path(command[command.index("--config") + 1])
+        assert frozen_config != config
+        assert frozen_config.read_bytes() == initial_config
+        if not config_mutated:
+            config.write_bytes(b"[attacker]\ntype = local\n")
+            os.chmod(config, 0o600)
+            config_mutated = True
+        return fake(command, **kwargs)
+
+    receipt = cold.run_cold_archive_pass(
+        source_db=db_path,
+        stage_root=stage,
+        now=NOW,
+        hold_sources=[],
+        rclone_remote=REMOTE,
+        rclone_config=config,
+        age_recipient_file=recipient,
+        age_runner=racing_age,
+        rclone_runner=racing_rclone,
+    )
+
+    recipient_snapshot = stage / "restricted" / "AGE-RECIPIENTS.txt"
+    assert age_recipient_paths == [recipient_snapshot, recipient_snapshot]
+    assert recipient_snapshot.read_bytes() == initial_recipient
+    assert receipt["age_recipient_sha256"] == _sha(recipient_snapshot)
+    assert config_mutated is True
+
+
+def test_approved_manifest_must_be_read_only_and_outside_stage(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    inside = stage / "APPROVED-GATE-B-MANIFEST.json"
+    inside.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+    os.chmod(inside, 0o400)
+
+    with pytest.raises(ColdArchiveError, match="outside the producer stage"):
+        cold.run_cold_archive_pass(
+            source_db=db_path,
+            stage_root=stage,
+            apply_retention=True,
+            approved_manifest_path=inside,
+            approved_manifest_sha256=producer["manifest_file_sha256"],
+            rclone_config=config,
+            rclone_runner=fake,
+        )
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE sessions SET pinned=1 WHERE id='eligible'",
+        "UPDATE sessions SET archived=0 WHERE id='eligible'",
+        "UPDATE sessions SET ended_at=NULL WHERE id='eligible'",
+        "UPDATE sessions SET last_activity_at=last_activity_at+1 WHERE id='eligible'",
+        "UPDATE sessions SET title='post-lock mutation' WHERE id='eligible'",
+    ],
+)
+def test_each_selected_row_drift_under_destructive_lock_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    before = _logical_snapshot(db_path)
+    original = cold._revalidate_selected_under_lock
+
+    def mutate_then_revalidate(
+        conn: sqlite3.Connection, manifest: dict[str, Any], ids: list[str]
+    ) -> int:
+        conn.execute(mutation)
+        return original(conn, manifest, ids)
+
+    monkeypatch.setattr(cold, "_revalidate_selected_under_lock", mutate_then_revalidate)
+    with pytest.raises(ColdArchiveError, match="logical snapshot changed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert _logical_snapshot(db_path) == before
+
+
+@pytest.mark.parametrize("remote_index", [0, 1, 2])
+def test_apply_reverifies_every_remote_object_before_delete(
+    tmp_path: Path, remote_index: int
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    remote = producer["remote_publish"][remote_index]["remote"]
+    original = fake.remote[remote]
+    fake.remote[remote] = bytes([original[0] ^ 1]) + original[1:]
+
+    with pytest.raises(ColdArchiveError, match="remote custody checksum failed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+
+
+def test_survivor_source_only_drift_rolls_back(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+        _make_session(
+            db,
+            "survivor",
+            days_ago=2,
+            archived=False,
+            ended=False,
+            content="survivor",
+        )
+        db._conn.execute(
+            """
+            CREATE TRIGGER mutate_survivor_source
+            AFTER DELETE ON sessions WHEN OLD.id = 'eligible'
+            BEGIN
+                UPDATE sessions SET source='mutated-source' WHERE id='survivor';
+            END
+            """
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+    before = _logical_snapshot(db_path)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+
+    with pytest.raises(ColdArchiveError, match="full surviving row payloads changed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert _logical_snapshot(db_path) == before
+
+
+def test_forged_prune_receipt_before_cutover_fails_closed(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    marker_sha = "a" * 64
+    forged = stage / "rollback" / "SOURCE-BUNDLE-PRUNED.json"
+    forged.write_text(
+        json.dumps({
+            "operation": "hermes-source-bundle-pruned",
+            "pruned": True,
+            "approved_cutover_marker_sha256": marker_sha,
+        }),
+        encoding="utf-8",
+    )
+    os.chmod(forged, 0o600)
+
+    with pytest.raises(ColdArchiveError, match="exists before cutover"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=NOW + 100 * DAY,
+        )
+
+
+def test_prune_replay_fails_if_plaintext_bundle_reappears(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    marker_sha = _sha(stage / "rollback" / "CANDIDATE-CUTOVER.json")
+    prune_at = cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS
+    cold.prune_source_bundle_after_retention(
+        stage,
+        candidate_health_confirmed=True,
+        approved_cutover_marker_sha256=marker_sha,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=prune_at,
+    )
+    (stage / "rollback" / "source-bundle").mkdir(mode=0o700)
+
+    with pytest.raises(ColdArchiveError, match="plaintext source bundle reappeared"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=prune_at + DAY,
+        )
+
+
+def test_cli_cold_archive_failure_returns_nonzero(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from hermes_cli.main import main; "
+                "sys.argv=['hermes','sessions','cold-archive','--source',"
+                f"{str(tmp_path / 'missing.db')!r},'--stage-root',"
+                f"{str(tmp_path / 'stage')!r},'--manifest-only']; main()"
+            ),
+        ],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "failed closed" in result.stdout
 
 
 def test_cli_help_requires_external_approval_flags_and_has_no_clock_override() -> None:
