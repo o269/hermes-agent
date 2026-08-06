@@ -126,21 +126,25 @@ class TestOrphanRollbackOnCreateFailure:
         db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
 
-        # Make the CHILD create_session raise, but let the initial parent
-        # end_session/reopen work. We patch create_session to blow up.
-        real_create = db.create_session
+        # Make the atomic child publication fail before commit. The parent
+        # termination shares that transaction, so there is no reopen/cleanup
+        # compensation path to depend on.
+        attempted_children: list[str] = []
 
-        def _boom(*a, **k):
+        def _boom(parent_session_id, child_session_id, **kwargs):
+            attempted_children.append(child_session_id)
             raise RuntimeError("FOREIGN KEY constraint failed")
 
-        with patch.object(db, "create_session", side_effect=_boom):
+        with patch.object(db, "publish_compression_rotation", side_effect=_boom):
             agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
 
-        # The live id must roll back to the still-indexed parent — NOT a
-        # phantom child id that has no row in state.db.
+        # The live id remains the indexed, live parent — never a phantom child.
         assert agent.session_id == parent
-        assert db.get_session(parent) is not None
-        _ = real_create  # silence unused
+        parent_row = db.get_session(parent)
+        assert parent_row is not None
+        assert parent_row.get("ended_at") is None
+        assert len(attempted_children) == 1
+        assert db.get_session(attempted_children[0]) is None
 
 
 class TestPlatformForwardedAtBoundary:

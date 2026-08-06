@@ -113,6 +113,11 @@ _SNAPSHOT_TUPLE_CONTAINER_BYTES = 56  # PyTupleObject header
 _SNAPSHOT_TUPLE_SLOT_BYTES = 8  # one pointer per item
 _SNAPSHOT_SET_CONTAINER_BYTES = 224  # PySetObject + initial hash table
 _SNAPSHOT_SET_ENTRY_BYTES = 32  # hash slot + amortized rehash growth
+# Covers the largest supported binary wrapper header on 64-bit CPython
+# (memoryview), plus allocator slack.  Payload is charged separately.  Bytes
+# are immutable/shared by the cloners, but charging the same conservative
+# header keeps preflight and both snapshot paths on one fail-closed bound.
+_SNAPSHOT_BINARY_CONTAINER_BYTES = 192
 
 # The full-compression permit is deliberately independent of the executor's
 # queue admission.  Gateway hygiene can call ``compress_context`` directly,
@@ -124,6 +129,13 @@ _process_compression_permit = threading.BoundedSemaphore(1)
 
 class CompressionSnapshotTooLargeError(RuntimeError):
     """A bounded private compression snapshot could not be constructed."""
+
+
+def _binary_payload_bytes(value: bytes | bytearray | memoryview) -> int:
+    """Return binary payload bytes (memoryview len() counts elements, not bytes)."""
+    if isinstance(value, memoryview):
+        return max(0, int(value.nbytes))
+    return len(value)
 
 
 def _utf8_size(value: str, *, stop_after: Optional[int] = None) -> int:
@@ -169,7 +181,9 @@ def _estimate_value_bytes(
             value, stop_after=stop_after - state["bytes"]
         )
     elif isinstance(value, (bytes, bytearray, memoryview)):
-        state["bytes"] += len(value)
+        state["bytes"] += (
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(value)
+        )
     else:
         value_id = id(value)
         if value_id in seen:
@@ -298,6 +312,75 @@ def _snapshot_budget_add(budget: dict[str, int], amount: int) -> None:
         )
 
 
+def _clone_bounded_mapping_key(
+    key: Any,
+    *,
+    budget: dict[str, int],
+    stats: dict[str, int],
+    depth: int,
+) -> Any:
+    """Clone supported immutable mapping keys; report unknown keys as opaque.
+
+    Dict keys need separate handling from values: inserting a caller-owned
+    identity-hashed plugin object directly into the worker dict preserves a
+    mutable alias.  Scalar keys are safely shared, while tuple/frozenset keys
+    are rebuilt recursively.  Unknown key objects remain referenced only for
+    compatibility, but increment ``opaque_object_refs`` so mutable extension
+    engines fail closed before they can touch the alias.
+    """
+    if depth > 64:
+        raise CompressionSnapshotTooLargeError(
+            "compression snapshot exceeded maximum nesting depth"
+        )
+    if key is None or isinstance(key, (bool, int, float)):
+        _snapshot_budget_add(budget, 8)
+        return key
+    if isinstance(key, str):
+        _snapshot_budget_add(
+            budget,
+            _utf8_size(key, stop_after=budget["limit"] - budget["bytes"]),
+        )
+        return key
+    if isinstance(key, bytes):
+        _snapshot_budget_add(
+            budget,
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(key),
+        )
+        return key
+    if isinstance(key, tuple):
+        _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_CONTAINER_BYTES)
+        items = []
+        for item in key:
+            _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_SLOT_BYTES)
+            items.append(
+                _clone_bounded_mapping_key(
+                    item,
+                    budget=budget,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+            )
+        return tuple(items)
+    if isinstance(key, frozenset):
+        _snapshot_budget_add(budget, _SNAPSHOT_SET_CONTAINER_BYTES)
+        items = []
+        for item in key:
+            _snapshot_budget_add(budget, _SNAPSHOT_SET_ENTRY_BYTES)
+            items.append(
+                _clone_bounded_mapping_key(
+                    item,
+                    budget=budget,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+            )
+        return frozenset(items)
+
+    stats["opaque_object_refs"] += 1
+    _snapshot_budget_add(budget, 64)
+    return key
+
+
 def _clone_bounded_snapshot_value(
     value: Any,
     *,
@@ -321,10 +404,16 @@ def _clone_bounded_snapshot_value(
         )
         return value
     if isinstance(value, bytes):
-        _snapshot_budget_add(budget, len(value))
+        _snapshot_budget_add(
+            budget,
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(value),
+        )
         return value
     if isinstance(value, (bytearray, memoryview)):
-        _snapshot_budget_add(budget, len(value))
+        _snapshot_budget_add(
+            budget,
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(value),
+        )
         return bytearray(value)
 
     value_id = id(value)
@@ -338,8 +427,13 @@ def _clone_bounded_snapshot_value(
         cloned: dict[Any, Any] = {}
         memo[value_id] = cloned
         for key, item in value.items():
-            key_size = _utf8_size(key) if isinstance(key, str) else 16
-            _snapshot_budget_add(budget, key_size + _SNAPSHOT_DICT_ENTRY_BYTES)
+            _snapshot_budget_add(budget, _SNAPSHOT_DICT_ENTRY_BYTES)
+            cloned_key = _clone_bounded_mapping_key(
+                key,
+                budget=budget,
+                stats=stats,
+                depth=depth + 1,
+            )
             if isinstance(key, str) and key in _OPAQUE_REPLAY_SIDECAR_KEYS:
                 # Detach the sidecar's mutable structure (dicts/lists/sets/
                 # bytearrays) within the configured byte budget so a legacy
@@ -347,7 +441,7 @@ def _clone_bounded_snapshot_value(
                 # caller's objects through this worker snapshot (PR #79668
                 # review H4). Immutable payload leaves stay shared — no
                 # recursive duplication, so the RSS invariant holds.
-                cloned[key] = _clone_detached_sidecar_value(
+                cloned[cloned_key] = _clone_detached_sidecar_value(
                     item,
                     budget=budget,
                     memo=memo,
@@ -356,7 +450,7 @@ def _clone_bounded_snapshot_value(
                 )
                 stats["opaque_sidecar_fields"] += 1
                 continue
-            cloned[key] = _clone_bounded_snapshot_value(
+            cloned[cloned_key] = _clone_bounded_snapshot_value(
                 item,
                 budget=budget,
                 memo=memo,
@@ -456,12 +550,21 @@ def _clone_detached_sidecar_value(
         raise CompressionSnapshotTooLargeError(
             "compression snapshot exceeded maximum nesting depth"
         )
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+    if isinstance(value, bytes):
+        _snapshot_budget_add(
+            budget,
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(value),
+        )
+        return value
+    if value is None or isinstance(value, (bool, int, float, str)):
         # Immutable: shared, fingerprint accounting only.
         _snapshot_budget_add(budget, 64)
         return value
     if isinstance(value, (bytearray, memoryview)):
-        _snapshot_budget_add(budget, len(value))
+        _snapshot_budget_add(
+            budget,
+            _SNAPSHOT_BINARY_CONTAINER_BYTES + _binary_payload_bytes(value),
+        )
         return bytearray(value)
 
     value_id = id(value)
@@ -473,8 +576,14 @@ def _clone_detached_sidecar_value(
         cloned: dict[Any, Any] = {}
         memo[value_id] = cloned
         for key, item in value.items():
-            _snapshot_budget_add(budget, 64 + _SNAPSHOT_DICT_ENTRY_BYTES)
-            cloned[key] = _clone_detached_sidecar_value(
+            _snapshot_budget_add(budget, _SNAPSHOT_DICT_ENTRY_BYTES)
+            cloned_key = _clone_bounded_mapping_key(
+                key,
+                budget=budget,
+                stats=stats,
+                depth=depth + 1,
+            )
+            cloned[cloned_key] = _clone_detached_sidecar_value(
                 item,
                 budget=budget,
                 memo=memo,
@@ -3138,6 +3247,7 @@ def _compress_context_impl(
             agent._cached_system_prompt = new_system_prompt
 
         split_status = "not_applicable"
+        rotation_published = False
         if agent._session_db:
             split_status = "pending"
             try:
@@ -3179,21 +3289,12 @@ def _compress_context_impl(
                     # diff) to re-baseline transcript handling.
                     compacted_in_place = True
                 else:
-                    # ── Rotation (legacy): end this session, fork a continuation ─
+                    # ── Rotation (legacy): atomically publish a continuation ─
                     # Flush any un-persisted current-turn messages to the OLD
-                    # session before ending it, so they survive in the preserved
-                    # parent transcript (#47202). (In-place skips this — see above.)
-                    #
-                    # Pass the already-durable prefix as conversation_history so
-                    # the flush skips it by identity (#68196). Preflight
-                    # compression runs BEFORE the normal turn flush has stamped
-                    # the cold-resumed history dicts with _DB_PERSISTED_MARKER, so
-                    # without a boundary _flush_messages_to_session_db treats every
-                    # restored row as new and re-appends the whole transcript to
-                    # the parent. turn_context anchors _persist_user_message_idx at
-                    # the current-turn user message before preflight runs, so
-                    # messages[:idx] is exactly the persisted prefix; only the
-                    # current turn's new messages get written.
+                    # session before the atomic boundary. The parent termination,
+                    # child row, child prompt, and compacted child transcript are
+                    # then one SessionDB transaction: any storage fault rolls all
+                    # four writes back and leaves the parent live.
                     current_idx = getattr(agent, "_persist_user_message_idx", None)
                     persisted_history = (
                         messages[:current_idx]
@@ -3208,99 +3309,80 @@ def _compress_context_impl(
                         )
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
-                    # Propagate title to the new session with auto-numbering
-                    old_title = agent._session_db.get_session_title(agent.session_id)
-                    agent._session_db.end_session(agent.session_id, "compression")
+
                     old_session_id = agent.session_id
-                    agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                    # Ordering contract: the agent thread updates the contextvar here;
-                    # the gateway propagates to SessionEntry after run_in_executor returns.
+                    old_title = agent._session_db.get_session_title(old_session_id)
+                    new_session_id = (
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                        f"{uuid.uuid4().hex[:6]}"
+                    )
+                    publish_rotation = getattr(
+                        agent._session_db, "publish_compression_rotation", None
+                    )
+                    if not callable(publish_rotation):
+                        # Version-skew safety: the old sequential writer can
+                        # durably end the parent before child publication. Do not
+                        # fall back to it; fail closed until the process reloads
+                        # the SessionDB implementation with the atomic primitive.
+                        raise RuntimeError(
+                            "atomic compression rotation API is unavailable"
+                        )
+                    publish_rotation(
+                        old_session_id,
+                        new_session_id,
+                        source=agent.platform
+                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model=agent.model,
+                        model_config=agent._session_init_model_config,
+                        system_prompt=new_system_prompt,
+                        messages=compressed,
+                    )
+                    rotation_published = True
+
+                    # The durable transaction committed. Only now expose the
+                    # child id to the live agent and routing/logging contexts.
+                    agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
 
                         set_current_session_id(agent.session_id)
                     except Exception:
                         os.environ["HERMES_SESSION_ID"] = agent.session_id
-                    # The gateway/tools session context (ContextVar + env) and the
-                    # logging session context are SEPARATE mechanisms. The call above
-                    # moves the former; the ``[session_id]`` tag on log lines comes
-                    # from ``hermes_logging._session_context`` (set once per turn in
-                    # conversation_loop.py). Without this, post-rotation log lines in
-                    # the same turn keep the STALE old id while the message/DB/gateway
-                    # state carry the new one — breaking log correlation exactly at the
-                    # compaction boundary (see #34089). Guarded separately so a logging
-                    # failure can never regress the routing update above.
                     try:
                         from hermes_logging import set_session_context
 
                         set_session_context(agent.session_id)
                     except Exception:
                         pass
-                    agent._session_db_created = False
-                    try:
-                        agent._session_db.create_session(
-                            session_id=agent.session_id,
-                            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                            model=agent.model,
-                            model_config=agent._session_init_model_config,
-                            parent_session_id=old_session_id,
-                        )
-                    except Exception as _cs_err:
-                        # The child row could not be created (e.g. FK constraint,
-                        # contended write). Previously the outer handler simply
-                        # warned and let the agent continue on the NEW id — which
-                        # has no row in state.db, producing an orphan: the parent
-                        # is ended, the child is never indexed, and every
-                        # subsequent message is attributed to a session that
-                        # doesn't exist (#33906/#33907). Roll the live id back to
-                        # the parent so the conversation stays attached to a real,
-                        # indexed session instead of a phantom.
-                        logger.warning(
-                            "Compression child session create failed (%s) — "
-                            "rolling back to parent session %s to avoid an orphan.",
-                            _cs_err, old_session_id,
-                        )
-                        agent.session_id = old_session_id
-                        try:
-                            from gateway.session_context import set_current_session_id
-                            set_current_session_id(agent.session_id)
-                        except Exception:
-                            os.environ["HERMES_SESSION_ID"] = agent.session_id
-                        try:
-                            from hermes_logging import set_session_context
-                            set_session_context(agent.session_id)
-                        except Exception:
-                            pass
-                        # Re-open the parent: it was ended above, but we're
-                        # continuing on it, so it must not stay closed.
-                        try:
-                            agent._session_db.reopen_session(old_session_id)
-                        except Exception:
-                            pass
-                        old_session_id = None  # no rotation happened
-                        # The parent row already exists in state.db, so mark the
-                        # session as created — _ensure_db_session would otherwise
-                        # retry a (harmless INSERT OR IGNORE) create next turn.
-                        agent._session_db_created = True
-                        raise
                     agent._session_db_created = True
                     split_status = "rotated_committed"
+
                     # Carry a persistent /goal onto the continuation session.
-                    # Compression mints a fresh child id; load_goal does a flat
-                    # per-session lookup with no parent walk, so without this an
-                    # active goal silently dies at the boundary (#33618).
                     try:
                         from hermes_cli.goals import migrate_goal_to_session
-                        migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
+
+                        migrate_goal_to_session(
+                            old_session_id,
+                            agent.session_id,
+                            reason="compression",
+                        )
                     except Exception as _goal_err:
-                        logger.debug("Could not migrate goal on compression: %s", _goal_err)
-                    # Auto-number the title for the continuation session
+                        logger.debug(
+                            "Could not migrate goal on compression: %s", _goal_err
+                        )
+                    # Auto-number the title for the continuation session.
                     if old_title:
                         try:
-                            new_title = agent._session_db.get_next_title_in_lineage(old_title)
-                            agent._session_db.set_session_title(agent.session_id, new_title)
+                            new_title = agent._session_db.get_next_title_in_lineage(
+                                old_title
+                            )
+                            agent._session_db.set_session_title(
+                                agent.session_id, new_title
+                            )
                         except (ValueError, Exception) as e:
-                            logger.debug("Could not propagate title on compression: %s", e)
+                            logger.debug(
+                                "Could not propagate title on compression: %s", e
+                            )
 
                 # Shared post-write steps (both modes target agent.session_id, which
                 # in-place keeps and rotation has already reassigned to the new id):
@@ -3327,11 +3409,9 @@ def _compress_context_impl(
                         )
                     agent._last_flushed_db_idx = 0
                 else:
-                    agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
-                    # A headless turn can be killed before its finalizer. Persist
-                    # the rotated child's compacted handoff at the boundary so
-                    # the new session is immediately resumable.
-                    agent._session_db.replace_messages(agent.session_id, compressed)
+                    # The atomic rotation transaction already persisted the
+                    # prompt and compacted handoff. Only in-memory flush
+                    # bookkeeping remains after the durable commit boundary.
                     agent._last_flushed_db_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
                     agent._flushed_db_message_ids = {
@@ -3341,146 +3421,70 @@ def _compress_context_impl(
                     }
             except Exception as e:
                 _old_sid: Optional[str] = locals().get("old_session_id")
-                _rotation_compensation_ok = True
-                if (
-                    not in_place
-                    and _old_sid
-                    and agent.session_id != _old_sid
-                ):
-                    # Post-child-creation publication failure (a fault in the
-                    # child's update_system_prompt() or replace_messages()):
-                    # the parent is already ended and the agent points at an
-                    # EMPTY child — returning the caller's original transcript
-                    # here would be a durable/live split-brain and resumable-
-                    # session data loss (PR #53 exact-head review P0).
-                    # Compensate fully BEFORE the shared abort branch:
-                    #   1. restore the live id to the parent,
-                    #   2. re-open the parent row,
-                    #   3. reverse the goal migration (best effort),
-                    #   4. delete/retire the failed child,
-                    #   5. verify all of it by read-back.
-                    _failed_child_id = agent.session_id
+                if not in_place and _old_sid and not rotation_published:
+                    # The atomic SessionDB transaction failed before publication.
+                    # Its rollback leaves the parent live and the child absent, so
+                    # recovery is purely in-memory; no compensating DB write can
+                    # itself fail and strand an ended parent.
                     agent.session_id = _old_sid
                     try:
                         from gateway.session_context import set_current_session_id
+
                         set_current_session_id(agent.session_id)
                     except Exception:
                         os.environ["HERMES_SESSION_ID"] = agent.session_id
                     try:
                         from hermes_logging import set_session_context
+
                         set_session_context(agent.session_id)
                     except Exception:
                         pass
-                    # The parent row already exists in state.db (see the
-                    # create-failure rollback above for the same contract).
                     agent._session_db_created = True
-                    try:
-                        from hermes_cli.goals import migrate_goal_to_session
-                        migrate_goal_to_session(
-                            _failed_child_id,
-                            _old_sid,
-                            reason="compression_rollback",
-                        )
-                    except Exception:
-                        pass  # best effort — goal state is advisory
-                    try:
-                        agent._session_db.reopen_session(_old_sid)
-                    except Exception as _reopen_err:
-                        _rotation_compensation_ok = False
-                        logger.error(
-                            "Compression rotation compensation failed to "
-                            "re-open parent %s: %s", _old_sid, _reopen_err,
-                        )
-                    try:
-                        agent._session_db.delete_session(_failed_child_id)
-                    except Exception as _child_err:
-                        _rotation_compensation_ok = False
-                        logger.error(
-                            "Compression rotation compensation failed to "
-                            "retire empty child %s: %s",
-                            _failed_child_id, _child_err,
-                        )
-                    # Read-back verification: the parent must be live again
-                    # and the failed child must be gone. A mismatch keeps the
-                    # attempt flagged failed_not_indexed instead of pretending
-                    # the abort cleanly rolled everything back.
-                    try:
-                        _parent_row = agent._session_db.get_session(_old_sid)
-                        _child_row = agent._session_db.get_session(_failed_child_id)
-                        if (
-                            not _parent_row
-                            or _parent_row.get("ended_at") is not None
-                            or _child_row is not None
-                        ):
-                            _rotation_compensation_ok = False
-                            logger.error(
-                                "Compression rotation compensation read-back "
-                                "mismatch (parent=%s child=%s)",
-                                "live"
-                                if _parent_row and _parent_row.get("ended_at") is None
-                                else "NOT-LIVE",
-                                "present" if _child_row is not None else "absent",
-                            )
-                    except Exception as _verify_err:
-                        _rotation_compensation_ok = False
-                        logger.error(
-                            "Compression rotation compensation read-back "
-                            "failed: %s", _verify_err,
-                        )
-                if (
-                    not in_place
-                    and _old_sid
-                    and agent.session_id == _old_sid
-                ):
-                    # Atomic publication failed (including lease loss): keep the
-                    # parent live and discard the stale compacted snapshot.
-                    # After a post-child failure this branch only marks the
-                    # rotation fully aborted when the compensation above
-                    # actually restored durable state; otherwise old_session_id
-                    # stays bound so split_status reports failed_not_indexed.
-                    if _rotation_compensation_ok:
-                        old_session_id = None
+                    old_session_id = None
                     messages[:] = _build_bounded_compression_snapshot(
                         messages_before_compression,
                         max_bytes=_snapshot_max_bytes,
                     )
                     compressed = messages
                     _compression_made_progress = False
-                    # Restore ONLY the prune runway, not the full attempt
-                    # snapshot: _restore_compressor_attempt_state is reserved
-                    # for pre-commit cancels (fence deny / explicit cancel),
-                    # while this branch is post-attempt — the other snapshot
-                    # fields (telemetry, aborted flags) must keep the failed
-                    # attempt's values. The runway is a property of transcript
-                    # state, and the transcript was just rolled back to its
-                    # pre-compression copy, so the runway rolls back with it.
-                    # (compress() zeroed it in-memory on summary success; the
-                    # durable copy was never cleared — that clear only rides
-                    # the atomic archive_and_compact / child-row publication
-                    # that just failed.)
+                    # The runway belongs to transcript state. The atomic write
+                    # failed, so restore the pre-attempt runway with the original
+                    # transcript while retaining failure telemetry.
                     if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
                         agent.context_compressor._proactive_prune_rearm_tokens = (
                             _compressor_attempt_snapshot[
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
-                split_status = (
-                    "aborted"
-                    if locals().get("old_session_id") is None and not in_place
-                    else "failed_not_indexed"
-                )
-                # If the rotation rolled back to the parent (orphan-avoidance
-                # above), agent.session_id is the still-indexed parent and
-                # old_session_id was cleared — so this is recovery, not an
-                # un-indexed orphan. Otherwise an earlier step failed before the
-                # child was created and the warning's original meaning holds.
-                if locals().get("old_session_id") is None and not in_place:
+                    split_status = "aborted"
                     logger.warning(
-                        "Compression rotation aborted and rolled back to the "
-                        "parent session (%s): %s", agent.session_id or "?", e,
+                        "Compression rotation transaction aborted; parent %s "
+                        "remains live: %s",
+                        agent.session_id or "?",
+                        e,
+                    )
+                elif not in_place and rotation_published:
+                    # Never return a clean abort after the durable transaction
+                    # committed. Reassert the published child id and continue with
+                    # the compacted transcript; every remaining operation is
+                    # non-durable bookkeeping.
+                    _published_child = locals().get("new_session_id")
+                    if _published_child:
+                        agent.session_id = _published_child
+                    agent._session_db_created = True
+                    split_status = "rotated_committed"
+                    logger.error(
+                        "Compression rotation committed; post-publication "
+                        "bookkeeping failed: %s",
+                        e,
                     )
                 else:
-                    logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                    split_status = "failed_not_indexed"
+                    logger.warning(
+                        "Session DB compression split failed — new session will "
+                        "NOT be indexed: %s",
+                        e,
+                    )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

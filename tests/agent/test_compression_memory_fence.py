@@ -1168,6 +1168,118 @@ def test_snapshot_container_allocations_are_charged_against_cap():
     assert stats["snapshot_retained_bytes"] >= _actual_bytes(snapshot)
 
 
+@pytest.mark.parametrize(
+    ("binary_type", "payload"),
+    [
+        (bytes, b""),
+        (bytes, b"x"),
+        (bytearray, b""),
+        (bytearray, b"x"),
+        (memoryview, b""),
+        (memoryview, b"x"),
+    ],
+    ids=[
+        "empty-bytes",
+        "tiny-bytes",
+        "empty-bytearray",
+        "tiny-bytearray",
+        "empty-memoryview",
+        "tiny-memoryview",
+    ],
+)
+def test_binary_headers_and_payloads_are_conservatively_charged(
+    binary_type, payload
+):
+    """R3 P0: binary objects include a retained header, even when empty."""
+    import sys
+
+    binary = binary_type(payload)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "x",
+            "plugin_blob": binary,
+            "codex_reasoning_items": [binary],
+        }
+    ]
+    estimate = compression._estimate_compression_message_graph(
+        messages, stop_after=64 * 1024 * 1024
+    )
+    stats: dict[str, int] = {}
+    snapshot = compression._build_bounded_compression_snapshot(
+        messages, max_bytes=64 * 1024 * 1024, stats=stats
+    )
+    primary_binary = snapshot[0]["plugin_blob"]
+    sidecar_binary = snapshot[0]["codex_reasoning_items"][0]
+
+    assert estimate["message_graph_bytes"] >= (
+        2 * (compression._SNAPSHOT_BINARY_CONTAINER_BYTES + len(payload))
+    )
+    assert stats["snapshot_retained_bytes"] >= (
+        sys.getsizeof(primary_binary) + sys.getsizeof(sidecar_binary)
+    )
+    if isinstance(binary, (bytearray, memoryview)):
+        assert primary_binary is not binary
+        assert sidecar_binary is not binary
+
+
+@pytest.mark.parametrize(
+    ("binary_type", "payload"),
+    [
+        (bytes, b""),
+        (bytes, b"x"),
+        (bytearray, b""),
+        (bytearray, b"x"),
+        (memoryview, b""),
+        (memoryview, b"x"),
+    ],
+    ids=[
+        "empty-bytes",
+        "tiny-bytes",
+        "empty-bytearray",
+        "tiny-bytearray",
+        "empty-memoryview",
+        "tiny-memoryview",
+    ],
+)
+def test_binary_container_graph_rejects_before_mutable_extension(
+    monkeypatch, binary_type, payload
+):
+    """R3 P0: broad empty/tiny binary graphs cannot cross a 64 KiB cap."""
+    monkeypatch.setattr(
+        compression,
+        "_compression_memory_limits",
+        lambda: {
+            "rss_ceiling_bytes": 64 * 1024 * 1024 * 1024,
+            "message_graph_limit_bytes": 64 * 1024 * 1024,
+            "snapshot_limit_bytes": 64 * 1024,
+        },
+    )
+    impl_calls = []
+    monkeypatch.setattr(
+        compression,
+        "_compress_context_impl",
+        lambda *a, **kw: impl_calls.append(1) or _success_impl(*a, **kw),
+    )
+    agent = _DummyAgent(f"binary-{binary_type.__name__}-{len(payload)}")
+    original = [
+        {
+            "role": "assistant",
+            "content": "x",
+            "codex_reasoning_items": [binary_type(payload) for _ in range(1024)],
+        }
+    ]
+
+    returned, _ = compression.compress_context(agent, original, "system")
+
+    assert returned is original
+    assert impl_calls == []
+    assert (
+        agent.context_compressor._last_compression_telemetry["failure_class"]
+        == "snapshot_too_large"
+    )
+
+
 def test_preflight_estimator_charges_containers_and_keeps_sidecar_mass():
     """PR53 P0: preflight projection matches the clone it admits."""
     messages = [
@@ -1312,6 +1424,78 @@ def test_mutable_extension_engine_fails_closed_on_opaque_snapshot_objects(
     assert private_payload not in repr(telemetry)
 
 
+class _MutableHashKey:
+    """Hash-by-identity plugin key with mutable caller-owned state."""
+
+    __hash__ = object.__hash__
+
+    def __init__(self) -> None:
+        self.payload = ["original"]
+
+
+def test_mutable_extension_fails_closed_on_opaque_replay_dict_key(monkeypatch):
+    """R3 P1: unknown mutable keys are reported opaque before engine invoke."""
+    key = _MutableHashKey()
+    original = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "codex_reasoning_items": {key: "value"},
+        }
+    ]
+    stats: dict[str, int] = {}
+    snapshot = compression._build_bounded_compression_snapshot(
+        original, max_bytes=4 * 1024 * 1024, stats=stats
+    )
+    snapshot_key = next(iter(snapshot[0]["codex_reasoning_items"]))
+    assert snapshot_key is key
+    assert stats["opaque_object_refs"] == 1
+
+    impl_calls = []
+
+    def mutating_impl(agent, messages, _system_message, **_kwargs):
+        impl_calls.append(1)
+        worker_key = next(iter(messages[0]["codex_reasoning_items"]))
+        worker_key.payload.append("mutated")
+        agent._last_compression_attempt_in_place = None
+        return messages, "cancelled"
+
+    monkeypatch.setattr(compression, "_compress_context_impl", mutating_impl)
+    agent = _DummyAgent("session-opaque-key")
+
+    returned, _ = compression.compress_context(agent, original, "system")
+
+    assert returned is original
+    assert impl_calls == []
+    assert key.payload == ["original"]
+    assert (
+        agent.context_compressor._last_compression_telemetry["failure_class"]
+        == "snapshot_opaque_mutable"
+    )
+
+
+def test_replay_dict_immutable_container_keys_are_detached_without_opaque_refs():
+    """R3 P1: supported immutable keys are cloned, not reported as opaque."""
+    key = tuple(["plugin", 7])
+    original = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "codex_reasoning_items": {key: "value"},
+        }
+    ]
+    stats: dict[str, int] = {}
+
+    snapshot = compression._build_bounded_compression_snapshot(
+        original, max_bytes=4 * 1024 * 1024, stats=stats
+    )
+    snapshot_key = next(iter(snapshot[0]["codex_reasoning_items"]))
+
+    assert snapshot_key == key
+    assert snapshot_key is not key
+    assert stats["opaque_object_refs"] == 0
+
+
 def test_engine_mutability_gate_pins_builtin_vs_extension():
     """The fail-closed predicate: exact built-in type only is non-mutating."""
     assert compression._engine_is_mutable_extension_point(_compressor()) is False
@@ -1441,14 +1625,13 @@ def _rotation_agent_and_compressor(db, parent, monkeypatch):
     agent.compression_in_place = False  # rotation mode
 
     created_children: list[str] = []
-    real_create = db.create_session
+    real_publish = db.publish_compression_rotation
 
-    def _tracking_create(session_id, source, **kwargs):
-        if session_id != parent:
-            created_children.append(session_id)
-        return real_create(session_id, source, **kwargs)
+    def _tracking_publish(parent_session_id, child_session_id, **kwargs):
+        created_children.append(child_session_id)
+        return real_publish(parent_session_id, child_session_id, **kwargs)
 
-    monkeypatch.setattr(db, "create_session", _tracking_create)
+    monkeypatch.setattr(db, "publish_compression_rotation", _tracking_publish)
 
     goal_migrations: list[tuple] = []
     monkeypatch.setattr(
@@ -1461,7 +1644,7 @@ def _rotation_agent_and_compressor(db, parent, monkeypatch):
 def _assert_rotation_fully_compensated(
     db, agent, parent, original, returned, created_children, goal_migrations
 ):
-    """The post-child publication failure must leave NO durable split-brain."""
+    """A failed atomic publication must leave no durable split-brain."""
     # Caller-visible abort: the original transcript content is returned.
     assert [m["content"] for m in returned] == [m["content"] for m in original]
     # The agent is restored onto the still-indexed parent session.
@@ -1472,21 +1655,61 @@ def _assert_rotation_fully_compensated(
     assert parent_row.get("ended_at") is None
     live = db.get_messages_as_conversation(parent)
     assert [m["content"] for m in live] == [m["content"] for m in original]
-    # The failed empty child was retired — no orphan row remains.
+    # The failed child transaction rolled back — no orphan row remains.
     assert len(created_children) == 1
     assert db.get_session(created_children[0]) is None
-    # The goal migration was reversed onto the parent.
-    assert (created_children[0], parent, "compression_rollback") in goal_migrations
+    # Goal migration happens only after publication commits, so failure needs no
+    # advisory compensating migration either.
+    assert goal_migrations == []
     # The boundary never committed: no compaction marker, no engine boundary
     # notification.
     assert agent._last_compression_attempt_in_place in (None, False)
     agent.context_compressor.on_session_start.assert_not_called()
 
 
+def test_rotation_atomic_publication_commits_resumable_child(tmp_path, monkeypatch):
+    """R3 P0: parent end, child prompt, and child transcript commit together."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = "PARENT_ROTATION_ATOMIC_SUCCESS"
+        agent, compacted, created_children, goal_migrations = (
+            _rotation_agent_and_compressor(db, parent, monkeypatch)
+        )
+        original = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+        returned, prompt = agent._compress_context(
+            original, "sys", approx_tokens=120_000
+        )
+
+        assert len(created_children) == 1
+        child = created_children[0]
+        assert agent.session_id == child
+        assert [message["content"] for message in returned] == [
+            message["content"] for message in compacted
+        ]
+        parent_row = db.get_session(parent)
+        child_row = db.get_session(child)
+        assert parent_row is not None
+        assert parent_row.get("ended_at") is not None
+        assert parent_row.get("end_reason") == "compression"
+        assert child_row is not None
+        assert child_row.get("parent_session_id") == parent
+        assert child_row.get("system_prompt") == prompt
+        durable_child = db.get_messages_as_conversation(child)
+        assert [message["content"] for message in durable_child] == [
+            message["content"] for message in compacted
+        ]
+        assert goal_migrations == [(parent, child, "compression")]
+    finally:
+        db.close()
+
+
 def test_rotation_child_prompt_write_failure_compensates_parent_and_child(
     tmp_path, monkeypatch
 ):
-    """PR53 P0: child update_system_prompt failure fully rolls the rotation back."""
+    """PR53 P0: child row/prompt publication failure rolls back atomically."""
     from unittest.mock import patch
 
     from hermes_state import SessionDB
@@ -1499,11 +1722,14 @@ def test_rotation_child_prompt_write_failure_compensates_parent_and_child(
         )
         original = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-        with patch.object(
-            db,
-            "update_system_prompt",
-            side_effect=RuntimeError("child prompt write failed"),
-        ):
+        real_insert_session = db._insert_session_row_txn
+
+        def _child_row_then_fail(conn, session_id, source, **kwargs):
+            real_insert_session(conn, session_id, source, **kwargs)
+            if session_id != parent:
+                raise RuntimeError("child row/prompt publication failed")
+
+        with patch.object(db, "_insert_session_row_txn", _child_row_then_fail):
             returned, _prompt = agent._compress_context(
                 original, "sys", approx_tokens=120_000
             )
@@ -1518,7 +1744,7 @@ def test_rotation_child_prompt_write_failure_compensates_parent_and_child(
 def test_rotation_child_replace_messages_failure_compensates_parent_and_child(
     tmp_path, monkeypatch
 ):
-    """PR53 P0: child replace_messages failure fully rolls the rotation back."""
+    """PR53 P0: child transcript publication failure rolls back atomically."""
     from unittest.mock import patch
 
     from hermes_state import SessionDB
@@ -1533,7 +1759,7 @@ def test_rotation_child_replace_messages_failure_compensates_parent_and_child(
 
         with patch.object(
             db,
-            "replace_messages",
+            "_insert_message_rows",
             side_effect=RuntimeError("child handoff write failed"),
         ):
             returned, _prompt = agent._compress_context(
@@ -1543,5 +1769,56 @@ def test_rotation_child_replace_messages_failure_compensates_parent_and_child(
         _assert_rotation_fully_compensated(
             db, agent, parent, original, returned, created_children, goal_migrations
         )
+    finally:
+        db.close()
+
+
+def test_rotation_atomic_publication_rolls_back_partial_insert_despite_reopen_fault(
+    tmp_path, monkeypatch
+):
+    """R3 P0: a second storage fault cannot leave the parent durably ended."""
+    from unittest.mock import patch
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = "PARENT_ROTATION_ATOMIC_SECOND_FAULT"
+        agent, _compacted, _created_children, _goal_migrations = (
+            _rotation_agent_and_compressor(db, parent, monkeypatch)
+        )
+        original = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        attempted_children: list[str] = []
+        real_insert_rows = db._insert_message_rows
+
+        def _partial_insert_then_fail(conn, session_id, messages):
+            attempted_children.append(session_id)
+            real_insert_rows(conn, session_id, messages[:1])
+            raise RuntimeError("child transcript write failed after partial insert")
+
+        with (
+            patch.object(db, "_insert_message_rows", _partial_insert_then_fail),
+            patch.object(
+                db,
+                "reopen_session",
+                side_effect=RuntimeError("persistent compensation write failure"),
+            ) as reopen,
+        ):
+            returned, _prompt = agent._compress_context(
+                original, "sys", approx_tokens=120_000
+            )
+
+        assert returned is original
+        assert agent.session_id == parent
+        assert (db.get_session(parent) or {}).get("ended_at") is None
+        live = db.get_messages_as_conversation(parent)
+        assert [message["content"] for message in live] == [
+            message["content"] for message in original
+        ]
+        assert len(attempted_children) == 1
+        assert db.get_session(attempted_children[0]) is None
+        # Atomic rollback makes compensating writes unnecessary; even a broken
+        # reopen implementation is outside the clean-abort path.
+        reopen.assert_not_called()
     finally:
         db.close()
