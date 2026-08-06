@@ -542,7 +542,11 @@ def _pid_holds_heavy_workspace_lease(
     fail closed for custom heavy spawns; the built-in spawn path is trusted
     because it passes the descriptor itself.
     """
-    if not pid or pid <= 0 or not _pid_alive(pid):
+    # The dispatcher itself owns the descriptor while it performs this check.
+    # Accepting its PID would therefore be a false proof: the descriptor is
+    # closed immediately after dispatch returns, leaving any real descendant
+    # launched by the callback outside the host cap.
+    if not pid or pid <= 0 or pid == os.getpid() or not _pid_alive(pid):
         return False
     try:
         for fd in lease.filenos():
@@ -13623,10 +13627,12 @@ def _dispatch_once_locked(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically lease a host slot
-         when it is a heavy local workspace, then claim and call
-         ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
-         return value (if any) is recorded as ``worker_pid`` so subsequent
-         ticks can detect crashes before the TTL expires.
+         when it is a heavy local workspace, then claim and call ``spawn_fn``.
+         Light tasks retain the historical
+         ``spawn_fn(task, workspace_path, board) -> Optional[int]`` contract.
+         A custom heavy spawner must accept ``heavy_workspace_lease``, make a
+         distinct worker inherit every descriptor in ``lease.filenos()``, and
+         return that worker's PID. The PID is recorded for crash detection.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —

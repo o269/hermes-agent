@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
@@ -280,6 +279,7 @@ def test_forced_skill_failure_then_review_retry_delivers_verdict(
         task_id = kb.create_task(
             conn,
             title="review with required skill",
+            body="Resource-Class: light\nReview carry-forward unit test.",
             assignee="default",
         )
         _move_to_review(conn, task_id)
@@ -331,9 +331,9 @@ def test_forced_skill_failure_then_review_retry_delivers_verdict(
             *,
             heavy_workspace_lease: kb._HeavyWorkspaceLease | None = None,
         ):
-            assert heavy_workspace_lease is not None
+            assert heavy_workspace_lease is None
             spawned.append(task)
-            return os.getpid()
+            return 12345
 
         second = kb.dispatch_once(conn, spawn_fn=capture_spawn)
         assert [item[0] for item in second.spawned] == [task_id]

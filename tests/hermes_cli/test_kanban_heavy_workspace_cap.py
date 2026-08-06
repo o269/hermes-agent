@@ -456,6 +456,53 @@ def test_custom_spawn_without_live_pid_fails_closed_and_restores_task(
     lease.close()
 
 
+def test_custom_spawn_cannot_use_dispatcher_pid_as_lease_proof(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kb, "_assignee_has_spawn_target", lambda _assignee: True)
+    invoked: list[str] = []
+
+    def return_dispatcher_pid(
+        task: kb.Task,
+        _workspace: str,
+        *,
+        heavy_workspace_lease: kb._HeavyWorkspaceLease | None = None,
+    ) -> int:
+        assert heavy_workspace_lease is not None
+        invoked.append(task.id)
+        return os.getpid()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dispatcher pid is not worker lease proof",
+            assignee="local",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=return_dispatcher_pid,
+            max_heavy_workspaces=3,
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert invoked == [task_id]
+    assert result.spawned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.worker_pid is None
+    assert task.consecutive_failures == 1
+    assert "did not inherit heavy-workspace lease" in (task.last_failure_error or "")
+    assert len(runs) == 1
+    assert runs[0].outcome == "spawn_failed"
+    assert [entry.reason for entry in result.dispositions] == ["spawn_failure"]
+
+    lease, reason = kb._try_acquire_heavy_workspace_lease(3)
+    assert lease is not None and reason == "acquired"
+    lease.close()
+
+
 def test_saturated_heavy_queue_does_not_block_explicit_light_work(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,

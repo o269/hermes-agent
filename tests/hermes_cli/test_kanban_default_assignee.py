@@ -7,7 +7,6 @@ the task is skipped (existing behavior preserved).
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 
@@ -24,6 +23,15 @@ def isolated_kanban_home(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    real_create_task = kanban_db.create_task
+
+    def create_light_task(*args, **kwargs):
+        kwargs.setdefault(
+            "body", "Resource-Class: light\nDefault-assignee unit test."
+        )
+        return real_create_task(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", create_light_task)
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test
@@ -32,8 +40,8 @@ def isolated_kanban_home(monkeypatch):
 
 def _fake_spawn(*args, heavy_workspace_lease=None, **kwargs):
     """Stand-in for the real worker spawn — returns a fake PID."""
-    assert heavy_workspace_lease is not None
-    return os.getpid()
+    assert heavy_workspace_lease is None
+    return 12345
 
 
 def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):
