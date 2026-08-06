@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import contextmanager
 import importlib.util
 import io
@@ -764,71 +763,26 @@ def test_transaction_stop_path_clears_peer_instrumentation(tmp_path: Path):
 
 class _FakeCanaryOps:
     def __init__(self):
-        self.rows: dict[str, dict] = {}
-        self.created = 0
-        self.archive_calls: list[str] = []
-        self.archive_outcomes: list[object] = []
-        self.create_error: Exception | None = None
-        self.mismatch_next_get = False
-        self.before_archive: Callable[[dict], None] | None = None
+        self.probes = 0
+        self.probe_error: Exception | None = None
+        self.receipt_overrides: dict[str, object] = {}
 
-    def find_active_candidates(self, limit: int) -> list[dict]:
-        rows = [row.copy() for row in self.rows.values() if row["status"] != "archived"]
-        return rows[:limit]
-
-    def create(self, identity: dict) -> str:
-        if self.create_error is not None:
-            raise self.create_error
-        self.created += 1
-        task_id = f"t_canary{self.created:02d}"
-        self.rows[task_id] = {
-            "id": task_id,
-            "title": identity["title"],
-            "body": identity["body"],
-            "status": "blocked",
-            "created_by": boardd_runtime.WRITE_CANARY_CREATED_BY,
-            "idempotency_key": identity["idempotency_key"],
-            "created_at": self.created,
+    def probe(self, identity: dict) -> dict:
+        if self.probe_error is not None:
+            raise self.probe_error
+        self.probes += 1
+        receipt = {
+            "task_id": identity["task_id"],
+            "event_id": self.probes,
+            "run_id": self.probes,
+            "persisted_counts": {
+                "tasks": 0,
+                "task_events": 0,
+                "task_runs": 0,
+            },
         }
-        return task_id
-
-    def get(self, task_id: str) -> dict | None:
-        row = self.rows.get(task_id)
-        if row is None:
-            return None
-        shown = row.copy()
-        if self.mismatch_next_get:
-            self.mismatch_next_get = False
-            shown["body"] = "{}"
-        return shown
-
-    def archive(self, task_id: str, identity: dict) -> bool:
-        self.archive_calls.append(task_id)
-        if self.before_archive is not None:
-            callback = self.before_archive
-            self.before_archive = None
-            callback(self.rows[task_id])
-        row = self.rows.get(task_id)
-        if row is None:
-            return False
-        expected = {
-            "title": identity["title"],
-            "body": identity["body"],
-            "created_by": identity.get(
-                "created_by", boardd_runtime.WRITE_CANARY_CREATED_BY
-            ),
-            "idempotency_key": identity["idempotency_key"],
-        }
-        if any(row.get(field) != value for field, value in expected.items()):
-            return False
-        if self.archive_outcomes:
-            outcome = self.archive_outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            if not outcome:
-                return False
-        row["status"] = "archived"
-        return True
+        receipt.update(self.receipt_overrides)
+        return receipt
 
 
 def _unit_broker(
@@ -887,10 +841,19 @@ def test_write_canary_success_and_overlap_suppression(tmp_path: Path):
 
     assert result["ok"] is True
     assert result["status"] == "healthy"
-    assert ops.rows[result["task_id"]]["status"] == "archived"
+    assert result["persisted_counts"] == {
+        "tasks": 0,
+        "task_events": 0,
+        "task_runs": 0,
+    }
+    assert ops.probes == 1
     health = broker._health()
     assert health["write_canary_ok"] is True
     assert health["write_canary"]["runs"] == 1
+    assert health["write_canary"]["probe_kind"] == "rollback-transaction"
+    assert health["write_canary"]["last_persisted_counts"] == result[
+        "persisted_counts"
+    ]
 
     broker._write_canary_lock.acquire()
     try:
@@ -909,6 +872,7 @@ def test_write_canary_success_and_overlap_suppression(tmp_path: Path):
     finally:
         broker._maintenance_lock.release()
     assert backup_overlap["reason"] == "backup-maintenance"
+    assert ops.probes == 1
     assert broker._health()["write_canary"]["overlap_suppressed"] == 2
 
 
@@ -936,7 +900,7 @@ def test_write_canary_once_retries_overlap_until_an_actual_probe(
 def test_write_canary_failure_dedup_repeat_and_recovery(tmp_path: Path, monkeypatch):
     broker = _unit_broker(tmp_path, alert_repeat_s=10)
     ops = _FakeCanaryOps()
-    ops.create_error = sqlite3.OperationalError(
+    ops.probe_error = sqlite3.OperationalError(
         "table tasks has no column named reasoning_effort"
     )
     clock = [100]
@@ -946,7 +910,7 @@ def test_write_canary_failure_dedup_repeat_and_recovery(tmp_path: Path, monkeypa
 
     first = broker.run_write_canary_once(ops)
     clock[0] = 101
-    ops.create_error = sqlite3.OperationalError("no such column: a_different_column")
+    ops.probe_error = sqlite3.OperationalError("no such column: a_different_column")
     second = broker.run_write_canary_once(ops)
     clock[0] = 111
     third = broker.run_write_canary_once(ops)
@@ -957,7 +921,7 @@ def test_write_canary_failure_dedup_repeat_and_recovery(tmp_path: Path, monkeypa
     assert [event["event"] for event in events] == ["failure", "repeat"]
     assert broker._health()["write_canary_alarm"]["count"] == 3
 
-    ops.create_error = None
+    ops.probe_error = None
     clock[0] = 112
     recovered = broker.run_write_canary_once(ops)
     assert recovered["ok"] is True
@@ -971,7 +935,7 @@ def test_write_canary_restores_dedupe_and_recovery_state_after_restart(
     clock = [100]
     monkeypatch.setattr(boardd_runtime, "_now", lambda: clock[0])
     ops = _FakeCanaryOps()
-    ops.create_error = sqlite3.OperationalError("no such column: reasoning_effort")
+    ops.probe_error = sqlite3.OperationalError("no such column: reasoning_effort")
 
     first_broker = _unit_broker(tmp_path, alert_repeat_s=10)
     first_broker.run_write_canary_once(ops)
@@ -989,7 +953,7 @@ def test_write_canary_restores_dedupe_and_recovery_state_after_restart(
     assert restarted_broker._health()["write_canary_alarm"]["count"] == 2
 
     clock[0] = 102
-    ops.create_error = None
+    ops.probe_error = None
     restarted_broker.run_write_canary_once(ops)
     events = [
         json.loads(line)
@@ -1001,48 +965,45 @@ def test_write_canary_restores_dedupe_and_recovery_state_after_restart(
     assert after_recovery._health()["write_canary_alarm"] is None
 
 
-def test_write_canary_reports_orphan_then_reconciles_it(tmp_path: Path, monkeypatch):
+def test_write_canary_rejects_invalid_probe_receipt(tmp_path: Path, monkeypatch):
     broker = _unit_broker(tmp_path)
     ops = _FakeCanaryOps()
-    # Initial archive + one bounded cleanup retry both fail.
-    ops.archive_outcomes = [False, False]
-    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
-
-    failed = broker.run_write_canary_once(ops)
-
-    orphan_id = failed["task_id"]
-    assert failed["kind"] == "write-canary-archive"
-    assert failed["phase"] == "archive"
-    assert failed["orphan_task_ids"] == [orphan_id]
-    assert ops.rows[orphan_id]["status"] == "blocked"
-
-    recovered = broker.run_write_canary_once(ops)
-    assert recovered["ok"] is True
-    assert recovered["reconciled_task_ids"] == [orphan_id]
-    assert ops.rows[orphan_id]["status"] == "archived"
-
-
-def test_write_canary_verification_failure_attempts_terminal_cleanup(
-    tmp_path: Path, monkeypatch
-):
-    broker = _unit_broker(tmp_path)
-    ops = _FakeCanaryOps()
-    ops.mismatch_next_get = True
+    ops.receipt_overrides["task_id"] = "t_wrong_receipt"
     monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
 
     result = broker.run_write_canary_once(ops)
 
     assert result["ok"] is False
     assert result["kind"] == "write-canary-verification"
-    assert result["phase"] == "verify-create"
+    assert result["phase"] == "probe-receipt"
     assert result["orphan_task_ids"] == []
-    assert ops.rows[result["task_id"]]["status"] == "archived"
+    assert result["cleanup_errors"] == []
+
+
+def test_write_canary_rejects_nonzero_persistence_receipt(
+    tmp_path: Path, monkeypatch
+):
+    broker = _unit_broker(tmp_path)
+    ops = _FakeCanaryOps()
+    ops.receipt_overrides["persisted_counts"] = {
+        "tasks": 1,
+        "task_events": 1,
+        "task_runs": 1,
+    }
+    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
+
+    result = broker.run_write_canary_once(ops)
+
+    assert result["ok"] is False
+    assert result["kind"] == "write-canary-persistence"
+    assert result["phase"] == "verify-rollback"
+    assert result["persisted_counts"] is None
 
 
 def test_write_canary_classifies_slow_transaction_timeout(tmp_path: Path, monkeypatch):
     broker = _unit_broker(tmp_path)
     ops = _FakeCanaryOps()
-    ops.create_error = sqlite3.OperationalError(
+    ops.probe_error = sqlite3.OperationalError(
         "TxnStale: interactive txn exceeded absolute cap 2.0s (slow holder)"
     )
     monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
@@ -1051,103 +1012,8 @@ def test_write_canary_classifies_slow_transaction_timeout(tmp_path: Path, monkey
 
     assert result["ok"] is False
     assert result["kind"] == "write-canary-timeout"
-    assert result["phase"] == "create"
+    assert result["phase"] == "transaction-probe"
     assert boardd_runtime.TXN_MAX_S == 2.0
-
-
-def test_write_canary_refuses_partial_marker_collision(tmp_path: Path, monkeypatch):
-    broker = _unit_broker(tmp_path)
-    ops = _FakeCanaryOps()
-    ops.rows["t_real"] = {
-        "id": "t_real",
-        "title": "operator card",
-        "body": "not a canary",
-        "status": "blocked",
-        "created_by": boardd_runtime.WRITE_CANARY_CREATED_BY,
-        "idempotency_key": None,
-        "created_at": 1,
-    }
-    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
-
-    result = broker.run_write_canary_once(ops)
-
-    assert result["kind"] == "write-canary-identity-collision"
-    assert result["phase"] == "reconcile-identity"
-    assert result["orphan_task_ids"] == []
-    assert ops.archive_calls == []
-    assert ops.rows["t_real"]["status"] == "blocked"
-
-
-def test_write_canary_reconcile_limit_reports_discovered_orphans(
-    tmp_path: Path, monkeypatch
-):
-    broker = _unit_broker(tmp_path)
-    ops = _FakeCanaryOps()
-    expected_ids = []
-    for index in range(boardd_runtime.WRITE_CANARY_STALE_LIMIT + 1):
-        identity = broker._canary_identity(f"stale-{index}")
-        task_id = f"t_stale{index:02d}"
-        expected_ids.append(task_id)
-        ops.rows[task_id] = {
-            "id": task_id,
-            "title": identity["title"],
-            "body": identity["body"],
-            "status": "blocked",
-            "created_by": boardd_runtime.WRITE_CANARY_CREATED_BY,
-            "idempotency_key": identity["idempotency_key"],
-            "created_at": index,
-        }
-    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
-
-    result = broker.run_write_canary_once(ops)
-
-    assert result["kind"] == "write-canary-reconcile-limit"
-    assert result["orphan_task_ids"] == expected_ids
-    assert ops.archive_calls == []
-
-
-def test_stale_canary_archive_failure_gets_one_guarded_cleanup_retry(
-    tmp_path: Path, monkeypatch
-):
-    broker = _unit_broker(tmp_path)
-    ops = _FakeCanaryOps()
-    stale_identity = broker._canary_identity()
-    stale_id = "t_stale_retry"
-    ops.rows[stale_id] = {
-        "id": stale_id,
-        "title": stale_identity["title"],
-        "body": stale_identity["body"],
-        "status": "blocked",
-        "created_by": boardd_runtime.WRITE_CANARY_CREATED_BY,
-        "idempotency_key": stale_identity["idempotency_key"],
-        "created_at": 1,
-    }
-    ops.archive_outcomes = [False, True]
-    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
-
-    result = broker.run_write_canary_once(ops)
-
-    assert result["ok"] is False
-    assert result["phase"] == "reconcile-archive"
-    assert result["task_id"] == stale_id
-    assert result["orphan_task_ids"] == []
-    assert ops.archive_calls == [stale_id, stale_id]
-    assert ops.rows[stale_id]["status"] == "archived"
-
-
-def test_write_canary_guard_refuses_repurposed_row(tmp_path: Path, monkeypatch):
-    broker = _unit_broker(tmp_path)
-    ops = _FakeCanaryOps()
-    ops.before_archive = lambda row: row.__setitem__("body", "operator changed it")
-    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
-
-    result = broker.run_write_canary_once(ops)
-
-    assert result["kind"] == "write-canary-archive"
-    assert result["phase"] == "archive"
-    assert result["orphan_task_ids"] == []
-    assert "guarded cleanup refused" in result["cleanup_errors"][0]
-    assert ops.rows[result["task_id"]]["status"] == "blocked"
 
 
 @pytest.mark.parametrize(
@@ -1183,32 +1049,27 @@ def test_write_canary_rejects_non_finite_durations(
         )
 
 
-def test_write_canary_once_uses_real_broker_create_and_archive_path(tmp_path: Path):
+def _task_history_counts(client: Client) -> dict[str, int]:
+    rows = client.query(
+        "SELECT "
+        "(SELECT COUNT(*) FROM tasks) AS tasks, "
+        "(SELECT COUNT(*) FROM task_events) AS task_events, "
+        "(SELECT COUNT(*) FROM task_runs) AS task_runs"
+    )
+    assert len(rows) == 1
+    return {name: int(rows[0][name]) for name in ("tasks", "task_events", "task_runs")}
+
+
+def test_write_canary_once_rolls_back_real_broker_task_event_and_run_writes(
+    tmp_path: Path,
+):
     with running_boardd(
         tmp_path,
         import_schema=True,
         write_canary_mode="once",
         write_canary_start_delay=1,
-    ) as (client, db_path, socket_path):
-        near_key = boardd_runtime.WRITE_CANARY_MARKER.replace("_", "x") + ":near"
-        near = _run_kanban_db_script(
-            db_path,
-            socket_path,
-            f"""
-import json
-from hermes_cli import kanban_db as kb
-with kb.connect() as conn:
-    task_id = kb.create_task(
-        conn,
-        title="operator near-match",
-        body="not a canary",
-        created_by="operator",
-        initial_status="blocked",
-        idempotency_key={near_key!r},
-    )
-    print(json.dumps({{"id": task_id}}))
-""",
-        )
+    ) as (client, _, _):
+        before = _task_history_counts(client)
         deadline = time.monotonic() + 10
         health = None
         while time.monotonic() < deadline:
@@ -1216,81 +1077,107 @@ with kb.connect() as conn:
             if health["write_canary"]["last_success_ts"] is not None:
                 break
             time.sleep(0.05)
+
         assert health is not None
         assert health["write_canary_ok"] is True
         assert health["write_canary"]["runs"] == 1
-        rows = client.query(
-            "SELECT id, title, status, created_by, idempotency_key FROM tasks "
-            "WHERE created_by = ?",
+        assert health["write_canary"]["probe_kind"] == "rollback-transaction"
+        assert health["write_canary"]["last_persisted_counts"] == {
+            "tasks": 0,
+            "task_events": 0,
+            "task_runs": 0,
+        }
+        assert health["write_canary"]["last_task_id"].startswith("t_wc_")
+        assert health["write_canary"]["last_event_id"] > 0
+        assert health["write_canary"]["last_run_id"] > 0
+        assert _task_history_counts(client) == before
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
             [boardd_runtime.WRITE_CANARY_CREATED_BY],
-        )
-        assert len(rows) == 1
-        assert rows[0]["status"] == "archived"
-        assert rows[0]["title"].startswith(boardd_runtime.WRITE_CANARY_TITLE_PREFIX)
-        assert rows[0]["idempotency_key"].startswith(
-            f"{boardd_runtime.WRITE_CANARY_MARKER}:"
-        )
-        near_row = client.get_task(near["id"])
-        assert near_row["status"] == "blocked"
-        assert near_row["body"] == "not a canary"
+        ) == [{"n": 0}]
 
 
-def test_write_canary_detects_title_only_reserved_marker_collision(tmp_path: Path):
-    # Periodic short-interval mode (not once+wall-clock delay): insert the
-    # collision first, then wait for a post-insertion canary run. Avoids the
-    # race where once-mode fires healthy before the collision exists.
+def test_periodic_write_canary_repeated_runs_leave_board_counts_unchanged(
+    tmp_path: Path,
+):
     with running_boardd(
         tmp_path,
         import_schema=True,
         write_canary_mode="periodic",
-        write_canary_start_delay=0,
+        write_canary_start_delay=1,
         write_canary_interval=0.15,
         write_canary_timeout=5,
-    ) as (client, db_path, socket_path):
-        collision = _run_kanban_db_script(
-            db_path,
-            socket_path,
-            f"""
-import json
-from hermes_cli import kanban_db as kb
-with kb.connect() as conn:
-    task_id = kb.create_task(
-        conn,
-        title={f"{boardd_runtime.WRITE_CANARY_TITLE_PREFIX} operator"!r},
-        body="operator card",
-        created_by="operator",
-        initial_status="blocked",
-        idempotency_key="operator-key",
-    )
-    print(json.dumps({{"id": task_id}}))
-""",
-        )
-        runs_at_insert = client.ping()["write_canary"]["runs"]
+    ) as (client, _, _):
+        before = _task_history_counts(client)
         deadline = time.monotonic() + 10
         health = None
         while time.monotonic() < deadline:
             health = client.ping()
-            alarm = health.get("write_canary_alarm") or {}
-            saw_post_insert_run = health["write_canary"]["runs"] > runs_at_insert
-            # Concurrent run that already observed the collision is also fine.
-            saw_collision = (
-                health["write_canary_ok"] is False
-                and alarm.get("kind") == "write-canary-identity-collision"
-                and alarm.get("task_id") == collision["id"]
-            )
-            if saw_collision and (
-                saw_post_insert_run or health["write_canary"]["runs"] >= 1
-            ):
+            if health["write_canary"]["runs"] >= 3:
+                break
+            time.sleep(0.05)
+
+        assert health is not None
+        assert health["write_canary_ok"] is True
+        assert health["write_canary"]["runs"] >= 3
+        assert health["write_canary"]["last_persisted_counts"] == {
+            "tasks": 0,
+            "task_events": 0,
+            "task_runs": 0,
+        }
+        assert _task_history_counts(client) == before
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ? "
+            "OR idempotency_key LIKE ?",
+            [
+                boardd_runtime.WRITE_CANARY_CREATED_BY,
+                f"{boardd_runtime.WRITE_CANARY_MARKER}:%",
+            ],
+        ) == [{"n": 0}]
+
+
+def test_failed_write_canary_alarms_and_rolls_back_partial_probe(tmp_path: Path):
+    schema_file = tmp_path / "canary-failure-schema.sql"
+    schema_file.write_text(
+        _repo_schema_sql()
+        + """
+CREATE TRIGGER reject_write_canary_event
+BEFORE INSERT ON task_events
+WHEN NEW.kind = 'write_canary_probe'
+BEGIN
+    SELECT RAISE(ABORT, 'forced write-canary event failure');
+END;
+""",
+        encoding="utf-8",
+    )
+    with running_boardd(
+        tmp_path,
+        schema_file=schema_file,
+        write_canary_mode="once",
+        write_canary_start_delay=1,
+    ) as (client, _, _):
+        before = _task_history_counts(client)
+        deadline = time.monotonic() + 10
+        health = None
+        while time.monotonic() < deadline:
+            health = client.ping()
+            if health["write_canary_alarm"] is not None:
                 break
             time.sleep(0.05)
 
         assert health is not None
         assert health["write_canary_ok"] is False
-        assert health["write_canary_alarm"]["kind"] == (
-            "write-canary-identity-collision"
-        )
-        assert health["write_canary_alarm"]["task_id"] == collision["id"]
-        assert client.get_task(collision["id"])["status"] == "blocked"
+        assert health["health_ok"] is False
+        assert health["write_canary"]["runs"] == 1
+        alarm = health["write_canary_alarm"]
+        assert alarm["kind"] == "write-canary-failure"
+        assert alarm["phase"] == "transaction-probe"
+        assert "forced write-canary event failure" in alarm["detail"]
+        assert _task_history_counts(client) == before
+        assert client.query(
+            "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
+            [boardd_runtime.WRITE_CANARY_CREATED_BY],
+        ) == [{"n": 0}]
 
 
 def test_guarded_archive_rejects_identity_changed_by_prior_broker_write(tmp_path: Path):
@@ -1388,7 +1275,7 @@ def test_write_canary_total_deadline_bounds_slow_transaction_holder(tmp_path: Pa
         assert health["write_canary_ok"] is False
         assert health["txn_capped"] >= 1
         assert alarm["kind"] == "write-canary-timeout"
-        assert alarm["phase"] == "reconcile-discovery"
+        assert alarm["phase"] == "transaction-probe"
         assert alarm["duration_ms"] < 750
         assert "after 1 attempts" in alarm["detail"]
 
