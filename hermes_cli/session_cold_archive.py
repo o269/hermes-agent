@@ -398,10 +398,16 @@ def _read_stable_regular_bytes(
             raise ColdArchiveError(f"{label} is not a regular file")
         if required_mode is not None and stat.S_IMODE(before.st_mode) != required_mode:
             raise ColdArchiveError(f"{label} must already be mode {required_mode:04o}")
-        if require_current_owner and before.st_uid != os.geteuid():
-            raise ColdArchiveError(
-                f"{label} must be owned by the current effective user"
-            )
+        if require_current_owner:
+            get_effective_uid = getattr(os, "geteuid", None)
+            if get_effective_uid is None:
+                raise ColdArchiveError(
+                    f"{label} ownership cannot be proven on this platform"
+                )
+            if before.st_uid != get_effective_uid():
+                raise ColdArchiveError(
+                    f"{label} must be owned by the current effective user"
+                )
         if require_single_link and before.st_nlink != 1:
             raise ColdArchiveError(f"{label} must not have hardlink aliases")
         with os.fdopen(fd, "rb") as handle:
