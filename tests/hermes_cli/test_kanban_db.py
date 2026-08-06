@@ -763,6 +763,50 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+def test_detect_crashed_workers_respects_broker_prefixed_worker_host(
+    kanban_home, monkeypatch,
+):
+    """The broker host prefix must not make a remote worker look local.
+
+    Broker-routed claims are ``<broker-host>:<worker-host>:<pid>``.  A
+    dispatcher on the broker host may only probe the embedded worker host, not
+    the first field.  Exact regression for t_6d1b6e8e: blitz-vps falsely
+    reclaimed a live blitz-vps-2 worker because its remote PID was absent from
+    blitz-vps's /proc.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_claimer_id", lambda: "blitz-vps:999")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        remote = kb.create_task(conn, title="remote", assignee="vps2-eng1")
+        local = kb.create_task(conn, title="local", assignee="engineer")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (3252854, "blitz-vps:blitz-vps-2:3249054", remote),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (2049999, "blitz-vps:blitz-vps:2049375", local),
+        )
+        conn.commit()
+
+        assert kb.detect_crashed_workers(conn) == [local]
+        assert kb.get_task(conn, remote).status == "running"
+        assert kb.get_task(conn, remote).worker_pid == 3252854
+        assert kb.get_task(conn, local).status == "ready"
+
+        # The worker host itself still owns liveness/reclaim for this exact
+        # broker-prefixed lock, so a genuinely dead remote worker is recoverable.
+        monkeypatch.setattr(_kb, "_claimer_id", lambda: "blitz-vps-2:1000")
+        assert kb.detect_crashed_workers(conn) == [remote]
+        assert kb.get_task(conn, remote).status == "ready"
+
+
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
