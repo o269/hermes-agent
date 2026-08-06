@@ -28,6 +28,154 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+class CodexStreamLimitError(RuntimeError):
+    """A local retained Codex SSE category exceeded its configured bound."""
+
+    def __init__(self, phase: str, *, limit: int, observed: int) -> None:
+        self.phase = phase
+        self.limit = int(limit)
+        self.observed = int(observed)
+        super().__init__(
+            "Codex retained stream limit exceeded "
+            f"(phase={phase}, limit={self.limit}, observed={self.observed})"
+        )
+
+
+def _codex_utf8_bytes(value: str, *, stop_after: int) -> int:
+    """Count UTF-8 bytes without allocating a duplicate output chunk."""
+    total = 0
+    for char in value:
+        codepoint = ord(char)
+        total += (
+            1
+            if codepoint < 0x80
+            else 2
+            if codepoint < 0x800
+            else 3
+            if codepoint < 0x10000
+            else 4
+        )
+        if total > stop_after:
+            return stop_after + 1
+    return total
+
+
+def _codex_slot_names(tp: type) -> tuple:
+    """Collect data-slot names across a type's MRO (empty when not slotted)."""
+    names: list = []
+    for klass in getattr(tp, "__mro__", (tp,)):
+        slots = getattr(klass, "__dict__", {}).get("__slots__")
+        if not slots:
+            continue
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            # __dict__/__weakref__ carry no retained payload of their own.
+            if isinstance(name, str) and not name.startswith("__"):
+                names.append(name)
+    return tuple(names)
+
+
+def _codex_scalar_leaf_bytes(item: Any) -> int:
+    """Fixed charge for known IMMUTABLE stdlib scalar leaves, else -1.
+
+    Only genuinely immutable, bounded-size types qualify; anything else that
+    is not a walkable container/object must be rejected by the caller rather
+    than waved through with a permissive constant (PR #53 exact-head review:
+    a slotted object carrying 1 MB was previously charged as 64 bytes).
+    """
+    import datetime
+    import decimal
+    import enum
+    import pathlib
+    import uuid
+
+    if isinstance(
+        item,
+        (
+            datetime.date,
+            datetime.time,
+            datetime.timedelta,
+            datetime.tzinfo,
+            uuid.UUID,
+            decimal.Decimal,
+            enum.Enum,
+            pathlib.PurePath,
+            type(Ellipsis),
+            type(NotImplemented),
+            range,
+            complex,
+        ),
+    ):
+        return 64
+    return -1
+
+
+def _bounded_codex_value_bytes(value: Any, *, stop_after: int) -> int:
+    """Estimate a done-item object graph without JSON serialization/copying.
+
+    Walks dicts, built-in collections, ``__dict__`` objects, and ``__slots__``
+    objects (a legitimate compatibility-host object may carry arbitrarily
+    large ``function_call.arguments`` / reasoning payloads in slots — PR #53
+    exact-head review).  Known immutable stdlib scalars are charged a fixed
+    leaf bound; any other unknown non-scalar object is REJECTED (returns
+    ``stop_after + 1`` so the retained-byte ceiling trips fail-closed)
+    instead of being charged a permissive constant.
+    """
+    seen: set[int] = set()
+    nodes = 0
+
+    def _walk(item: Any, depth: int = 0) -> int:
+        nonlocal nodes
+        nodes += 1
+        if nodes > 100_000 or depth > 64:
+            return stop_after + 1
+        if item is None or isinstance(item, (bool, int, float)):
+            return 8
+        if isinstance(item, str):
+            return _codex_utf8_bytes(item, stop_after=stop_after)
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            return len(item)
+        item_id = id(item)
+        if item_id in seen:
+            return 0
+        seen.add(item_id)
+        total = 16
+        if isinstance(item, dict):
+            child_values = item.items()
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            child_values = ((None, child) for child in item)
+        elif hasattr(item, "__dict__") or _codex_slot_names(type(item)):
+
+            def _object_values():
+                if hasattr(item, "__dict__"):
+                    yield from vars(item).items()
+                for slot in _codex_slot_names(type(item)):
+                    try:
+                        yield slot, getattr(item, slot)
+                    except AttributeError:
+                        # Unset slot — no retained payload.
+                        continue
+
+            child_values = _object_values()
+        else:
+            leaf = _codex_scalar_leaf_bytes(item)
+            if leaf >= 0:
+                return leaf
+            # Unknown non-scalar object: reject fail-closed rather than
+            # charge a permissive constant that a payload can hide behind.
+            return stop_after + 1
+        for key, child in child_values:
+            if key is not None:
+                total += _walk(key, depth + 1)
+            total += _walk(child, depth + 1)
+            if total > stop_after:
+                return stop_after + 1
+        return total
+
+    return _walk(value)
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -931,6 +1079,7 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    retention_limits: dict[str, int] | None = None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -981,6 +1130,25 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+    limits = retention_limits or {}
+    retained_bytes = {
+        "text_bytes": 0,
+        "commentary_bytes": 0,
+        "reasoning_bytes": 0,
+        "done_item_bytes": 0,
+    }
+
+    def _charge(phase: str, value: str) -> None:
+        limit = int(limits.get(f"max_{phase}", 0) or 0)
+        if limit <= 0:
+            return
+        observed = retained_bytes[phase] + _codex_utf8_bytes(
+            value,
+            stop_after=max(0, limit - retained_bytes[phase]),
+        )
+        if observed > limit:
+            raise CodexStreamLimitError(phase, limit=limit, observed=observed)
+        retained_bytes[phase] = observed
 
     # Content-free retained-event counters (seat-survival RSS diagnosis).
     # Never logs event payloads — only counts/byte totals/RSS.
@@ -1045,6 +1213,7 @@ def _consume_codex_event_stream(
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
             if delta_text and active_message_phase == "commentary":
+                _charge("commentary_bytes", delta_text)
                 commentary_text_deltas.append(delta_text)
                 if _stream_tel is not None:
                     try:
@@ -1059,12 +1228,14 @@ def _consume_codex_event_stream(
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text and active_message_phase == "analysis":
+                _charge("reasoning_bytes", delta_text)
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
+                _charge("text_bytes", delta_text)
                 collected_text_deltas.append(delta_text)
                 if _stream_tel is not None:
                     try:
@@ -1092,6 +1263,8 @@ def _consume_codex_event_stream(
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
+            if reasoning_text:
+                _charge("reasoning_bytes", reasoning_text)
             if reasoning_text and _stream_tel is not None:
                 try:
                     _stream_tel.note_reasoning_delta(reasoning_text)
@@ -1107,6 +1280,32 @@ def _consume_codex_event_stream(
         if event_type == "response.output_item.done":
             done_item = _event_field(event, "item")
             if done_item is not None:
+                max_items = int(limits.get("max_output_items", 0) or 0)
+                observed_items = len(collected_output_items) + 1
+                if max_items > 0 and observed_items > max_items:
+                    raise CodexStreamLimitError(
+                        "output_items",
+                        limit=max_items,
+                        observed=observed_items,
+                    )
+                done_limit = int(limits.get("max_done_item_bytes", 0) or 0)
+                if done_limit > 0:
+                    observed_done_bytes = retained_bytes["done_item_bytes"] + (
+                        _bounded_codex_value_bytes(
+                            done_item,
+                            stop_after=max(
+                                0,
+                                done_limit - retained_bytes["done_item_bytes"],
+                            ),
+                        )
+                    )
+                    if observed_done_bytes > done_limit:
+                        raise CodexStreamLimitError(
+                            "done_item_bytes",
+                            limit=done_limit,
+                            observed=observed_done_bytes,
+                        )
+                    retained_bytes["done_item_bytes"] = observed_done_bytes
                 collected_output_items.append(done_item)
                 if _stream_tel is not None:
                     try:
@@ -1215,6 +1414,90 @@ def _consume_codex_event_stream(
         error=terminal_error,
     )
     return final
+
+
+def _enforce_codex_completed_object_limits(
+    final: Any,
+    *,
+    retention_limits: dict[str, int] | None = None,
+) -> None:
+    """Charge a completed (non-streamed) Responses object against local caps.
+
+    Some Codex-compatible hosts answer ``stream=True`` with a completed
+    Responses object instead of an SSE iterator.  That path bypasses the
+    per-event retained-byte accounting in ``_consume_codex_event_stream``;
+    without this check a chat-style output cap (compression / MoA) would
+    retain an unbounded payload, defeating the RSS safety fence (PR #79668
+    review).  The same ceilings are enforced here against the finished
+    object's output items.
+    """
+    limits = retention_limits or {}
+    if not any(int(v or 0) > 0 for v in limits.values()):
+        return
+
+    def _field(obj: Any, key: str, default: Any = None) -> Any:
+        val = getattr(obj, key, None)
+        if val is None and isinstance(obj, dict):
+            val = obj.get(key, default)
+        return val if val is not None else default
+
+    # Never materialize the full output reference container just to count it:
+    # an already-huge completed response would be duplicated before the item
+    # ceiling trips (PR #53 exact-head review).  Consume at most
+    # max_output_items + 1 entries; without an item cap, iterate the
+    # provider's own container directly for byte accounting.
+    output_value = _field(final, "output", None) or []
+    max_items = int(limits.get("max_output_items", 0) or 0)
+    if max_items > 0:
+        import itertools
+
+        items = list(itertools.islice(iter(output_value), max_items + 1))
+        if len(items) > max_items:
+            raise CodexStreamLimitError(
+                "output_items", limit=max_items, observed=max_items + 1
+            )
+    else:
+        items = output_value
+
+    text_limit = int(limits.get("max_text_bytes", 0) or 0)
+    done_limit = int(limits.get("max_done_item_bytes", 0) or 0)
+    reasoning_limit = int(limits.get("max_reasoning_bytes", 0) or 0)
+    text_bytes = 0
+    done_bytes = 0
+    reasoning_bytes = 0
+
+    for item in items:
+        if done_limit > 0:
+            done_bytes += _bounded_codex_value_bytes(
+                item, stop_after=max(0, done_limit - done_bytes)
+            )
+            if done_bytes > done_limit:
+                raise CodexStreamLimitError(
+                    "done_item_bytes", limit=done_limit, observed=done_bytes
+                )
+        item_type = _field(item, "type", "")
+        if item_type == "message" and text_limit > 0:
+            for part in (_field(item, "content", None) or []):
+                ptype = _field(part, "type", "")
+                if ptype in {"output_text", "text"}:
+                    text_bytes += _codex_utf8_bytes(
+                        str(_field(part, "text", "") or ""),
+                        stop_after=max(0, text_limit - text_bytes),
+                    )
+                    if text_bytes > text_limit:
+                        raise CodexStreamLimitError(
+                            "text_bytes", limit=text_limit, observed=text_bytes
+                        )
+        elif item_type == "reasoning" and reasoning_limit > 0:
+            reasoning_bytes += _bounded_codex_value_bytes(
+                item, stop_after=max(0, reasoning_limit - reasoning_bytes)
+            )
+            if reasoning_bytes > reasoning_limit:
+                raise CodexStreamLimitError(
+                    "reasoning_bytes",
+                    limit=reasoning_limit,
+                    observed=reasoning_bytes,
+                )
 
 
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):

@@ -5,9 +5,13 @@ agent-level lock against a real ``SessionDB``) by focusing on gateway-level
 isolation guarantees:
 
 1. Five distinct sessions compressing in parallel must not alias each other's
-   session_ids (no cross-session contamination).
+   session_ids (no cross-session contamination). Under the process-wide
+   compression permit (the RSS memory fence) exactly one attempt is admitted;
+   the rest fail closed with their original transcripts and keep their parent
+   session_ids. The aliasing invariant is what this test pins.
 2. Two agents sharing the same session_id must serialize: exactly one rotates,
-   the other returns its input unchanged (the no-op / lock-loser contract).
+   the other returns its input unchanged (the permit busy / lock-loser
+   contract).
 
 The stub-compressor pattern mirrors ``test_compression_concurrent_fork.py``:
 the compressor returns deterministic output and sleeps briefly so threads
@@ -25,6 +29,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent.conversation_compression as conversation_compression
 from hermes_state import SessionDB
 
 
@@ -78,6 +83,35 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     return agent
 
 
+class _BarrieredPermit:
+    """Test facade over the real process compression permit.
+
+    The permit is a C-level ``threading.BoundedSemaphore`` whose ``acquire``
+    cannot be wrapped per-instance, so the module global is swapped for this
+    facade during a test. Every caller rendezvous at a barrier *before* the
+    real non-blocking acquire, which forces genuine simultaneous contention —
+    exactly the condition these tests mean to assert, with zero timing
+    dependency (a two-party barrier in front of an atomic acquire decides a
+    single winner even under CI CPU starvation).
+    """
+
+    def __init__(self, real: threading.BoundedSemaphore, parties: int) -> None:
+        self._real = real
+        self._barrier = threading.Barrier(parties, timeout=15)
+
+    def acquire(self, blocking: bool = False) -> bool:  # noqa: FBT001,FBT002 - mirrors semaphore API
+        try:
+            self._barrier.wait()
+        except threading.BrokenBarrierError:
+            # A test-side timeout must never masquerade as permit-logic
+            # failure: fall through to the real (atomic) acquire.
+            pass
+        return self._real.acquire(blocking=blocking)
+
+    def release(self) -> None:
+        self._real.release()
+
+
 _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
 
@@ -86,13 +120,13 @@ _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 # ---------------------------------------------------------------------------
 
 def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
-    """Five distinct sessions compressing in parallel must each produce a unique
-    post-compression session_id; no two agents must end up sharing an id.
+    """Five distinct sessions compressing in parallel stay isolated.
 
-    Without per-session locking there is no cross-session aliasing anyway (each
-    agent generates its own timestamp + uuid suffix), but this test makes the
-    invariant explicit and would catch any regression where session_id generation
-    became shared state (e.g. a module-level counter or a shared random seed).
+    The process-wide compression permit (RSS memory fence) admits exactly one
+    attempt; the other four fail closed with their original transcripts and
+    keep their parent session_ids. The invariant this test pins is isolation:
+    the admitted attempt rotates to a fresh unique id, no two agents ever
+    share a post-compression id, and no rejected attempt mutates its session.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
 
@@ -110,19 +144,32 @@ def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
         except Exception as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=run, args=(a,), name=f"session-{i}") for i, a in enumerate(agents)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=15)
+    real_permit = conversation_compression._process_compression_permit
+    conversation_compression._process_compression_permit = _BarrieredPermit(
+        real_permit, parties=n
+    )
+    try:
+        threads = [threading.Thread(target=run, args=(a,), name=f"session-{i}") for i, a in enumerate(agents)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+    finally:
+        conversation_compression._process_compression_permit = real_permit
 
     assert not errors, f"Compression raised exceptions: {errors}"
 
-    # Every agent must have rotated to a new, unique session_id.
+    # Exactly one agent wins the permit and rotates to a fresh session_id;
+    # the rest are busy-rejected and must keep their parent id untouched.
     new_ids = [a.session_id for a in agents]
-    assert all(sid not in parent_ids for sid in new_ids), (
-        "At least one agent did not rotate its session_id during compression. "
+    rotated = [sid for sid in new_ids if sid not in parent_ids]
+    kept = [sid for sid in new_ids if sid in parent_ids]
+    assert len(rotated) == 1, (
+        f"Expected exactly one permit winner to rotate, got {len(rotated)}. "
         f"parent_ids={parent_ids}  new_ids={new_ids}"
+    )
+    assert len(kept) == n - 1, (
+        f"Busy-rejected agents must keep their parent session_id: {new_ids}"
     )
     assert len(set(new_ids)) == n, (
         f"Post-compression session_ids are not unique: {new_ids}. "
@@ -133,10 +180,12 @@ def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
 def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     """Two agents sharing a session_id must not both rotate it.
 
-    The per-session compression lock (added in #34351) serializes concurrent
-    compress() calls keyed on the same session_id.  Exactly one agent must
-    rotate (the lock winner); the other must return its messages unchanged (the
-    lock loser, which detects ``len(returned) == len(input)`` and backs off).
+    The process-wide compression permit (RSS memory fence) is the first
+    serialization gate: one attempt is admitted and the other is busy-rejected
+    before any expensive work, returning its messages unchanged. (The
+    per-session DB lock added in #34351 remains as the second gate for the
+    admitted attempt.) Exactly one agent must rotate; the loser detects
+    ``len(returned) == len(input)`` and backs off.
 
     This is the gateway analogue of the fork test in
     ``test_compression_concurrent_fork.py`` but scoped to the two-agent /
@@ -150,30 +199,6 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     agent_a = _build_agent_with_db(db, shared_sid)
     agent_b = _build_agent_with_db(db, shared_sid)
 
-    # Force genuine simultaneous lock contention instead of relying on a
-    # ``time.sleep`` inside the compressor stub to make the threads overlap.
-    # Under CI CPU starvation that sleep is not enough: one thread could
-    # acquire → compress → rotate → RELEASE the lock before the other even
-    # reaches ``try_acquire``, so both would acquire on the shared id and
-    # both would compress (the historical "got 2" flake). A two-party
-    # barrier in front of the real acquire guarantees both threads are
-    # contending for the lock at the same instant, which is exactly the
-    # condition this test means to assert — with zero timing dependency.
-    barrier = threading.Barrier(2, timeout=15)
-    _real_acquire = db.try_acquire_compression_lock
-
-    def _barriered_acquire(*args, **kwargs):
-        # Rendezvous both callers, then let the real (atomic) acquire decide
-        # the single winner. Tolerate a broken barrier so a test-side timeout
-        # never masquerades as a lock-logic failure.
-        try:
-            barrier.wait()
-        except threading.BrokenBarrierError:
-            pass
-        return _real_acquire(*args, **kwargs)
-
-    db.try_acquire_compression_lock = _barriered_acquire
-
     results: dict[str, list | None] = {"a": None, "b": None}
     errors: list[Exception] = []
 
@@ -184,16 +209,22 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
         except Exception as exc:
             errors.append(exc)
 
-    t_a = threading.Thread(target=run, args=("a", agent_a), name="main_turn")
-    t_b = threading.Thread(target=run, args=("b", agent_b), name="review_fork")
-    t_a.start()
-    t_b.start()
-    t_a.join(timeout=15)
-    t_b.join(timeout=15)
-
-    # Restore the real method so the post-join lock-leak assertion below
-    # (and any future call) hits the unwrapped implementation.
-    db.try_acquire_compression_lock = _real_acquire
+    # Force genuine simultaneous contention at the permit gate instead of
+    # relying on the compressor stub's ``time.sleep`` to overlap threads:
+    # both callers rendezvous, then the real atomic acquire picks the winner.
+    real_permit = conversation_compression._process_compression_permit
+    conversation_compression._process_compression_permit = _BarrieredPermit(
+        real_permit, parties=2
+    )
+    try:
+        t_a = threading.Thread(target=run, args=("a", agent_a), name="main_turn")
+        t_b = threading.Thread(target=run, args=("b", agent_b), name="review_fork")
+        t_a.start()
+        t_b.start()
+        t_a.join(timeout=15)
+        t_b.join(timeout=15)
+    finally:
+        conversation_compression._process_compression_permit = real_permit
 
     assert not errors, f"Compression raised exceptions: {errors}"
 
@@ -209,12 +240,12 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
 
     assert compressed_count == 1, (
         f"Expected exactly one agent to compress, got {compressed_count}. "
-        "If both compressed, the lock failed to serialize. "
-        "If neither compressed, both lost the lock (check lock logic)."
+        "If both compressed, the permit failed to serialize. "
+        "If neither compressed, both were rejected (check permit logic)."
     )
     assert unchanged_count == 1, (
-        f"Expected exactly one agent to return messages unchanged (lock loser), "
-        f"got {unchanged_count}."
+        f"Expected exactly one agent to return messages unchanged (permit "
+        f"busy-rejection), got {unchanged_count}."
     )
 
     # Exactly one session_id rotation must have occurred.
@@ -226,7 +257,8 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
         "Both agents rotating produces a session fork (Damien's incident shape)."
     )
 
-    # The lock must be released so future compression on the NEW session_id works.
+    # The session lock must be released so future compression on the NEW
+    # session_id works.
     assert db.get_compression_lock_holder(shared_sid) is None, (
         "Compression lock leaked: still held on the parent session_id after both "
         "threads joined. Future compression on the child session would deadlock."

@@ -1966,6 +1966,59 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    def _insert_session_row_txn(
+        self,
+        conn,
+        session_id: str,
+        source: str,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Insert/enrich one session row using the caller's transaction."""
+        conn.execute(
+            """INSERT INTO sessions (
+               id, source, user_id, session_key, chat_id, chat_type, thread_id,
+               model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
+            )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   model = COALESCE(sessions.model, excluded.model),
+                   model_config = COALESCE(sessions.model_config, excluded.model_config),
+                   system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                   session_key = COALESCE(sessions.session_key, excluded.session_key),
+                   chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                   chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                   thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                   parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                   cwd = COALESCE(sessions.cwd, excluded.cwd),
+                   profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
+            (
+                session_id,
+                source,
+                user_id,
+                session_key,
+                chat_id,
+                chat_type,
+                thread_id,
+                model,
+                json.dumps(model_config) if model_config else None,
+                system_prompt,
+                parent_session_id,
+                cwd,
+                profile_name,
+                time.time(),
+            ),
+        )
+
     def _insert_session_row(
         self,
         session_id: str,
@@ -2000,47 +2053,90 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
+
         def _do(conn):
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
-                )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
-                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
-                       session_key = COALESCE(sessions.session_key, excluded.session_key),
-                       chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
-                       chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
-                       thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
-                       cwd = COALESCE(sessions.cwd, excluded.cwd),
-                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    session_key,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    cwd,
-                    profile_name,
-                    time.time(),
-                ),
+            self._insert_session_row_txn(
+                conn,
+                session_id,
+                source,
+                model=model,
+                model_config=model_config,
+                system_prompt=system_prompt,
+                user_id=user_id,
+                session_key=session_key,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                parent_session_id=parent_session_id,
+                cwd=cwd,
+                profile_name=profile_name,
             )
+
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def publish_compression_rotation(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        *,
+        source: str,
+        messages: List[Dict[str, Any]],
+        system_prompt: str,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Atomically end a compression parent and publish its resumable child.
+
+        Parent termination, child creation, prompt publication, and compacted
+        transcript insertion share one ``BEGIN IMMEDIATE`` transaction. Any
+        serialization, insert, trigger, or commit failure rolls every mutation
+        back, so callers never need a second compensating write to recover a
+        live parent.
+        """
+        if not parent_session_id or not child_session_id:
+            raise ValueError("compression rotation requires parent and child ids")
+        if parent_session_id == child_session_id:
+            raise ValueError("compression rotation child must differ from parent")
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (child_session_id,)
+            ).fetchone():
+                raise RuntimeError("compression rotation child already exists")
+
+            ended = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), parent_session_id),
+            )
+            if ended.rowcount != 1:
+                raise RuntimeError("compression rotation parent is missing or ended")
+
+            self._insert_session_row_txn(
+                conn,
+                child_session_id,
+                source,
+                model=model,
+                model_config=model_config,
+                system_prompt=system_prompt,
+                parent_session_id=parent_session_id,
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, child_session_id, messages
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                "WHERE id = ?",
+                (inserted, tool_calls_total, child_session_id),
+            )
+            return child_session_id
+
+        return self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,
