@@ -13,6 +13,7 @@ import pytest
 import agent.auxiliary_client as auxiliary
 import agent.context_compressor as context_compressor_module
 import agent.conversation_compression as compression
+import agent.codex_runtime as codex_runtime
 import hermes_cli.mem_trim as mem_trim
 from agent.context_compressor import ContextCompressor
 from agent.codex_runtime import CodexStreamLimitError
@@ -866,5 +867,681 @@ def test_in_place_commit_boundary_prompt_refresh_failure_returns_compacted(tmp_p
         assert agent._last_compression_attempt_in_place is True
         live = db.get_messages_as_conversation(parent)
         assert [m["content"] for m in live] == [m["content"] for m in compacted]
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# PR #53 exact-head review blockers — adversarial contract tests
+# ---------------------------------------------------------------------------
+
+
+def _fallback_chain(monkeypatch, fb_client, fb_model="fb-model", fb_label="openrouter"):
+    """Route call_llm's primary failure onto one recording fallback candidate."""
+    monkeypatch.setattr(
+        auxiliary,
+        "_try_configured_fallback_chain",
+        lambda *_a, **_kw: (fb_client, fb_model, fb_label),
+    )
+    monkeypatch.setattr(
+        auxiliary, "_try_main_fallback_chain", lambda *_a, **_kw: (None, None, "")
+    )
+    payment_fallback_calls = []
+    monkeypatch.setattr(
+        auxiliary,
+        "_try_payment_fallback",
+        lambda *_a, **_kw: payment_fallback_calls.append(1) or (None, None, ""),
+    )
+    return payment_fallback_calls
+
+
+def _primary_failing_provider():
+    primary = MagicMock()
+    primary.base_url = "https://primary.test/v1"
+    primary.chat.completions.create.side_effect = RuntimeError(
+        "402 payment required: insufficient credits"
+    )
+    return primary
+
+
+def _patch_aux_resolution(monkeypatch, primary):
+    monkeypatch.setattr(
+        auxiliary,
+        "_resolve_task_provider_model",
+        lambda *_a, **_kw: ("openrouter", "test-model", None, None, None),
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_get_cached_client",
+        lambda provider, *_a, **_kw: (primary, "test-model"),
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_get_auxiliary_task_config",
+        lambda _task: {"max_output_tokens": 12_000},
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_validate_llm_response",
+        lambda response, _task, **_kwargs: response,
+    )
+
+
+def test_sync_fallback_carries_clamped_compression_cap(monkeypatch):
+    """PR53 P0: primary fails over — the fallback request must carry the cap.
+
+    End-to-end sync path: the caller omits max_tokens, the fallback receives
+    the centrally clamped compression cap, and its (oversized-looking)
+    response is served through the normal validated route.
+    """
+    primary = _primary_failing_provider()
+    _patch_aux_resolution(monkeypatch, primary)
+
+    fb_client = MagicMock()
+    fb_client.base_url = "https://fallback.test/v1"
+    fb_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="y" * 1_000_000))]
+    )
+    fb_client.chat.completions.create.return_value = fb_response
+    _fallback_chain(monkeypatch, fb_client)
+
+    result = auxiliary.call_llm(
+        task="compression",
+        messages=[{"role": "user", "content": "summarize"}],
+    )
+
+    assert result is fb_response
+    fb_kwargs = fb_client.chat.completions.create.call_args.kwargs
+    assert ("max_tokens" in fb_kwargs) or ("max_completion_tokens" in fb_kwargs), (
+        "compression fallback request carried no injected output cap"
+    )
+    cap_value = fb_kwargs.get("max_tokens", fb_kwargs.get("max_completion_tokens"))
+    assert cap_value == 12_000  # centrally clamped configured cap
+
+
+def test_sync_fallback_caller_max_tokens_is_clamped_on_fallback(monkeypatch):
+    """The fallback must clamp an explicit caller max_tokens to the cap too."""
+    primary = _primary_failing_provider()
+    _patch_aux_resolution(monkeypatch, primary)
+
+    fb_client = MagicMock()
+    fb_client.base_url = "https://fallback.test/v1"
+    fb_client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+    )
+    _fallback_chain(monkeypatch, fb_client)
+
+    auxiliary.call_llm(
+        task="compression",
+        messages=[{"role": "user", "content": "summarize"}],
+        max_tokens=999_999,
+    )
+
+    fb_kwargs = fb_client.chat.completions.create.call_args.kwargs
+    cap_value = fb_kwargs.get("max_tokens", fb_kwargs.get("max_completion_tokens"))
+    assert cap_value == 12_000
+
+
+def test_sync_fallback_cap_rejection_fails_closed(monkeypatch):
+    """PR53 P0: a fallback rejecting the injected cap aborts compression."""
+    primary = _primary_failing_provider()
+    _patch_aux_resolution(monkeypatch, primary)
+
+    fb_client = MagicMock()
+    fb_client.base_url = "https://fallback.test/v1"
+    fb_client.chat.completions.create.side_effect = RuntimeError(
+        "Unsupported parameter: max_tokens is not supported"
+    )
+    payment_fallback_calls = _fallback_chain(monkeypatch, fb_client)
+
+    with pytest.raises(auxiliary.AuxiliaryCompressionLimitError):
+        auxiliary.call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "summarize"}],
+        )
+    # Fail-closed: the chain was NOT walked further after the refusal.
+    assert payment_fallback_calls == []
+
+
+def test_async_fallback_carries_cap_and_cap_rejection_fails_closed(monkeypatch):
+    """PR53 P0 async mirror: cap on the wire + fail-closed on refusal."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    primary = _primary_failing_provider()
+    _patch_aux_resolution(monkeypatch, primary)
+    # async_call_llm() accepts the sync fallback-chain result and converts it
+    # before dispatch. Keep these recording clients intact so the test probes
+    # the async helper's kwargs/exception contract instead of constructing a
+    # real AsyncOpenAI client from MagicMock credentials.
+    monkeypatch.setattr(
+        auxiliary,
+        "_to_async_client",
+        lambda client, model, **_kwargs: (client, model),
+    )
+
+    # Case 1: fallback answers — request must carry the clamped cap.
+    fb_client = MagicMock()
+    fb_client.base_url = "https://fallback.test/v1"
+    fb_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="y" * 1_000_000))]
+    )
+    fb_client.chat.completions.create = AsyncMock(return_value=fb_response)
+    _fallback_chain(monkeypatch, fb_client)
+
+    result = asyncio.run(
+        auxiliary.async_call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "summarize"}],
+        )
+    )
+    assert result is fb_response
+    fb_kwargs = fb_client.chat.completions.create.call_args.kwargs
+    cap_value = fb_kwargs.get("max_tokens", fb_kwargs.get("max_completion_tokens"))
+    assert cap_value == 12_000
+
+    # Case 2: fallback rejects the cap — must fail closed, not continue.
+    fb_rejecting = MagicMock()
+    fb_rejecting.base_url = "https://fallback.test/v1"
+    fb_rejecting.chat.completions.create = AsyncMock(
+        side_effect=RuntimeError("Unsupported parameter: max_tokens is not supported")
+    )
+    payment_fallback_calls = _fallback_chain(monkeypatch, fb_rejecting)
+
+    with pytest.raises(auxiliary.AuxiliaryCompressionLimitError):
+        asyncio.run(
+            auxiliary.async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+        )
+    assert payment_fallback_calls == []
+
+
+def test_fallback_auth_refresh_retry_carries_cap_and_fails_closed(monkeypatch):
+    """PR53 P0: the auth-refresh retry inside a fallback is fenced too.
+
+    First fallback attempt 401s; the refreshed-credential retry must still
+    carry the clamped compression cap and must fail closed when the retry
+    rejects it.
+    """
+    primary = _primary_failing_provider()
+
+    retry_client = MagicMock()
+    retry_client.base_url = "https://refresh.test/v1"
+    retry_client.chat.completions.create.side_effect = RuntimeError(
+        "Unsupported parameter: max_completion_tokens is not supported"
+    )
+
+    def _client_for(provider, *_a, **_kw):
+        if provider == "anthropic":
+            return retry_client, "retry-model"
+        return primary, "test-model"
+
+    monkeypatch.setattr(
+        auxiliary,
+        "_resolve_task_provider_model",
+        lambda *_a, **_kw: ("openrouter", "test-model", None, None, None),
+    )
+    monkeypatch.setattr(auxiliary, "_get_cached_client", _client_for)
+    monkeypatch.setattr(
+        auxiliary,
+        "_get_auxiliary_task_config",
+        lambda _task: {"max_output_tokens": 12_000},
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_validate_llm_response",
+        lambda response, _task, **_kwargs: response,
+    )
+
+    fb_client = MagicMock()
+    fb_client.base_url = "https://fallback.test/v1"
+    fb_client.chat.completions.create.side_effect = RuntimeError("Error code: 401")
+    _fallback_chain(monkeypatch, fb_client, fb_label="anthropic")
+    monkeypatch.setattr(
+        auxiliary, "_auth_refresh_provider_for_route", lambda *_a, **_kw: "anthropic"
+    )
+    monkeypatch.setattr(
+        auxiliary, "_refresh_provider_credentials", lambda *_a, **_kw: True
+    )
+
+    with pytest.raises(auxiliary.AuxiliaryCompressionLimitError):
+        auxiliary.call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "summarize"}],
+        )
+
+    retry_kwargs = retry_client.chat.completions.create.call_args.kwargs
+    cap_value = retry_kwargs.get(
+        "max_tokens", retry_kwargs.get("max_completion_tokens")
+    )
+    assert cap_value == 12_000
+
+
+def _bushy_container_graph(fanout: int = 64) -> list:
+    """Broad+shallow container graph: 1 + fanout + fanout² containers."""
+    return [[[] for _ in range(fanout)] for _ in range(fanout)]
+
+
+def test_snapshot_container_allocations_are_charged_against_cap():
+    """PR53 P0: container allocations count against the snapshot byte cap."""
+    messages = [
+        {"role": "user", "content": "x", "graph": _bushy_container_graph()}
+    ]
+    # 4,161 empty lists ≈ 266 KB of pure container allocation: a 512-byte cap
+    # must reject, where payload-only accounting admitted it wholesale.
+    with pytest.raises(compression.CompressionSnapshotTooLargeError):
+        compression._build_bounded_compression_snapshot(messages, max_bytes=512)
+
+    stats: dict[str, int] = {}
+    snapshot = compression._build_bounded_compression_snapshot(
+        messages, max_bytes=64 * 1024 * 1024, stats=stats
+    )
+    assert snapshot is not messages
+    container_count = 1 + 64 + 64 * 64
+    # Every allocated container is charged with the conservative bound...
+    assert stats["snapshot_retained_bytes"] >= (
+        compression._SNAPSHOT_LIST_CONTAINER_BYTES * container_count
+    )
+    # ...and counted as a node.
+    assert stats["snapshot_nodes"] >= container_count
+    # Measured upper bound: the charged estimate stays conservative against
+    # the real allocation size of the cloned graph.
+    import sys as _sys
+
+    def _actual_bytes(value, seen=None):
+        seen = seen or set()
+        if id(value) in seen:
+            return 0
+        seen.add(id(value))
+        total = _sys.getsizeof(value)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            total += sum(_actual_bytes(item, seen) for item in value)
+        elif isinstance(value, dict):
+            total += sum(
+                _actual_bytes(k, seen) + _actual_bytes(v, seen)
+                for k, v in value.items()
+            )
+        return total
+
+    assert stats["snapshot_retained_bytes"] >= _actual_bytes(snapshot)
+
+
+def test_preflight_estimator_charges_containers_and_keeps_sidecar_mass():
+    """PR53 P0: preflight projection matches the clone it admits."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "graph": _bushy_container_graph(),
+            "codex_reasoning_items": [{"encrypted_content": "z" * 2048}],
+        }
+    ]
+    estimate = compression._estimate_compression_message_graph(
+        messages, stop_after=64 * 1024 * 1024
+    )
+    container_count = 1 + 64 + 64 * 64
+    assert estimate["message_graph_bytes"] >= (
+        compression._SNAPSHOT_LIST_CONTAINER_BYTES * container_count
+    )
+    # Sidecar mass is counted for admission but no longer SUBTRACTED from the
+    # projected clone charge: mutable sidecar containers are structurally
+    # cloned into the worker snapshot (and again into the rollback snapshot).
+    assert estimate["opaque_replay_bytes"] >= 2048
+    assert estimate["snapshot_clone_bytes"] == estimate["message_graph_bytes"]
+
+
+def test_compress_context_rejects_oversized_container_graph_preflight(monkeypatch):
+    """The whole boundary rejects a container-heavy transcript before work."""
+    monkeypatch.setattr(
+        compression,
+        "_compression_memory_limits",
+        lambda: {
+            "rss_ceiling_bytes": 64 * 1024 * 1024 * 1024,
+            "message_graph_limit_bytes": 64 * 1024 * 1024,
+            "snapshot_limit_bytes": 4096,
+        },
+    )
+    impl_calls = []
+    monkeypatch.setattr(
+        compression,
+        "_compress_context_impl",
+        lambda *a, **kw: impl_calls.append(1) or _success_impl(*a, **kw),
+    )
+    agent = _DummyAgent("session-bushy")
+    original = [{"role": "user", "content": "x", "graph": _bushy_container_graph()}]
+
+    returned, _ = compression.compress_context(agent, original, "system")
+
+    assert returned is original
+    assert impl_calls == []
+    telemetry = agent.context_compressor._last_compression_telemetry
+    assert telemetry["failure_class"] == "snapshot_too_large"
+
+
+def test_bounded_snapshot_detaches_sets_in_messages_and_sidecars():
+    """PR53 P1: set/frozenset containers are detached, not aliased."""
+    caller_flags = {"alpha"}
+    caller_tags = {"original"}
+    messages = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "plugin_flags": caller_flags,
+            "codex_reasoning_items": {"tags": caller_tags},
+        }
+    ]
+    stats: dict[str, int] = {}
+    snapshot = compression._build_bounded_compression_snapshot(
+        messages, max_bytes=4 * 1024 * 1024, stats=stats
+    )
+
+    snap_flags = snapshot[0]["plugin_flags"]
+    snap_tags = snapshot[0]["codex_reasoning_items"]["tags"]
+    assert snap_flags == {"alpha"} and snap_flags is not caller_flags
+    assert snap_tags == {"original"} and snap_tags is not caller_tags
+    snap_flags.add("mutated")
+    snap_tags.add("mutated")
+    assert caller_flags == {"alpha"}
+    assert caller_tags == {"original"}
+    assert all(isinstance(value, int) for value in stats.values())
+
+
+def test_failed_attempt_cannot_mutate_caller_set_sidecars(monkeypatch):
+    """PR53 P1: a mutating engine cannot reach caller sets through aliases."""
+    def mutating_impl(agent, messages, _system_message, **_kwargs):
+        messages[0]["codex_reasoning_items"]["tags"].add("MUTATED")
+        messages[0]["plugin_flags"].add("MUTATED")
+        agent._last_compression_attempt_in_place = None
+        return messages, "cancelled"
+
+    monkeypatch.setattr(compression, "_compress_context_impl", mutating_impl)
+    agent = _DummyAgent("session-set-sidecar")
+    original = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "plugin_flags": {"original"},
+            "codex_reasoning_items": {"tags": {"original"}},
+        }
+    ]
+
+    returned, _ = compression.compress_context(agent, original, "system")
+
+    assert returned is original
+    assert original[0]["plugin_flags"] == {"original"}
+    assert original[0]["codex_reasoning_items"]["tags"] == {"original"}
+
+
+class _OpaqueSDKObject:
+    """Stand-in for an unknown mutable SDK/plugin object the cloner cannot detach."""
+
+    def __init__(self, payload: str = "opaque") -> None:
+        self.payload = payload
+
+
+def test_mutable_extension_engine_fails_closed_on_opaque_snapshot_objects(
+    monkeypatch,
+):
+    """PR53 P1: opaque mutable aliases + mutable engine → reject before invoke."""
+    impl_calls = []
+    monkeypatch.setattr(
+        compression,
+        "_compress_context_impl",
+        lambda *a, **kw: impl_calls.append(1) or _success_impl(*a, **kw),
+    )
+    agent = _DummyAgent("session-opaque")
+    # _DummyAgent's SimpleNamespace compressor is NOT the built-in — a
+    # mutable extension point by the fail-closed predicate.
+    private_payload = "SENSITIVE_OPAQUE_SIDECAR_PAYLOAD"
+    original = [
+        {
+            "role": "assistant",
+            "content": "live",
+            "sdk_obj": _OpaqueSDKObject(private_payload),
+        }
+    ]
+
+    returned, _ = compression.compress_context(agent, original, "system")
+
+    assert returned is original
+    assert impl_calls == []  # engine never invoked
+    telemetry = agent.context_compressor._last_compression_telemetry
+    assert telemetry["failure_class"] == "snapshot_opaque_mutable"
+    assert private_payload not in repr(telemetry)
+
+
+def test_engine_mutability_gate_pins_builtin_vs_extension():
+    """The fail-closed predicate: exact built-in type only is non-mutating."""
+    assert compression._engine_is_mutable_extension_point(_compressor()) is False
+    assert compression._engine_is_mutable_extension_point(SimpleNamespace()) is True
+
+    class _CustomCompressor(ContextCompressor):
+        pass
+
+    assert (
+        compression._engine_is_mutable_extension_point(
+            object.__new__(_CustomCompressor)
+        )
+        is True
+    )
+    assert compression._engine_is_mutable_extension_point(None) is True
+
+
+class _SlottedDoneItem:
+    """Compatibility-host done item carrying a large payload in __slots__."""
+
+    __slots__ = ("type", "arguments")
+
+    def __init__(self, payload: str) -> None:
+        self.type = "function_call"
+        self.arguments = payload
+
+
+def test_codex_completed_slotted_object_charged_against_done_item_cap():
+    """PR53 P1: a slotted completed object can no longer bypass the cap."""
+    closed = {"flag": False}
+    completed = SimpleNamespace(
+        output=[_SlottedDoneItem("y" * (1024 * 1024))],
+        usage=None,
+    )
+    completed.close = lambda: closed.__setitem__("flag", True)
+    client = _FakeCodexClient(completed)
+    adapter = auxiliary._CodexCompletionsAdapter(client, "gpt-test")
+
+    with pytest.raises(CodexStreamLimitError):
+        adapter.create(
+            messages=[{"role": "user", "content": "summarize"}],
+            max_tokens=1,
+        )
+    assert closed["flag"] is True
+
+
+def test_codex_completed_unknown_opaque_object_rejected_fail_closed():
+    """PR53 P1: unknown non-scalar objects are rejected, not charged 64B."""
+    completed = SimpleNamespace(
+        output=[{"type": "function_call", "opaque": object()}],
+        usage=None,
+    )
+    with pytest.raises(CodexStreamLimitError) as exc_info:
+        codex_runtime._enforce_codex_completed_object_limits(
+            completed,
+            retention_limits={"max_done_item_bytes": 4096},
+        )
+    assert exc_info.value.phase == "done_item_bytes"
+
+
+def test_codex_walk_bounded_charges_slotted_graph():
+    """The shared walker charges slotted payloads near their real size."""
+    charged = codex_runtime._bounded_codex_value_bytes(
+        _SlottedDoneItem("y" * (1024 * 1024)),
+        stop_after=8 * 1024 * 1024,
+    )
+    assert charged >= 1024 * 1024
+
+
+def test_codex_completed_output_item_cap_checks_without_materializing():
+    """PR53 P1: output_items enforcement consumes at most max+1 entries."""
+    consumed = {"count": 0}
+
+    def _output_stream():
+        for _ in range(100):
+            consumed["count"] += 1
+            yield {"type": "message", "content": []}
+
+    completed = SimpleNamespace(output=_output_stream(), usage=None)
+    with pytest.raises(CodexStreamLimitError) as exc_info:
+        codex_runtime._enforce_codex_completed_object_limits(
+            completed,
+            retention_limits={"max_output_items": 12},
+        )
+    assert exc_info.value.phase == "output_items"
+    assert exc_info.value.observed == 13
+    # The full 100-entry container was never materialized/consumed.
+    assert consumed["count"] == 13
+
+
+def _rotation_agent_and_compressor(db, parent, monkeypatch):
+    """Real SessionDB + real AIAgent wired for rotation-mode compression."""
+    import os
+    from unittest.mock import patch
+
+    db.create_session(parent, source="cli")
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            platform="cli",
+            quiet_mode=True,
+            session_db=db,
+            session_id=parent,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    compacted = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "user", "content": "tail"},
+    ]
+    compressor = MagicMock()
+    compressor.compress.return_value = compacted
+    compressor.compression_count = 1
+    compressor.last_prompt_tokens = 0
+    compressor.last_completion_tokens = 0
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_summary_auth_failure = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    agent.context_compressor = compressor
+    agent.compression_in_place = False  # rotation mode
+
+    created_children: list[str] = []
+    real_create = db.create_session
+
+    def _tracking_create(session_id, source, **kwargs):
+        if session_id != parent:
+            created_children.append(session_id)
+        return real_create(session_id, source, **kwargs)
+
+    monkeypatch.setattr(db, "create_session", _tracking_create)
+
+    goal_migrations: list[tuple] = []
+    monkeypatch.setattr(
+        "hermes_cli.goals.migrate_goal_to_session",
+        lambda src, dst, reason=None: goal_migrations.append((src, dst, reason)),
+    )
+    return agent, compacted, created_children, goal_migrations
+
+
+def _assert_rotation_fully_compensated(
+    db, agent, parent, original, returned, created_children, goal_migrations
+):
+    """The post-child publication failure must leave NO durable split-brain."""
+    # Caller-visible abort: the original transcript content is returned.
+    assert [m["content"] for m in returned] == [m["content"] for m in original]
+    # The agent is restored onto the still-indexed parent session.
+    assert agent.session_id == parent
+    # Read-back: the parent is live (not ended) with its original transcript.
+    parent_row = db.get_session(parent)
+    assert parent_row is not None
+    assert parent_row.get("ended_at") is None
+    live = db.get_messages_as_conversation(parent)
+    assert [m["content"] for m in live] == [m["content"] for m in original]
+    # The failed empty child was retired — no orphan row remains.
+    assert len(created_children) == 1
+    assert db.get_session(created_children[0]) is None
+    # The goal migration was reversed onto the parent.
+    assert (created_children[0], parent, "compression_rollback") in goal_migrations
+    # The boundary never committed: no compaction marker, no engine boundary
+    # notification.
+    assert agent._last_compression_attempt_in_place in (None, False)
+    agent.context_compressor.on_session_start.assert_not_called()
+
+
+def test_rotation_child_prompt_write_failure_compensates_parent_and_child(
+    tmp_path, monkeypatch
+):
+    """PR53 P0: child update_system_prompt failure fully rolls the rotation back."""
+    from unittest.mock import patch
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = "PARENT_ROTATION_PROMPT_FAIL"
+        agent, _compacted, created_children, goal_migrations = (
+            _rotation_agent_and_compressor(db, parent, monkeypatch)
+        )
+        original = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+        with patch.object(
+            db,
+            "update_system_prompt",
+            side_effect=RuntimeError("child prompt write failed"),
+        ):
+            returned, _prompt = agent._compress_context(
+                original, "sys", approx_tokens=120_000
+            )
+
+        _assert_rotation_fully_compensated(
+            db, agent, parent, original, returned, created_children, goal_migrations
+        )
+    finally:
+        db.close()
+
+
+def test_rotation_child_replace_messages_failure_compensates_parent_and_child(
+    tmp_path, monkeypatch
+):
+    """PR53 P0: child replace_messages failure fully rolls the rotation back."""
+    from unittest.mock import patch
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = "PARENT_ROTATION_REPLACE_FAIL"
+        agent, _compacted, created_children, goal_migrations = (
+            _rotation_agent_and_compressor(db, parent, monkeypatch)
+        )
+        original = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+        with patch.object(
+            db,
+            "replace_messages",
+            side_effect=RuntimeError("child handoff write failed"),
+        ):
+            returned, _prompt = agent._compress_context(
+                original, "sys", approx_tokens=120_000
+            )
+
+        _assert_rotation_fully_compensated(
+            db, agent, parent, original, returned, created_children, goal_migrations
+        )
     finally:
         db.close()
