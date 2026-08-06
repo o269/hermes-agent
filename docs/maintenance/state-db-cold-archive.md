@@ -33,6 +33,7 @@ The current selection rules are:
 - Hot: sessions active within 30 days stay live.
 - Warm: already archived sessions get a 7-day reversible grace window.
 - Cold eligibility begins at inactive age **>= 37 days**. Exactly on the 37-day boundary is eligible.
+- `--hot-days` plus `--archive-grace-days` may lengthen that window, but their combined value may never be below 37 days. Producer and apply both reject a shorter policy before stage creation or candidate mutation; they never silently clamp it.
 - Effective activity is the freshest of durable `sessions.last_activity_at`, actual `messages.timestamp`, and `sessions.started_at`.
 - A candidate must be ended, archived, unpinned, canonically activity-proven, and outside the hot+grace window.
 - Selection is parent/child lineage-component safe. If any row in a component is open, pinned, unarchived, recent, held, or referenced by async/gateway/compression state, the whole component is skipped.

@@ -347,6 +347,92 @@ def test_manifest_uses_canonical_activity_and_exact_37_day_boundary(
     assert manifest["policy"]["cold_boundary_inclusive"] is True
 
 
+@pytest.mark.parametrize(
+    ("hot_days", "archive_grace_days"),
+    [
+        pytest.param(0.0, 7.0, id="zero-hot-days"),
+        pytest.param(30.0, 0.0, id="zero-archive-grace-days"),
+        pytest.param(0.0, 0.0, id="both-zero"),
+        pytest.param(30.0, 7.0 - 1 / DAY, id="one-second-under-floor"),
+    ],
+)
+def test_producer_rejects_cold_age_below_hard_37_day_floor_without_stage(
+    tmp_path: Path,
+    hot_days: float,
+    archive_grace_days: float,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "recent", days_ago=1, content="must-survive")
+    finally:
+        db.close()
+    before = _logical_snapshot(db_path)
+    stage = tmp_path / "stage"
+
+    with pytest.raises(ColdArchiveError, match="at least 37 days"):
+        cold.run_cold_archive_pass(
+            source_db=db_path,
+            stage_root=stage,
+            now=NOW,
+            hot_days=hot_days,
+            archive_grace_days=archive_grace_days,
+            hold_sources=[],
+            manifest_only=True,
+        )
+
+    assert not stage.exists()
+    assert _logical_snapshot(db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("hot_days", "archive_grace_days"),
+    [
+        pytest.param(0.0, 7.0, id="zero-hot-days"),
+        pytest.param(30.0, 0.0, id="zero-archive-grace-days"),
+        pytest.param(0.0, 0.0, id="both-zero"),
+        pytest.param(30.0, 7.0 - 1 / DAY, id="one-second-under-floor"),
+    ],
+)
+def test_apply_rejects_approved_policy_below_hard_37_day_floor_without_delete(
+    tmp_path: Path,
+    hot_days: float,
+    archive_grace_days: float,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    manifest = cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
+    combined_days = hot_days + archive_grace_days
+    manifest["policy"].update({
+        "hot_days": hot_days,
+        "archive_grace_days": archive_grace_days,
+        "cold_cutoff_epoch": NOW - combined_days * DAY,
+        "cold_cutoff_utc": cold.utc_iso(NOW - combined_days * DAY),
+        "hot_cutoff_epoch": NOW - hot_days * DAY,
+        "hot_cutoff_utc": cold.utc_iso(NOW - hot_days * DAY),
+    })
+    manifest["manifest_sha256"] = cold._manifest_digest(manifest)
+    before = _logical_snapshot(db_path)
+    prepared = tmp_path / "COLD-ARCHIVE-APPLY-PREPARED.json"
+
+    with pytest.raises(ColdArchiveError, match="at least 37 days"):
+        cold.apply_retention_to_candidate(
+            db_path,
+            manifest,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            approved_manifest_file_sha256="0" * 64,
+            prepared_receipt_path=prepared,
+            remote_custody_reverified=[],
+        )
+
+    assert not prepared.exists()
+    assert _logical_snapshot(db_path) == before
+
+
 def test_apply_deletes_exact_37_day_boundary_but_not_one_second_inside(
     tmp_path: Path,
 ) -> None:
@@ -1071,6 +1157,8 @@ def test_system_prompt_cleanup_is_selected_only_and_fts_match_negatives_hold(
 def test_source_bundle_retention_is_clocked_from_cutover_and_exactly_14_days(
     tmp_path: Path,
 ) -> None:
+    literal_retention_seconds = 1_209_600
+    assert cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS == literal_retention_seconds
     db_path = tmp_path / "candidate.db"
     db = _build_archive_candidate(db_path)
     try:
@@ -1084,6 +1172,14 @@ def test_source_bundle_retention_is_clocked_from_cutover_and_exactly_14_days(
     bundle = rollback_dir / "rollback-source-bundle.tar.gz"
     source_bundle = rollback_dir / "source-bundle"
     encrypted = rollback_dir / "ROLLBACK-SOURCE-BUNDLE.tar.gz.age"
+    policy = json.loads(
+        (rollback_dir / "SOURCE-BUNDLE-RETENTION-POLICY.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        policy["minimum_retention_seconds_after_cutover"] == literal_retention_seconds
+    )
 
     awaiting = cold.prune_source_bundle_after_retention(
         stage,
@@ -1106,15 +1202,17 @@ def test_source_bundle_retention_is_clocked_from_cutover_and_exactly_14_days(
     )
     marker_sha = _sha(rollback_dir / "CANDIDATE-CUTOVER.json")
     assert marker["cutover_epoch"] == cutover
+    assert cutover - policy["created_at_epoch"] == 101 * DAY
     before = cold.prune_source_bundle_after_retention(
         stage,
         candidate_health_confirmed=True,
         approved_cutover_marker_sha256=marker_sha,
         rclone_config=config,
         rclone_runner=fake,
-        now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS - 1,
+        now=cutover + 1_209_599,
     )
     assert before["pruned"] is False
+    assert before["eligible_at_epoch"] == cutover + literal_retention_seconds
     assert bundle.exists() and source_bundle.exists()
 
     exact = cold.prune_source_bundle_after_retention(
@@ -1123,7 +1221,7 @@ def test_source_bundle_retention_is_clocked_from_cutover_and_exactly_14_days(
         approved_cutover_marker_sha256=marker_sha,
         rclone_config=config,
         rclone_runner=fake,
-        now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        now=cutover + 1_209_600,
     )
     assert exact["pruned"] is True
     assert not bundle.exists()
@@ -1139,7 +1237,7 @@ def test_source_bundle_retention_is_clocked_from_cutover_and_exactly_14_days(
         approved_cutover_marker_sha256=marker_sha,
         rclone_config=config,
         rclone_runner=fake,
-        now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS + DAY,
+        now=cutover + 1_209_600 + DAY,
     )
     assert replay["pruned"] is True
     assert replay["replayed"] is True

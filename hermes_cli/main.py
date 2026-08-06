@@ -14948,13 +14948,19 @@ def main():
         "--hot-days",
         type=float,
         default=30.0,
-        help="Hot searchable window in days (default: 30)",
+        help=(
+            "Hot searchable window in days (default: 30); hot + archive grace "
+            "must be at least 37"
+        ),
     )
     sessions_cold_archive.add_argument(
         "--archive-grace-days",
         type=float,
         default=7.0,
-        help="Archived reversible grace window in days (default: 7)",
+        help=(
+            "Archived reversible grace window in days (default: 7); hot + archive "
+            "grace must be at least 37"
+        ),
     )
 
     sessions_cold_archive.add_argument(

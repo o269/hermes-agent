@@ -37,6 +37,7 @@ from hermes_cli.session_export_md import (
 
 DEFAULT_HOT_DAYS = 30.0
 DEFAULT_ARCHIVE_GRACE_DAYS = 7.0
+MINIMUM_COLD_AGE_DAYS = 37.0
 DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS = 14 * 86_400
 _ARCHIVE_VERSION = 2
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
@@ -135,6 +136,46 @@ def _finite_epoch(value: Any, label: str) -> float:
     if not math.isfinite(result):
         raise ColdArchiveError(f"{label} must be a finite number")
     return result
+
+
+def _validate_cold_age_window(
+    hot_days: Any, archive_grace_days: Any
+) -> tuple[float, float, float]:
+    hot = _finite_epoch(hot_days, "hot_days")
+    grace = _finite_epoch(archive_grace_days, "archive_grace_days")
+    if hot < 0 or grace < 0:
+        raise ColdArchiveError("hot_days and archive_grace_days must be non-negative")
+    combined = _finite_epoch(hot + grace, "hot_days + archive_grace_days")
+    if combined < MINIMUM_COLD_AGE_DAYS:
+        raise ColdArchiveError(
+            "hot_days + archive_grace_days must be at least 37 days; "
+            f"received {hot:g} + {grace:g} = {combined:g} days"
+        )
+    return hot, grace, combined
+
+
+def _validate_manifest_cold_age_policy(manifest: dict[str, Any]) -> None:
+    policy = manifest.get("policy")
+    if not isinstance(policy, dict):
+        raise ColdArchiveError("Gate-B manifest cold-age policy is missing")
+    hot, _grace, combined = _validate_cold_age_window(
+        policy.get("hot_days"), policy.get("archive_grace_days")
+    )
+    generated_at = _finite_epoch(
+        manifest.get("generated_at_epoch"), "Gate-B manifest generated_at_epoch"
+    )
+    cold_cutoff = _finite_epoch(
+        policy.get("cold_cutoff_epoch"), "Gate-B manifest cold_cutoff_epoch"
+    )
+    hot_cutoff = _finite_epoch(
+        policy.get("hot_cutoff_epoch"), "Gate-B manifest hot_cutoff_epoch"
+    )
+    if cold_cutoff != generated_at - combined * 86_400.0:
+        raise ColdArchiveError(
+            "Gate-B manifest cold cutoff is inconsistent with policy"
+        )
+    if hot_cutoff != generated_at - hot * 86_400.0:
+        raise ColdArchiveError("Gate-B manifest hot cutoff is inconsistent with policy")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -997,12 +1038,11 @@ def build_gate_b_manifest(
 ) -> dict[str, Any]:
     """Build a redacted manifest from an offline, schema-provable snapshot."""
 
-    hot_days = _finite_epoch(hot_days, "hot_days")
-    archive_grace_days = _finite_epoch(archive_grace_days, "archive_grace_days")
-    if hot_days < 0 or archive_grace_days < 0:
-        raise ColdArchiveError("hot_days and archive_grace_days must be non-negative")
+    hot_days, archive_grace_days, combined_days = _validate_cold_age_window(
+        hot_days, archive_grace_days
+    )
     generated_at = _finite_epoch(time.time() if now is None else now, "now")
-    cutoff = generated_at - (hot_days + archive_grace_days) * 86_400.0
+    cutoff = generated_at - combined_days * 86_400.0
     hot_cutoff = generated_at - hot_days * 86_400.0
     source = reject_live_state_db(source_db)
     source_info = source.stat()
@@ -1038,7 +1078,7 @@ def build_gate_b_manifest(
                     reasons.add("pinned")
                 if row.get("last_activity_at") is None:
                     reasons.add("canonical_last_activity_unprovable")
-                # Exactly on the 37-day default boundary is eligible.
+                # Exactly on the hard 37-day minimum boundary is eligible.
                 if float(row["actual_last_active"]) > cutoff:
                     reasons.add("inside_30d_hot_plus_7d_grace")
                 reasons.update(
@@ -1204,6 +1244,7 @@ def load_approved_gate_b_manifest(
         raise ColdArchiveError("unsupported Gate-B manifest version")
     if _manifest_digest(manifest) != manifest.get("manifest_sha256"):
         raise ColdArchiveError("embedded Gate-B manifest digest mismatch")
+    _validate_manifest_cold_age_policy(manifest)
 
     ids_payload = _load_private_json(stage.restricted_ids_path)
     raw_ids = ids_payload.get("selected_ids")
@@ -2099,6 +2140,7 @@ def _revalidate_selected_under_lock(
         raise ColdArchiveError(
             "destructive revalidation must run under BEGIN IMMEDIATE"
         )
+    _validate_manifest_cold_age_policy(manifest)
     if _logical_snapshot_sha256(conn) != manifest.get("source_logical_sha256"):
         raise ColdArchiveError(
             "candidate logical snapshot changed before destructive revalidation"
@@ -2262,6 +2304,7 @@ def apply_retention_to_candidate(
 ) -> dict[str, Any]:
     """Delete the approved set with revalidation and all checks under one lock."""
 
+    _validate_manifest_cold_age_policy(manifest)
     ids = sorted(str(value) for value in manifest.get("_restricted_selected_ids") or [])
     if expected_manifest_sha256 != manifest.get("manifest_sha256"):
         raise ColdArchiveError("Gate-B canonical manifest hash mismatch")
