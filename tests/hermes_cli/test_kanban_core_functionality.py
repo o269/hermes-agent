@@ -191,7 +191,7 @@ def test_explicit_authorized_promote_releases_initial_block(
 
 def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawnable):
     """N consecutive spawn failures on the same task → auto_blocked."""
-    def _bad_spawn(task, ws):
+    def _bad_spawn(task, ws, **_kwargs):
         raise RuntimeError("no PATH")
 
     conn = kb.connect()
@@ -225,15 +225,20 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
     complete_task reset for the replacement point.)
     """
     calls = [0]
-    def _flaky_spawn(task, ws):
+    def _flaky_spawn(task, ws, **_kwargs):
         calls[0] += 1
         if calls[0] <= 2:
             raise RuntimeError("transient")
-        return 99999  # pid value — harmless; crash detection will clear it
+        return 99999
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn,
+            title="x",
+            body="Resource-Class: light\nSpawn-failure lifecycle unit test.",
+            assignee="worker",
+        )
         # Two failures + one success.
         kb.dispatch_once(conn, spawn_fn=_flaky_spawn, failure_limit=5)
         kb.dispatch_once(conn, spawn_fn=_flaky_spawn, failure_limit=5)
@@ -486,7 +491,7 @@ def test_pid_alive_detects_darwin_zombie(monkeypatch):
     assert kb._pid_alive(123) is False
 
 
-def test_detect_crashed_workers_reclaims(kanban_home):
+def test_detect_crashed_workers_reclaims(kanban_home, all_assignees_spawnable):
     """A running task whose pid vanished gets dropped to ready with a
     ``crashed`` event, independent of the claim TTL."""
     def _spawn_pid_that_exits(task, ws):
@@ -501,8 +506,14 @@ def test_detect_crashed_workers_reclaims(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn,
+            title="x",
+            body="Resource-Class: light\nCrash-detection unit test.",
+            assignee="worker",
+        )
         res = kb.dispatch_once(conn, spawn_fn=_spawn_pid_that_exits)
+        assert [item[0] for item in res.spawned] == [tid]
         # Brief sleep to make sure the child's pid has been reaped; on
         # busy CI the pid may be reused by another process, which would
         # fool _pid_alive. If that happens we accept the test still
@@ -1310,7 +1321,7 @@ def test_recompute_ready_emits_promoted_not_ready(kanban_home):
 
 
 def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_spawnable):
-    def _bad(task, ws):
+    def _bad(task, ws, **_kwargs):
         raise RuntimeError("nope")
     conn = kb.connect()
     try:
@@ -1328,11 +1339,16 @@ def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_
 def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
     """Successful spawn must append a ``spawned`` event with the pid in
     the payload so humans tailing events see pid tracking."""
-    def _spawn_returns_pid(task, ws):
+    def _spawn_returns_pid(task, ws, **_kwargs):
         return 98765
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn,
+            title="x",
+            body="Resource-Class: light\nSpawn-event payload unit test.",
+            assignee="worker",
+        )
         kb.dispatch_once(conn, spawn_fn=_spawn_returns_pid)
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
@@ -1720,7 +1736,7 @@ def test_run_on_block_with_reason(kanban_home):
 def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spawnable):
     """Each spawn_failed event closes a run with outcome='spawn_failed',
     and the Nth failure closes a run with outcome='gave_up'."""
-    def _bad(task, ws):
+    def _bad(task, ws, **_kwargs):
         raise RuntimeError("no PATH")
 
     conn = kb.connect()

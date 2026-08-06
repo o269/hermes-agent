@@ -78,6 +78,54 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     assert "deliver" not in kinds
 
 
+def test_run_one_job_protective_skip_is_audited_without_delivery(monkeypatch):
+    calls = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        calls.append(("run_job", job["id"]))
+        return (True, "load above threshold", s.CRON_SKIP_MARKER, None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda jid, output: calls.append(("save", jid, output)),
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *_args, **_kwargs: calls.append(("deliver",)),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: calls.append(("mark", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "execution-1"},
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_args: None)
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: calls.append(("finish", args, kwargs)),
+    )
+
+    ok = s.run_one_job({"id": "skip-job", "name": "load gate"})
+
+    assert ok is True
+    assert not any(call[0] == "deliver" for call in calls)
+    assert ("save", "skip-job", "load above threshold") in calls
+    mark = next(call for call in calls if call[0] == "mark")
+    assert mark[1][:2] == ("skip-job", True)
+    assert mark[2]["status"] == "skipped"
+    finish = next(call for call in calls if call[0] == "finish")
+    assert finish[1] == ("execution-1",)
+    assert finish[2] == {"success": True, "error": None, "status": "skipped"}
+
+
 def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
