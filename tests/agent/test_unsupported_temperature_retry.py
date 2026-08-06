@@ -112,12 +112,14 @@ class TestCallLlmUnsupportedTemperatureRetry:
         retry_kwargs = client.chat.completions.create.call_args_list[1].kwargs
         assert first_kwargs["temperature"] == 0.3
         assert "temperature" not in retry_kwargs
-        # max_tokens is intentionally omitted on OpenAI-compatible endpoints
-        # (#34530) — auxiliary calls let the model max out its own output — so
-        # it must be absent in BOTH the first and retry kwargs. Use a kwarg that
-        # actually survives (model) to prove the retry preserves the rest.
-        assert "max_tokens" not in first_kwargs
-        assert "max_tokens" not in retry_kwargs
+        # OpenAI-compatible auxiliary calls omit max_tokens by default
+        # (#34530), but compression is the explicit exception: its output cap
+        # is an RSS safety invariant injected and centrally clamped by
+        # _build_call_kwargs (caller's 500 survives under the 12000 default
+        # ceiling). The temperature retry must preserve it like every other
+        # kwarg — model is asserted too as the unaffected-kwarg control.
+        assert first_kwargs["max_tokens"] == 500
+        assert retry_kwargs["max_tokens"] == 500
         assert retry_kwargs["model"] == first_kwargs["model"]
 
     def test_non_temperature_400_does_not_retry_as_temperature(self):

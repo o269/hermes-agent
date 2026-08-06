@@ -2281,6 +2281,7 @@ def compress_context(
             defer_context_engine_notification=defer_context_engine_notification,
             commit_fence=commit_fence,
             _snapshot_max_bytes=limits["snapshot_limit_bytes"],
+            _caller_messages=messages,
         )
         committed = getattr(agent, "_last_compression_attempt_in_place", None) is not None
         if not committed:
@@ -2314,6 +2315,7 @@ def _compress_context_impl(
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
     _snapshot_max_bytes: int = _DEFAULT_COMPRESSION_SNAPSHOT_BYTES,
+    _caller_messages: Optional[list] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2378,10 +2380,14 @@ def _compress_context_impl(
         # The app-server route owns its own compaction boundary; mark the
         # attempt as a completed non-in-place outcome so the outer isolation
         # boundary returns the route's result instead of discarding it.
+        # The route never reads message content (only ``len()`` for logging)
+        # and never rewrites the Hermes transcript, so hand it the caller's
+        # original list rather than the bounded private snapshot: the
+        # returned object must stay identical to what the caller passed in.
         agent._last_compression_attempt_in_place = False
         return _compress_context_via_codex_app_server(
             agent,
-            messages,
+            _caller_messages if _caller_messages is not None else messages,
             system_message,
             approx_tokens=approx_tokens,
             task_id=task_id,
