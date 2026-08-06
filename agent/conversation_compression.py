@@ -97,6 +97,23 @@ _OPAQUE_REPLAY_SIDECAR_KEYS = frozenset(
     }
 )
 
+# Conservative retained-size bounds (64-bit CPython) for container
+# ALLOCATIONS, shared by the preflight estimator and the snapshot cloners so
+# admission accounting never under-charges the clones it admits.  Charging
+# only payload leaves let nested empty containers slip far past the
+# configured snapshot cap (PR #53 exact-head review: a 512-byte cap admitted
+# ~645 KB / 10,004 containers).  Bounds include object headers, pointer
+# slots, and amortized growth — overestimating is safe (fail closed),
+# underestimating defeats the RSS headroom invariant.
+_SNAPSHOT_DICT_CONTAINER_BYTES = 232  # PyDictObject + keys object + hash table
+_SNAPSHOT_DICT_ENTRY_BYTES = 40  # per-slot hash entry + key/value pointers + growth
+_SNAPSHOT_LIST_CONTAINER_BYTES = 64  # PyListObject header
+_SNAPSHOT_LIST_SLOT_BYTES = 16  # 8-byte pointer + amortized append growth
+_SNAPSHOT_TUPLE_CONTAINER_BYTES = 56  # PyTupleObject header
+_SNAPSHOT_TUPLE_SLOT_BYTES = 8  # one pointer per item
+_SNAPSHOT_SET_CONTAINER_BYTES = 224  # PySetObject + initial hash table
+_SNAPSHOT_SET_ENTRY_BYTES = 32  # hash slot + amortized rehash growth
+
 # The full-compression permit is deliberately independent of the executor's
 # queue admission.  Gateway hygiene can call ``compress_context`` directly,
 # and a worker that timed out remains alive after its host stops waiting.  The
@@ -159,8 +176,9 @@ def _estimate_value_bytes(
             return 0
         seen.add(value_id)
         if isinstance(value, dict):
-            state["bytes"] += 16
+            state["bytes"] += _SNAPSHOT_DICT_CONTAINER_BYTES
             for key, item in value.items():
+                state["bytes"] += _SNAPSHOT_DICT_ENTRY_BYTES
                 _estimate_value_bytes(
                     key,
                     stop_after=stop_after,
@@ -177,8 +195,29 @@ def _estimate_value_bytes(
                 )
                 if state["bytes"] > stop_after:
                     break
-        elif isinstance(value, (list, tuple, set, frozenset)):
-            state["bytes"] += 16
+        elif isinstance(value, (list, tuple)):
+            state["bytes"] += (
+                _SNAPSHOT_LIST_CONTAINER_BYTES
+                + _SNAPSHOT_LIST_SLOT_BYTES * len(value)
+                if isinstance(value, list)
+                else _SNAPSHOT_TUPLE_CONTAINER_BYTES
+                + _SNAPSHOT_TUPLE_SLOT_BYTES * len(value)
+            )
+            for item in value:
+                _estimate_value_bytes(
+                    item,
+                    stop_after=stop_after,
+                    seen=seen,
+                    state=state,
+                    depth=depth + 1,
+                )
+                if state["bytes"] > stop_after:
+                    break
+        elif isinstance(value, (set, frozenset)):
+            state["bytes"] += (
+                _SNAPSHOT_SET_CONTAINER_BYTES
+                + _SNAPSHOT_SET_ENTRY_BYTES * len(value)
+            )
             for item in value:
                 _estimate_value_bytes(
                     item,
@@ -237,7 +276,12 @@ def _estimate_compression_message_graph(
     return {
         "message_graph_bytes": total,
         "opaque_replay_bytes": opaque,
-        "snapshot_clone_bytes": max(0, total - opaque),
+        # Do NOT subtract sidecar mass from the projected clone charge: the
+        # sidecar cloner STRUCTURALLY duplicates mutable sidecar containers
+        # into the worker snapshot (and the rollback snapshot clones them
+        # again), so their allocations are part of the projected clone RSS —
+        # not an exclusion from it (PR #53 exact-head review).
+        "snapshot_clone_bytes": total,
         "message_graph_nodes": total_state["nodes"],
     }
 
@@ -288,13 +332,16 @@ def _clone_bounded_snapshot_value(
         return memo[value_id]
 
     if isinstance(value, dict):
+        # Charge the container allocation itself, not just its payload:
+        # nested empty containers must count against the configured cap.
+        _snapshot_budget_add(budget, _SNAPSHOT_DICT_CONTAINER_BYTES)
         cloned: dict[Any, Any] = {}
         memo[value_id] = cloned
         for key, item in value.items():
             key_size = _utf8_size(key) if isinstance(key, str) else 16
-            _snapshot_budget_add(budget, key_size)
+            _snapshot_budget_add(budget, key_size + _SNAPSHOT_DICT_ENTRY_BYTES)
             if isinstance(key, str) and key in _OPAQUE_REPLAY_SIDECAR_KEYS:
-                # Detach the sidecar's mutable structure (dicts/lists/
+                # Detach the sidecar's mutable structure (dicts/lists/sets/
                 # bytearrays) within the configured byte budget so a legacy
                 # or plugin engine mutating its input cannot reach the
                 # caller's objects through this worker snapshot (PR #79668
@@ -318,9 +365,11 @@ def _clone_bounded_snapshot_value(
             )
         return cloned
     if isinstance(value, list):
+        _snapshot_budget_add(budget, _SNAPSHOT_LIST_CONTAINER_BYTES)
         cloned_list: list[Any] = []
         memo[value_id] = cloned_list
         for item in value:
+            _snapshot_budget_add(budget, _SNAPSHOT_LIST_SLOT_BYTES)
             cloned_list.append(
                 _clone_bounded_snapshot_value(
                     item,
@@ -332,21 +381,51 @@ def _clone_bounded_snapshot_value(
             )
         return cloned_list
     if isinstance(value, tuple):
+        _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_CONTAINER_BYTES)
         placeholder: list[Any] = []
         memo[value_id] = placeholder
-        placeholder.extend(
-            _clone_bounded_snapshot_value(
-                item,
-                budget=budget,
-                memo=memo,
-                stats=stats,
-                depth=depth + 1,
-            )
-            for item in value
-        )
+
+        def _tuple_items():
+            for item in value:
+                _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_SLOT_BYTES)
+                yield _clone_bounded_snapshot_value(
+                    item,
+                    budget=budget,
+                    memo=memo,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+
+        placeholder.extend(_tuple_items())
         cloned_tuple = tuple(placeholder)
         memo[value_id] = cloned_tuple
         return cloned_tuple
+    if isinstance(value, (set, frozenset)):
+        # Sets are mutable (and frozensets can carry mutable custom objects):
+        # detach them like every other supported container so a mutating
+        # engine cannot reach the caller through the worker snapshot
+        # (PR #53 exact-head review).
+        _snapshot_budget_add(budget, _SNAPSHOT_SET_CONTAINER_BYTES)
+        cloned_items: list[Any] = []
+        memo[value_id] = cloned_items
+        for item in value:
+            _snapshot_budget_add(budget, _SNAPSHOT_SET_ENTRY_BYTES)
+            cloned_items.append(
+                _clone_bounded_snapshot_value(
+                    item,
+                    budget=budget,
+                    memo=memo,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+            )
+        cloned_set = (
+            frozenset(cloned_items)
+            if isinstance(value, frozenset)
+            else set(cloned_items)
+        )
+        memo[value_id] = cloned_set
+        return cloned_set
 
     # Unknown provider/plugin objects are intentionally shared, not deep-copied.
     stats["opaque_object_refs"] += 1
@@ -390,10 +469,11 @@ def _clone_detached_sidecar_value(
         return memo[value_id]
 
     if isinstance(value, dict):
+        _snapshot_budget_add(budget, _SNAPSHOT_DICT_CONTAINER_BYTES)
         cloned: dict[Any, Any] = {}
         memo[value_id] = cloned
         for key, item in value.items():
-            _snapshot_budget_add(budget, 64)
+            _snapshot_budget_add(budget, 64 + _SNAPSHOT_DICT_ENTRY_BYTES)
             cloned[key] = _clone_detached_sidecar_value(
                 item,
                 budget=budget,
@@ -403,9 +483,11 @@ def _clone_detached_sidecar_value(
             )
         return cloned
     if isinstance(value, list):
+        _snapshot_budget_add(budget, _SNAPSHOT_LIST_CONTAINER_BYTES)
         cloned_list: list[Any] = []
         memo[value_id] = cloned_list
         for item in value:
+            _snapshot_budget_add(budget, _SNAPSHOT_LIST_SLOT_BYTES)
             cloned_list.append(
                 _clone_detached_sidecar_value(
                     item,
@@ -417,21 +499,50 @@ def _clone_detached_sidecar_value(
             )
         return cloned_list
     if isinstance(value, tuple):
+        _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_CONTAINER_BYTES)
         placeholder: list[Any] = []
         memo[value_id] = placeholder
-        placeholder.extend(
-            _clone_detached_sidecar_value(
-                item,
-                budget=budget,
-                memo=memo,
-                stats=stats,
-                depth=depth + 1,
-            )
-            for item in value
-        )
+
+        def _sidecar_tuple_items():
+            for item in value:
+                _snapshot_budget_add(budget, _SNAPSHOT_TUPLE_SLOT_BYTES)
+                yield _clone_detached_sidecar_value(
+                    item,
+                    budget=budget,
+                    memo=memo,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+
+        placeholder.extend(_sidecar_tuple_items())
         cloned_tuple = tuple(placeholder)
         memo[value_id] = cloned_tuple
         return cloned_tuple
+    if isinstance(value, (set, frozenset)):
+        # A set inside a recognized replay sidecar stayed ALIASED before this
+        # branch existed, so a mutating engine reached the caller's set
+        # through the worker snapshot (PR #53 exact-head review).
+        _snapshot_budget_add(budget, _SNAPSHOT_SET_CONTAINER_BYTES)
+        cloned_items: list[Any] = []
+        memo[value_id] = cloned_items
+        for item in value:
+            _snapshot_budget_add(budget, _SNAPSHOT_SET_ENTRY_BYTES)
+            cloned_items.append(
+                _clone_detached_sidecar_value(
+                    item,
+                    budget=budget,
+                    memo=memo,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+            )
+        cloned_set = (
+            frozenset(cloned_items)
+            if isinstance(value, frozenset)
+            else set(cloned_items)
+        )
+        memo[value_id] = cloned_set
+        return cloned_set
 
     # Unknown provider/plugin objects are intentionally shared, not deep-copied.
     stats["opaque_object_refs"] += 1
@@ -461,6 +572,27 @@ def _build_bounded_compression_snapshot(
     snapshot_stats["snapshot_retained_bytes"] = budget["bytes"]
     snapshot_stats["snapshot_nodes"] = budget["nodes"]
     return cloned
+
+
+def _engine_is_mutable_extension_point(engine: Any) -> bool:
+    """True when the active context engine may mutate its input snapshot.
+
+    The built-in :class:`ContextCompressor` works functionally (it rebinds
+    rather than mutating the caller's list).  Legacy/plugin engines carry a
+    preserved mutate-in-place contract, so an opaque object the snapshot
+    cloner could not safely detach (unknown SDK/plugin types — recursively
+    duplicating them is the amplification vector this fence exists to close)
+    would remain reachable by the engine through an alias.  Exact-type check:
+    subclasses are extensions too and take the fail-closed path (PR #53
+    exact-head review).
+    """
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        return type(engine) is not ContextCompressor
+    except Exception:
+        # Engine identity unknown → treat as a mutable extension point.
+        return True
 
 
 def _current_process_rss_bytes() -> int:
@@ -2266,6 +2398,19 @@ def compress_context(
             return _record_rejection("snapshot_too_large", metrics=metrics)
 
         metrics.update(snapshot_stats)
+        if snapshot_stats.get("opaque_object_refs", 0) > 0 and (
+            _engine_is_mutable_extension_point(
+                getattr(agent, "context_compressor", None)
+            )
+        ):
+            # The snapshot still aliases opaque mutable SDK/plugin objects the
+            # cloner cannot safely detach, and the active engine is a mutable
+            # extension point that could reach the caller's objects through
+            # those aliases. Fail closed BEFORE invoking it: the caller keeps
+            # its exact original transcript (PR #53 exact-head review).
+            return _record_rejection(
+                "snapshot_opaque_mutable", metrics=metrics
+            )
         logger.info(
             "context compression memory preflight: %s",
             json.dumps(metrics, sort_keys=True, separators=(",", ":")),
@@ -3195,14 +3340,106 @@ def _compress_context_impl(
                         if isinstance(message, dict)
                     }
             except Exception as e:
+                _old_sid: Optional[str] = locals().get("old_session_id")
+                _rotation_compensation_ok = True
                 if (
                     not in_place
-                    and locals().get("old_session_id")
-                    and agent.session_id == old_session_id
+                    and _old_sid
+                    and agent.session_id != _old_sid
+                ):
+                    # Post-child-creation publication failure (a fault in the
+                    # child's update_system_prompt() or replace_messages()):
+                    # the parent is already ended and the agent points at an
+                    # EMPTY child — returning the caller's original transcript
+                    # here would be a durable/live split-brain and resumable-
+                    # session data loss (PR #53 exact-head review P0).
+                    # Compensate fully BEFORE the shared abort branch:
+                    #   1. restore the live id to the parent,
+                    #   2. re-open the parent row,
+                    #   3. reverse the goal migration (best effort),
+                    #   4. delete/retire the failed child,
+                    #   5. verify all of it by read-back.
+                    _failed_child_id = agent.session_id
+                    agent.session_id = _old_sid
+                    try:
+                        from gateway.session_context import set_current_session_id
+                        set_current_session_id(agent.session_id)
+                    except Exception:
+                        os.environ["HERMES_SESSION_ID"] = agent.session_id
+                    try:
+                        from hermes_logging import set_session_context
+                        set_session_context(agent.session_id)
+                    except Exception:
+                        pass
+                    # The parent row already exists in state.db (see the
+                    # create-failure rollback above for the same contract).
+                    agent._session_db_created = True
+                    try:
+                        from hermes_cli.goals import migrate_goal_to_session
+                        migrate_goal_to_session(
+                            _failed_child_id,
+                            _old_sid,
+                            reason="compression_rollback",
+                        )
+                    except Exception:
+                        pass  # best effort — goal state is advisory
+                    try:
+                        agent._session_db.reopen_session(_old_sid)
+                    except Exception as _reopen_err:
+                        _rotation_compensation_ok = False
+                        logger.error(
+                            "Compression rotation compensation failed to "
+                            "re-open parent %s: %s", _old_sid, _reopen_err,
+                        )
+                    try:
+                        agent._session_db.delete_session(_failed_child_id)
+                    except Exception as _child_err:
+                        _rotation_compensation_ok = False
+                        logger.error(
+                            "Compression rotation compensation failed to "
+                            "retire empty child %s: %s",
+                            _failed_child_id, _child_err,
+                        )
+                    # Read-back verification: the parent must be live again
+                    # and the failed child must be gone. A mismatch keeps the
+                    # attempt flagged failed_not_indexed instead of pretending
+                    # the abort cleanly rolled everything back.
+                    try:
+                        _parent_row = agent._session_db.get_session(_old_sid)
+                        _child_row = agent._session_db.get_session(_failed_child_id)
+                        if (
+                            not _parent_row
+                            or _parent_row.get("ended_at") is not None
+                            or _child_row is not None
+                        ):
+                            _rotation_compensation_ok = False
+                            logger.error(
+                                "Compression rotation compensation read-back "
+                                "mismatch (parent=%s child=%s)",
+                                "live"
+                                if _parent_row and _parent_row.get("ended_at") is None
+                                else "NOT-LIVE",
+                                "present" if _child_row is not None else "absent",
+                            )
+                    except Exception as _verify_err:
+                        _rotation_compensation_ok = False
+                        logger.error(
+                            "Compression rotation compensation read-back "
+                            "failed: %s", _verify_err,
+                        )
+                if (
+                    not in_place
+                    and _old_sid
+                    and agent.session_id == _old_sid
                 ):
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
-                    old_session_id = None
+                    # After a post-child failure this branch only marks the
+                    # rotation fully aborted when the compensation above
+                    # actually restored durable state; otherwise old_session_id
+                    # stays bound so split_status reports failed_not_indexed.
+                    if _rotation_compensation_ok:
+                        old_session_id = None
                     messages[:] = _build_bounded_compression_snapshot(
                         messages_before_compression,
                         max_bytes=_snapshot_max_bytes,

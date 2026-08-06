@@ -3862,6 +3862,34 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     return None
 
 
+def _is_compression_cap_rejection(
+    task: Optional[str],
+    err: Exception,
+    base_url: Optional[str] = None,
+) -> bool:
+    """True when *err* is a provider rejection of the injected compression cap.
+
+    Compression's hard output cap is injected by :func:`_build_call_kwargs`
+    under whichever provider-appropriate key (``max_tokens`` or
+    ``max_completion_tokens``).  A refusal of that key on a compression call
+    must fail closed (``AuxiliaryCompressionLimitError``) everywhere the cap
+    can ride — primary request, fallback candidate, and auth-refresh retry —
+    so it can never escape as a generic summary failure that commits a static
+    fallback or an uncapped response (PR #53 exact-head review).
+    """
+    if str(task or "") != "compression":
+        return False
+    err_str = str(err)
+    return (
+        "max_tokens" in err_str
+        or "max_completion_tokens" in err_str
+        or "unsupported_parameter" in err_str
+        or _is_unsupported_parameter_error(err, "max_tokens")
+        or _is_unsupported_parameter_error(err, "max_completion_tokens")
+        or ("1210" in err_str and "bigmodel" in str(base_url or ""))
+    )
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
@@ -3910,11 +3938,18 @@ def _call_fallback_candidate_sync(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base)
+        base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
+        # A fallback that refuses compression's mandatory injected output cap
+        # must fail closed exactly like the primary request — never continue
+        # the chain so an uncapped/oversized response can be retained.
+        if _is_compression_cap_rejection(task, fb_err, fb_base):
+            raise AuxiliaryCompressionLimitError(
+                "compression fallback rejected mandatory output limit"
+            ) from fb_err
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
@@ -3927,11 +3962,20 @@ def _call_fallback_candidate_sync(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                    base_url=str(getattr(retry_client, "base_url", "") or fb_base),
+                    task=task)
                 try:
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
                 except Exception as retry_err:
+                    if _is_compression_cap_rejection(
+                        task, retry_err,
+                        str(getattr(retry_client, "base_url", "") or fb_base),
+                    ):
+                        raise AuxiliaryCompressionLimitError(
+                            "compression fallback auth-refresh retry rejected "
+                            "mandatory output limit"
+                        ) from retry_err
                     if not _is_auth_error(retry_err):
                         raise
         # Refresh unavailable or the refreshed credential still 401s —
@@ -3976,11 +4020,16 @@ async def _call_fallback_candidate_async(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base)
+        base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
+        # Fail closed on compression-cap rejection — mirror of the sync helper.
+        if _is_compression_cap_rejection(task, fb_err, fb_base):
+            raise AuxiliaryCompressionLimitError(
+                "compression fallback rejected mandatory output limit"
+            ) from fb_err
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
@@ -3994,11 +4043,20 @@ async def _call_fallback_candidate_async(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                    base_url=str(getattr(retry_client, "base_url", "") or fb_base),
+                    task=task)
                 try:
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
                 except Exception as retry_err:
+                    if _is_compression_cap_rejection(
+                        task, retry_err,
+                        str(getattr(retry_client, "base_url", "") or fb_base),
+                    ):
+                        raise AuxiliaryCompressionLimitError(
+                            "compression fallback auth-refresh retry rejected "
+                            "mandatory output limit"
+                        ) from retry_err
                     if not _is_auth_error(retry_err):
                         raise
         _mark_provider_unhealthy(fb_provider or fb_label)

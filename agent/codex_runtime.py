@@ -60,8 +60,68 @@ def _codex_utf8_bytes(value: str, *, stop_after: int) -> int:
     return total
 
 
+def _codex_slot_names(tp: type) -> tuple:
+    """Collect data-slot names across a type's MRO (empty when not slotted)."""
+    names: list = []
+    for klass in getattr(tp, "__mro__", (tp,)):
+        slots = getattr(klass, "__dict__", {}).get("__slots__")
+        if not slots:
+            continue
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            # __dict__/__weakref__ carry no retained payload of their own.
+            if isinstance(name, str) and not name.startswith("__"):
+                names.append(name)
+    return tuple(names)
+
+
+def _codex_scalar_leaf_bytes(item: Any) -> int:
+    """Fixed charge for known IMMUTABLE stdlib scalar leaves, else -1.
+
+    Only genuinely immutable, bounded-size types qualify; anything else that
+    is not a walkable container/object must be rejected by the caller rather
+    than waved through with a permissive constant (PR #53 exact-head review:
+    a slotted object carrying 1 MB was previously charged as 64 bytes).
+    """
+    import datetime
+    import decimal
+    import enum
+    import pathlib
+    import uuid
+
+    if isinstance(
+        item,
+        (
+            datetime.date,
+            datetime.time,
+            datetime.timedelta,
+            datetime.tzinfo,
+            uuid.UUID,
+            decimal.Decimal,
+            enum.Enum,
+            pathlib.PurePath,
+            type(Ellipsis),
+            type(NotImplemented),
+            range,
+            complex,
+        ),
+    ):
+        return 64
+    return -1
+
+
 def _bounded_codex_value_bytes(value: Any, *, stop_after: int) -> int:
-    """Estimate a done-item object graph without JSON serialization/copying."""
+    """Estimate a done-item object graph without JSON serialization/copying.
+
+    Walks dicts, built-in collections, ``__dict__`` objects, and ``__slots__``
+    objects (a legitimate compatibility-host object may carry arbitrarily
+    large ``function_call.arguments`` / reasoning payloads in slots — PR #53
+    exact-head review).  Known immutable stdlib scalars are charged a fixed
+    leaf bound; any other unknown non-scalar object is REJECTED (returns
+    ``stop_after + 1`` so the retained-byte ceiling trips fail-closed)
+    instead of being charged a permissive constant.
+    """
     seen: set[int] = set()
     nodes = 0
 
@@ -82,14 +142,30 @@ def _bounded_codex_value_bytes(value: Any, *, stop_after: int) -> int:
         seen.add(item_id)
         total = 16
         if isinstance(item, dict):
-            values = item.items()
+            child_values = item.items()
         elif isinstance(item, (list, tuple, set, frozenset)):
-            values = ((None, child) for child in item)
-        elif hasattr(item, "__dict__"):
-            values = vars(item).items()
+            child_values = ((None, child) for child in item)
+        elif hasattr(item, "__dict__") or _codex_slot_names(type(item)):
+
+            def _object_values():
+                if hasattr(item, "__dict__"):
+                    yield from vars(item).items()
+                for slot in _codex_slot_names(type(item)):
+                    try:
+                        yield slot, getattr(item, slot)
+                    except AttributeError:
+                        # Unset slot — no retained payload.
+                        continue
+
+            child_values = _object_values()
         else:
-            return 64
-        for key, child in values:
+            leaf = _codex_scalar_leaf_bytes(item)
+            if leaf >= 0:
+                return leaf
+            # Unknown non-scalar object: reject fail-closed rather than
+            # charge a permissive constant that a payload can hide behind.
+            return stop_after + 1
+        for key, child in child_values:
             if key is not None:
                 total += _walk(key, depth + 1)
             total += _walk(child, depth + 1)
@@ -1365,13 +1441,23 @@ def _enforce_codex_completed_object_limits(
             val = obj.get(key, default)
         return val if val is not None else default
 
-    items = list(_field(final, "output", None) or [])
-
+    # Never materialize the full output reference container just to count it:
+    # an already-huge completed response would be duplicated before the item
+    # ceiling trips (PR #53 exact-head review).  Consume at most
+    # max_output_items + 1 entries; without an item cap, iterate the
+    # provider's own container directly for byte accounting.
+    output_value = _field(final, "output", None) or []
     max_items = int(limits.get("max_output_items", 0) or 0)
-    if max_items > 0 and len(items) > max_items:
-        raise CodexStreamLimitError(
-            "output_items", limit=max_items, observed=len(items)
-        )
+    if max_items > 0:
+        import itertools
+
+        items = list(itertools.islice(iter(output_value), max_items + 1))
+        if len(items) > max_items:
+            raise CodexStreamLimitError(
+                "output_items", limit=max_items, observed=max_items + 1
+            )
+    else:
+        items = output_value
 
     text_limit = int(limits.get("max_text_bytes", 0) or 0)
     done_limit = int(limits.get("max_done_item_bytes", 0) or 0)
