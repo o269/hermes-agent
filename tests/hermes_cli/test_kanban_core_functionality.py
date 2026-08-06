@@ -191,7 +191,7 @@ def test_explicit_authorized_promote_releases_initial_block(
 
 def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawnable):
     """N consecutive spawn failures on the same task → auto_blocked."""
-    def _bad_spawn(task, ws):
+    def _bad_spawn(task, ws, **_kwargs):
         raise RuntimeError("no PATH")
 
     conn = kb.connect()
@@ -225,11 +225,11 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
     complete_task reset for the replacement point.)
     """
     calls = [0]
-    def _flaky_spawn(task, ws):
+    def _flaky_spawn(task, ws, **_kwargs):
         calls[0] += 1
         if calls[0] <= 2:
             raise RuntimeError("transient")
-        return 99999  # pid value — harmless; crash detection will clear it
+        return os.getpid()  # synchronous test double owns the injected lease
 
     conn = kb.connect()
     try:
@@ -246,7 +246,7 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
         assert task.last_failure_error is not None
         # Task is now running with a pid.
         assert task.status == "running"
-        assert task.worker_pid == 99999
+        assert task.worker_pid == os.getpid()
     finally:
         conn.close()
 
@@ -1310,7 +1310,7 @@ def test_recompute_ready_emits_promoted_not_ready(kanban_home):
 
 
 def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_spawnable):
-    def _bad(task, ws):
+    def _bad(task, ws, **_kwargs):
         raise RuntimeError("nope")
     conn = kb.connect()
     try:
@@ -1328,8 +1328,8 @@ def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_
 def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
     """Successful spawn must append a ``spawned`` event with the pid in
     the payload so humans tailing events see pid tracking."""
-    def _spawn_returns_pid(task, ws):
-        return 98765
+    def _spawn_returns_pid(task, ws, **_kwargs):
+        return os.getpid()
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -1339,7 +1339,7 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         assert len(spawned) == 1
         payload = spawned[0].payload
         assert payload is not None
-        assert payload["pid"] == 98765
+        assert payload["pid"] == os.getpid()
         assert payload["boot_id"]
     finally:
         conn.close()
@@ -1720,7 +1720,7 @@ def test_run_on_block_with_reason(kanban_home):
 def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spawnable):
     """Each spawn_failed event closes a run with outcome='spawn_failed',
     and the Nth failure closes a run with outcome='gave_up'."""
-    def _bad(task, ws):
+    def _bad(task, ws, **_kwargs):
         raise RuntimeError("no PATH")
 
     conn = kb.connect()

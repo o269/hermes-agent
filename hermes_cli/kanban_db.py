@@ -13701,6 +13701,20 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
+    # Resolve each assignee's spawn target once per tick. Apart from avoiding
+    # repeated profile/config I/O, this gives every candidate a stable
+    # admission snapshot: a VPS2 transport that disappears after the snapshot
+    # is still re-checked by _default_spawn and fails through the canonical
+    # spawn-failure cleanup path rather than becoming silently nonspawnable.
+    spawn_target_cache: dict[str, bool] = {}
+
+    def has_tick_spawn_target(assignee: Optional[str]) -> bool:
+        if not assignee:
+            return False
+        if assignee not in spawn_target_cache:
+            spawn_target_cache[assignee] = _assignee_has_spawn_target(assignee)
+        return spawn_target_cache[assignee]
+
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
@@ -13714,7 +13728,7 @@ def _dispatch_once_locked(
     ready_heavy_pending = any(
         task is not None
         and bool(row["assignee"])
-        and _assignee_has_spawn_target(row["assignee"])
+        and has_tick_spawn_target(row["assignee"])
         and _is_heavy_local_workspace_task(task)
         for row in ready_rows
         for task in [get_task(conn, row["id"])]
@@ -13722,7 +13736,7 @@ def _dispatch_once_locked(
     review_heavy_pending = any(
         task is not None
         and bool(row["assignee"])
-        and _assignee_has_spawn_target(row["assignee"])
+        and has_tick_spawn_target(row["assignee"])
         and _is_heavy_local_workspace_task(task)
         for row in review_rows
         for task in [get_task(conn, row["id"])]
@@ -13916,7 +13930,7 @@ def _dispatch_once_locked(
         # Spawn only through the canonical target predicate.  A target is either
         # a local profile or the configured attached-SSH VPS2 transport; terminal
         # control-plane lanes remain nonspawnable and pull claims themselves.
-        if not _assignee_has_spawn_target(row_assignee):
+        if not has_tick_spawn_target(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
             _record_ready_disposition(
                 conn,
@@ -14504,7 +14518,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if not _assignee_has_spawn_target(row["assignee"]):
+        if not has_tick_spawn_target(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         active_cards = _per_profile_active_cards.get(row["assignee"], set())
@@ -14780,6 +14794,37 @@ def _dispatch_once_locked(
         finally:
             if heavy_workspace_lease is not None:
                 heavy_workspace_lease.close()
+
+    # A phase can be selected from the raw ready/review queues yet have no
+    # candidate reach heavy admission because every candidate was held by an
+    # earlier guard (per-profile ownership, forced-skill preflight, respawn
+    # custody, or the lease protocol). In that case neither loop above calls
+    # _advance_heavy_workspace_phase_turn, so persisting the same turn would
+    # indefinitely starve otherwise admissible work in the opposite phase.
+    # Rotate after this no-progress tick. The opposite phase gets the next tick;
+    # retaining one phase per tick keeps admission ordering deterministic.
+    if (
+        not dry_run
+        and ready_heavy_pending
+        and review_heavy_pending
+        and not heavy_phase_attempted
+        and heavy_phase_turn in {"ready", "review"}
+    ):
+        phase_rows = ready_rows if heavy_phase_turn == "ready" else review_rows
+        for phase_row in phase_rows:
+            phase_task = get_task(conn, phase_row["id"])
+            if (
+                phase_task is not None
+                and bool(phase_row["assignee"])
+                and has_tick_spawn_target(phase_row["assignee"])
+                and _is_heavy_local_workspace_task(phase_task)
+            ):
+                _advance_heavy_workspace_phase_turn(
+                    conn,
+                    phase_row["id"],
+                    attempted_phase=heavy_phase_turn,
+                )
+                break
     for lease in dry_run_heavy_leases:
         lease.close()
     return result

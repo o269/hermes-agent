@@ -753,6 +753,98 @@ def test_ready_and_review_heavy_work_alternate_without_starvation(
             child.wait(timeout=5)
 
 
+@pytest.mark.parametrize("guarded_phase", ["ready", "review"])
+def test_guarded_heavy_phase_rotates_so_opposite_phase_progresses_next_tick(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guarded_phase: str,
+) -> None:
+    """A pre-admission hold must not pin the same phase turn forever."""
+    monkeypatch.setattr(kb, "_assignee_has_spawn_target", lambda _assignee: True)
+    monkeypatch.setattr(kb, "_preflight_forced_skills", lambda *_args, **_kwargs: True)
+    guarded_profile = f"{guarded_phase}-profile"
+    opposite_phase = "review" if guarded_phase == "ready" else "ready"
+    opposite_profile = f"{opposite_phase}-profile"
+    children: list[subprocess.Popen[bytes]] = []
+
+    def spawn(
+        _task: kb.Task,
+        _workspace: str,
+        *,
+        heavy_workspace_lease: kb._HeavyWorkspaceLease | None = None,
+        **_kwargs: Any,
+    ) -> int:
+        assert heavy_workspace_lease is not None
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            pass_fds=heavy_workspace_lease.filenos(),
+        )
+        children.append(child)
+        return child.pid
+
+    try:
+        with kb.connect() as conn:
+            busy_id = kb.create_task(
+                conn, title="already running", assignee=guarded_profile
+            )
+            kb.claim_task(conn, busy_id)
+            guarded_id = kb.create_task(
+                conn, title=f"guarded {guarded_phase}", assignee=guarded_profile
+            )
+            opposite_id = kb.create_task(
+                conn, title=f"spawnable {opposite_phase}", assignee=opposite_profile
+            )
+            if guarded_phase == "review":
+                conn.execute(
+                    "UPDATE tasks SET status = 'review' WHERE id = ?", (guarded_id,)
+                )
+            if opposite_phase == "review":
+                conn.execute(
+                    "UPDATE tasks SET status = 'review' WHERE id = ?", (opposite_id,)
+                )
+            conn.commit()
+
+            # Equivalent to the state immediately after the opposite phase had
+            # the previous fair turn: this tick selects the guarded phase.
+            kb._advance_heavy_workspace_phase_turn(
+                conn,
+                guarded_id,
+                attempted_phase=opposite_phase,
+            )
+
+            first = kb.dispatch_once(
+                conn,
+                spawn_fn=spawn,
+                max_heavy_workspaces=1,
+                max_in_progress=99,
+                skill_validator=lambda _profile, _skills: [],
+            )
+            second = kb.dispatch_once(
+                conn,
+                spawn_fn=spawn,
+                max_heavy_workspaces=1,
+                max_in_progress=99,
+                skill_validator=lambda _profile, _skills: [],
+            )
+
+            assert first.spawned == []
+            assert (guarded_id, guarded_profile, 1) in (
+                first.skipped_per_profile_capped
+            )
+            assert (opposite_id, 1, "phase_fairness") in (
+                first.skipped_heavy_workspace_capped
+            )
+            assert [item[0] for item in second.spawned] == [opposite_id]
+            guarded = kb.get_task(conn, guarded_id)
+            assert guarded is not None and guarded.status == guarded_phase
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        for child in children:
+            child.wait(timeout=5)
+
+
 def test_dashboard_dispatch_cannot_bypass_host_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -30,9 +30,10 @@ def isolated_kanban_home(monkeypatch):
     # contamination.
 
 
-def _fake_spawn(*args, **kwargs):
+def _fake_spawn(*args, heavy_workspace_lease=None, **kwargs):
     """Stand-in for the real worker spawn — returns a fake PID."""
-    return 12345
+    assert heavy_workspace_lease is not None
+    return os.getpid()
 
 
 def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):

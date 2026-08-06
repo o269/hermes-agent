@@ -35,8 +35,9 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     yield kanban_db
 
 
-def _fake_spawn(*args, **kwargs):
-    return 12345
+def _fake_spawn(*args, heavy_workspace_lease=None, **kwargs):
+    assert heavy_workspace_lease is not None
+    return os.getpid()
 
 
 def test_same_assignee_ready_pair_spawns_only_highest_priority(
@@ -388,6 +389,11 @@ def test_ready_and_review_same_profile_share_one_card_limit(
             conn.execute(
                 "UPDATE tasks SET status = 'review' WHERE id = ?", (review,)
             )
+        # Pin this assertion to a ready phase turn so the review card reaches
+        # the profile-cap guard after ready has acquired the one active slot.
+        kb._advance_heavy_workspace_phase_turn(
+            conn, review, attempted_phase="review"
+        )
         result = kb.dispatch_once(conn, spawn_fn=_fake_spawn, max_spawn=2)
         review_row = conn.execute(
             "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",

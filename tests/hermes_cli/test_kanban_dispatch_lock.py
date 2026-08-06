@@ -116,7 +116,9 @@ def _dispatch_lock_holder(home: str, entered, release, output) -> None:
     def blocking_spawn(*_args, **_kwargs):
         entered.set()
         assert release.wait(10)
-        return 99101
+        # The dispatcher process itself is the synchronous test double and
+        # therefore owns the injected heavy-workspace lease at verification.
+        return os.getpid()
 
     with child_kb.connect() as child_conn:
         result = child_kb.dispatch_once(child_conn, spawn_fn=blocking_spawn)
