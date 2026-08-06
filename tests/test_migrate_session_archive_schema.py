@@ -316,6 +316,23 @@ def test_live_holder_aborts_before_backup_or_mutation(tmp_path):
     assert not Path(str(db_path) + ".bak-holder").exists()
 
 
+def test_lsof_zero_holder_command_suppresses_stock_warnings(tmp_path):
+    db_path = tmp_path / "lsof-warning-state.db"
+    _create_real_shaped_db(db_path, include_pinned=True, include_activity=False)
+    targets = migration.deduplicate_targets([db_path])
+    commands = []
+
+    def warning_sensitive_lsof(command, **kwargs):
+        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        commands.append(command)
+        warning = "" if "-w" in command else "lsof: WARNING: can't stat() tracefs"
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=warning)
+
+    migration.assert_no_lsof_holders(targets, runner=warning_sensitive_lsof)
+
+    assert commands == [["lsof", "-w", "-F", "pfn", "--", str(db_path)]]
+
+
 def test_lsof_error_output_is_not_mistaken_for_zero_holders(tmp_path):
     db_path = tmp_path / "lsof-error-state.db"
     _create_real_shaped_db(db_path, include_pinned=True, include_activity=False)

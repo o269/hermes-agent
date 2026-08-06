@@ -429,7 +429,7 @@ def assert_no_lsof_holders(
     runner: Runner = subprocess.run,
 ) -> None:
     paths = _lsof_paths(targets)
-    command = ["lsof", "-F", "pfn", "--", *(str(path) for path in paths)]
+    command = ["lsof", "-w", "-F", "pfn", "--", *(str(path) for path in paths)]
     try:
         result = runner(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as exc:
