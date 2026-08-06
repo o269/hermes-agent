@@ -14889,6 +14889,161 @@ def main():
         help="Skip the timestamped backup copy (not recommended)",
     )
 
+    sessions_cold_archive = sessions_subparsers.add_parser(
+        "cold-archive",
+        help="Stage a lineage-safe offline cold archive manifest/export pass",
+        description=(
+            "Purpose-built state.db cold archival. Refuses the active profile "
+            "database and every named-profile inode alias. Producer mode requires "
+            "a new stage and creates encrypted rollback/restricted packets with "
+            "offsite readback. Apply mode loads externally frozen manifest and "
+            "producer-receipt bytes, re-verifies custody, and checks every invariant before "
+            "COMMIT. It never runs VACUUM, optimize, checkpoint, auto-prune, or "
+            "live maintenance actions."
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Offline recovered candidate state.db; active ~/.hermes/state.db is refused",
+    )
+    sessions_cold_archive.add_argument(
+        "--stage-root",
+        type=Path,
+        required=True,
+        help=(
+            "Producer: a nonexistent restricted stage; apply: the existing approved stage"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Only write the Gate-B manifest and restricted ID files; no export/upload/delete",
+    )
+    sessions_cold_archive.add_argument(
+        "--apply-retention",
+        action="store_true",
+        help="Load an existing externally approved stage and retain only its reviewed set",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-manifest",
+        type=Path,
+        help="Externally frozen copy of GATE-B-MANIFEST.json for apply",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-manifest-sha256",
+        help="Exact SHA-256 of the approved manifest file bytes (required for apply)",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt",
+        type=Path,
+        help="Externally frozen copy of COLD-ARCHIVE-PRODUCER-RECEIPT.json",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt-sha256",
+        help="Exact SHA-256 of the externally approved producer receipt bytes",
+    )
+    sessions_cold_archive.add_argument(
+        "--hot-days",
+        type=float,
+        default=30.0,
+        help=(
+            "Hot searchable window in days (default: 30); hot + archive grace "
+            "must be at least 37"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--archive-grace-days",
+        type=float,
+        default=7.0,
+        help=(
+            "Archived reversible grace window in days (default: 7); hot + archive "
+            "grace must be at least 37"
+        ),
+    )
+
+    sessions_cold_archive.add_argument(
+        "--no-default-holds",
+        action="store_true",
+        help="Do not apply the built-in customer/ops platform-source permanent holds",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-source",
+        action="append",
+        default=[],
+        help="Additional session source to hold permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-title-regex",
+        action="append",
+        default=[],
+        help="Regex matching titles that must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-cwd-prefix",
+        action="append",
+        default=[],
+        help="CWD prefix whose sessions must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-remote",
+        help="Bounded encrypted-offsite remote root, e.g. gdrive:vps-offload/hermes-state",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-config",
+        type=Path,
+        help="Dedicated current-user mode-0600 unaliased rclone config",
+    )
+    sessions_cold_archive.add_argument(
+        "--remote-namespace",
+        help="Remote namespace below --rclone-remote (default: manifest hash namespace)",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-recipient-file",
+        type=Path,
+        help="Public age recipient for opaque rollback and restricted/QMD packets",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-exe",
+        default="age",
+        help="age executable name/path (default: age)",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-exe",
+        default="rclone",
+        help="rclone executable name/path (default: rclone)",
+    )
+
+    sessions_cold_cutover = sessions_subparsers.add_parser(
+        "cold-archive-mark-cutover",
+        help="Record the successful candidate cutover clock for 14-day source retention",
+    )
+    sessions_cold_cutover.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_cutover.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate is healthy before starting the 14-day clock",
+    )
+    sessions_cold_cutover.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_cutover.add_argument("--rclone-exe", default="rclone")
+
+    sessions_cold_prune = sessions_subparsers.add_parser(
+        "cold-archive-prune-bundle",
+        help="Prune local plaintext source bundle only after cutover plus 14 days",
+    )
+    sessions_cold_prune.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_prune.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate remains healthy before local plaintext prune",
+    )
+    sessions_cold_prune.add_argument(
+        "--approved-cutover-marker-sha256", required=True
+    )
+    sessions_cold_prune.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_prune.add_argument("--rclone-exe", default="rclone")
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
@@ -14964,6 +15119,106 @@ def main():
                     print(f"  A backup is preserved at: {report['backup_path']}")
                 print("  Keep state.db and the backup; do not delete them.")
             return
+
+        if action in {"cold-archive-mark-cutover", "cold-archive-prune-bundle"}:
+            from hermes_cli.session_cold_archive import (
+                ColdArchiveError,
+                prune_source_bundle_after_retention,
+                record_candidate_cutover,
+            )
+
+            try:
+                if action == "cold-archive-mark-cutover":
+                    result = record_candidate_cutover(
+                        args.stage_root,
+                        candidate_health_confirmed=getattr(
+                            args, "candidate_health_confirmed", False
+                        ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
+                    )
+                else:
+                    result = prune_source_bundle_after_retention(
+                        args.stage_root,
+                        candidate_health_confirmed=getattr(
+                            args, "candidate_health_confirmed", False
+                        ),
+                        approved_cutover_marker_sha256=(
+                            args.approved_cutover_marker_sha256
+                        ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
+                    )
+            except ColdArchiveError as exc:
+                print(f"Error: cold archive lifecycle failed closed: {exc}")
+                raise SystemExit(1) from exc
+            print(_json.dumps(result, indent=2, sort_keys=True))
+            return 0
+
+        if action == "cold-archive":
+            from hermes_cli.session_cold_archive import (
+                ColdArchiveError,
+                DEFAULT_PERMANENT_HOLD_SOURCES,
+                run_cold_archive_pass,
+            )
+
+            hold_sources = (
+                []
+                if getattr(args, "no_default_holds", False)
+                else list(DEFAULT_PERMANENT_HOLD_SOURCES)
+            )
+            hold_sources.extend(getattr(args, "hold_source", None) or [])
+            try:
+                receipt = run_cold_archive_pass(
+                    source_db=args.source,
+                    stage_root=args.stage_root,
+                    hot_days=getattr(args, "hot_days", 30.0),
+                    archive_grace_days=getattr(args, "archive_grace_days", 7.0),
+                    hold_sources=hold_sources,
+                    hold_title_regexes=getattr(args, "hold_title_regex", None) or [],
+                    hold_cwd_prefixes=getattr(args, "hold_cwd_prefix", None) or [],
+                    manifest_only=getattr(args, "manifest_only", False),
+                    apply_retention=getattr(args, "apply_retention", False),
+                    approved_manifest_path=getattr(args, "approved_manifest", None),
+                    approved_manifest_sha256=getattr(
+                        args, "approved_manifest_sha256", None
+                    ),
+                    approved_producer_receipt_path=getattr(
+                        args, "approved_producer_receipt", None
+                    ),
+                    approved_producer_receipt_sha256=getattr(
+                        args, "approved_producer_receipt_sha256", None
+                    ),
+                    rclone_remote=getattr(args, "rclone_remote", None),
+                    rclone_config=getattr(args, "rclone_config", None),
+                    remote_namespace=getattr(args, "remote_namespace", None),
+                    age_recipient_file=getattr(args, "age_recipient_file", None),
+                    age_exe=getattr(args, "age_exe", "age"),
+                    rclone_exe=getattr(args, "rclone_exe", "rclone"),
+                )
+            except ColdArchiveError as exc:
+                print(f"Error: cold archive failed closed: {exc}")
+                raise SystemExit(1) from exc
+            public_receipt = dict(receipt)
+            public_receipt.pop("source_db", None)
+            public_receipt.pop("stage_root", None)
+            qmd = public_receipt.get("qmd_export")
+            if isinstance(qmd, dict):
+                public_receipt["qmd_export"] = {
+                    "exported_file_count": len(qmd.get("exported_files") or []),
+                    "message_count": qmd.get("message_count"),
+                    "verified": qmd.get("verified"),
+                }
+            remote = public_receipt.get("remote_publish")
+            if isinstance(remote, list):
+                public_receipt["remote_publish"] = [
+                    {key: value for key, value in item.items() if key != "local_path"}
+                    if isinstance(item, dict)
+                    else item
+                    for item in remote
+                ]
+            print(_json.dumps(public_receipt, indent=2, sort_keys=True))
+            return 0
 
         try:
             from hermes_state import SessionDB
