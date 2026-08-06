@@ -1471,6 +1471,18 @@ DEFAULT_CONFIG = {
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
+        "memory_rss_ceiling_mb": 2048,  # fail-fast before compression snapshots when
+                                      # current parent RSS + two bounded private
+                                      # snapshots + retained-output reserve would
+                                      # exceed this process ceiling.
+        "memory_message_graph_limit_mb": 64,  # reject a transcript whose counted
+                                      # content/tool/replay graph exceeds this bound
+                                      # before any recursive copy or aux request.
+        "memory_snapshot_limit_mb": 64,  # per private worker/rollback snapshot cap;
+                                      # opaque Codex/provider replay sidecars are
+                                      # counted, then structurally detached (mutable
+                                      # containers cloned, immutable payloads shared)
+                                      # never recursively duplicated.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
@@ -1678,6 +1690,11 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "max_output_tokens": 12000,  # hard safety cap; above the normal ~10K
+                                      # summary envelope. Provider wires that
+                                      # support output caps receive it directly;
+                                      # Codex Responses enforces derived local
+                                      # retained-event byte/item limits instead.
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },

@@ -916,6 +916,25 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
+        # Codex's backend rejects max_output_tokens/max_completion_tokens on
+        # the Responses wire. When an auxiliary caller supplies a chat-style
+        # cap (compression and MoA), consume it locally as strict retained SSE
+        # byte/item limits instead of forwarding an unsupported parameter.
+        raw_output_cap = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+        retained_stream_limits: Optional[dict[str, int]] = None
+        if raw_output_cap is not None:
+            try:
+                output_cap = int(raw_output_cap)
+            except (TypeError, ValueError, OverflowError):
+                output_cap = 0
+            if output_cap > 0:
+                retained_stream_limits = {
+                    "max_output_items": 256,
+                    "max_text_bytes": output_cap * 8,
+                    "max_commentary_bytes": output_cap * 8,
+                    "max_reasoning_bytes": output_cap * 16,
+                    "max_done_item_bytes": output_cap * 32,
+                }
 
         # Separate system/instructions from replayable conversation messages,
         # then route the rest through the SINGLE shared chat->Responses
@@ -1153,11 +1172,32 @@ class _CodexCompletionsAdapter:
 
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
-                final = _consume_codex_event_stream(
-                    event_stream,
-                    model=resp_kwargs.get("model"),
-                    on_event=_on_each_event,
-                )
+                # Some Codex-compatible hosts accept ``stream=True`` but return
+                # a completed Responses object instead of an SSE iterator. Do
+                # not hand that object to the event consumer: typed Responses
+                # (and compatibility shims such as SimpleNamespace) are not
+                # event streams and may not be iterable at all.
+                if hasattr(event_stream, "output"):
+                    # A completed Responses object bypassed the SSE consumer's
+                    # per-event accounting — charge it against the same local
+                    # retained-byte/item ceilings so a chat-style cap
+                    # (compression / MoA) cannot retain an unbounded payload.
+                    from agent.codex_runtime import (
+                        _enforce_codex_completed_object_limits,
+                    )
+
+                    _enforce_codex_completed_object_limits(
+                        event_stream,
+                        retention_limits=retained_stream_limits,
+                    )
+                    final = event_stream
+                else:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=str(resp_kwargs.get("model") or model),
+                        on_event=_on_each_event,
+                        retention_limits=retained_stream_limits,
+                    )
             finally:
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
@@ -6365,6 +6405,12 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # (they finish before the deadline) and is a minimum, so a higher config value
 # is kept unchanged.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
+_DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS = 12_000
+_MAX_COMPRESSION_MAX_OUTPUT_TOKENS = 20_000
+
+
+class AuxiliaryCompressionLimitError(RuntimeError):
+    """A required compression output bound could not be enforced."""
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -6409,6 +6455,21 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
         pass
 
     return task_config
+
+
+def compression_max_output_tokens() -> int:
+    """Return a positive configured compression cap, clamped at 20K."""
+    raw = _get_auxiliary_task_config("compression").get("max_output_tokens")
+    if raw is None:
+        configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    else:
+        try:
+            configured = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    if configured <= 0:
+        configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    return min(configured, _MAX_COMPRESSION_MAX_OUTPUT_TOKENS)
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
@@ -6486,6 +6547,76 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
                     task, effort,
                 )
     return result
+
+
+# Per-task concurrency limiting (#23324)
+# ---------------------------------------------------------------------------
+# Background auxiliary work (title generation, context compression, etc.) can
+# spawn unbounded concurrent LLM calls when many sessions are active. During
+# provider incidents each call also retries / fans out across the fallback
+# chain, multiplying request volume on already-degraded endpoints. A per-task
+# semaphore caps in-flight calls so retry amplification stays bounded.
+
+_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
+_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_sem_lock = threading.Lock()
+
+
+def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
+    """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
+    if not task or task == "vision":
+        # Vision already uses this key for its encode/resize CPU worker pool;
+        # its LLM calls deliberately remain concurrent.
+        return None
+    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
+    """Get a per-task sync semaphore, rebuilding it after a config change."""
+    limit = _get_task_max_concurrency(task)
+    if limit is None:
+        return None
+    with _aux_sem_lock:
+        entry = _aux_sync_semaphores.get(task)
+        if entry is None or entry[0] != limit:
+            semaphore = threading.BoundedSemaphore(limit)
+            _aux_sync_semaphores[task] = (limit, semaphore)
+            return semaphore
+        return entry[1]
+
+
+def _acquire_async_aux_semaphore(task: Optional[str]):
+    """Get a per-task, per-event-loop async semaphore after config lookup."""
+    limit = _get_task_max_concurrency(task)
+    if limit is None:
+        return None
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (task, id(loop))
+    with _aux_sem_lock:
+        entry = _aux_async_semaphores.get(key)
+        if entry is None or entry[0] != limit:
+            semaphore = asyncio.Semaphore(limit)
+            _aux_async_semaphores[key] = (limit, semaphore)
+            return semaphore
+        return entry[1]
+
+
+def _reset_aux_semaphores() -> None:
+    """Drop cached semaphores (test helper)."""
+    with _aux_sem_lock:
+        _aux_sync_semaphores.clear()
+        _aux_async_semaphores.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -6631,6 +6762,7 @@ def _build_call_kwargs(
     extra_body: Optional[dict] = None,
     reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
@@ -6638,6 +6770,18 @@ def _build_call_kwargs(
         "messages": messages,
         "timeout": timeout,
     }
+
+    # Keep compression's hard output ceiling below the ContextCompressor API.
+    # That preserves the compressor's long-standing prompt-guidance contract
+    # while ensuring every real provider request (including Codex's local SSE
+    # adapter) receives a bounded, centrally clamped value.
+    if str(task or "") == "compression":
+        configured_cap = compression_max_output_tokens()
+        try:
+            requested_cap = int(max_tokens) if max_tokens is not None else configured_cap
+        except (TypeError, ValueError, OverflowError):
+            requested_cap = configured_cap
+        max_tokens = min(max(1, requested_cap), configured_cap)
 
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
@@ -6670,7 +6814,8 @@ def _build_call_kwargs(
         # The one exception is the Anthropic Messages wire (MiniMax and any
         # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
         # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
-        # there.
+        # there. Compression is also an explicit exception: its output cap is
+        # an RSS safety invariant, translated provider-appropriately below.
         #
         # NVIDIA NIM (integrate.api.nvidia.com and local NIM endpoints) is a
         # second exception: some models—notably minimaxai/minimax-m3—return HTTP
@@ -6685,9 +6830,11 @@ def _build_call_kwargs(
             _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
+        _is_compression = bool(task) and str(task) == "compression"
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _is_nvidia_nim
+            or _is_compression
         ):
             kwargs["max_tokens"] = max_tokens
 
@@ -6925,6 +7072,73 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
 ) -> Any:
+    """Run an auxiliary LLM request, applying the configured task limit."""
+    semaphore = _acquire_sync_aux_semaphore(task)
+    if semaphore is not None:
+        semaphore.acquire()
+    try:
+        response = _call_llm_impl(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            reasoning_config=reasoning_config,
+            api_mode=api_mode,
+            stream=stream,
+            stream_options=stream_options,
+        )
+        if stream and semaphore is not None:
+            stream_semaphore = semaphore
+            semaphore = None
+            return _release_sync_semaphore_after_stream(response, stream_semaphore)
+        return response
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+def _release_sync_semaphore_after_stream(
+    stream: Any, semaphore: threading.BoundedSemaphore,
+):
+    """Release a permit only after a streaming response is consumed or closed."""
+    try:
+        yield from stream
+    finally:
+        try:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        finally:
+            semaphore.release()
+
+
+def _call_llm_impl(
+    task: str = None,
+    *,
+    provider: str = None,
+    model: str = None,
+    base_url: str = None,
+    api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: int = None,
+    tools: list = None,
+    timeout: float = None,
+    extra_body: dict = None,
+    reasoning_config: Optional[dict] = None,
+    api_mode: str = None,
+    stream: bool = False,
+    stream_options: dict = None,
+) -> Any:
     """Centralized synchronous LLM call.
 
     Resolves provider + model (from task config, explicit args, or auto-detect),
@@ -7058,7 +7272,8 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_base_info or resolved_base_url)
+        base_url=_base_info or resolved_base_url,
+        task=task)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
@@ -7178,12 +7393,29 @@ def call_llm(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        # Compression's hard output cap is injected by _build_call_kwargs()
+        # even when the caller omitted ``max_tokens``, under whichever
+        # provider-appropriate key (``max_tokens`` or
+        # ``max_completion_tokens``). Detect rejection of the actual injected
+        # key(s) — independent of the caller's original argument — so a
+        # refusal can never escape as a generic summary failure that commits
+        # a static fallback (PR #79668 review: fail-closed cap contract).
+        _compression_cap_call = bool(task) and str(task) == "compression"
+        _cap_key_inflight = (
+            "max_tokens" in kwargs or "max_completion_tokens" in kwargs
+        )
+        if (max_tokens is not None or (_compression_cap_call and _cap_key_inflight)) and (
             "max_tokens" in err_str
+            or "max_completion_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_unsupported_parameter_error(first_err, "max_completion_tokens")
             or _is_zai_param_error
         ):
+            if _compression_cap_call:
+                raise AuxiliaryCompressionLimitError(
+                    "provider rejected mandatory compression output limit"
+                ) from first_err
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
@@ -7589,6 +7821,47 @@ async def async_call_llm(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
 ) -> Any:
+    """Run an asynchronous auxiliary LLM request under the configured limit."""
+    semaphore = _acquire_async_aux_semaphore(task)
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        return await _async_call_llm_impl(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            reasoning_config=reasoning_config,
+        )
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+async def _async_call_llm_impl(
+    task: str = None,
+    *,
+    provider: str = None,
+    model: str = None,
+    base_url: str = None,
+    api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: int = None,
+    tools: list = None,
+    timeout: float = None,
+    extra_body: dict = None,
+    reasoning_config: Optional[dict] = None,
+) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
@@ -7674,7 +7947,8 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_client_base or resolved_base_url)
+        base_url=_client_base or resolved_base_url,
+        task=task)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
@@ -7742,12 +8016,29 @@ async def async_call_llm(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        # Compression's hard output cap is injected by _build_call_kwargs()
+        # even when the caller omitted ``max_tokens``, under whichever
+        # provider-appropriate key (``max_tokens`` or
+        # ``max_completion_tokens``). Detect rejection of the actual injected
+        # key(s) — independent of the caller's original argument — so a
+        # refusal can never escape as a generic summary failure that commits
+        # a static fallback (PR #79668 review: fail-closed cap contract).
+        _compression_cap_call = bool(task) and str(task) == "compression"
+        _cap_key_inflight = (
+            "max_tokens" in kwargs or "max_completion_tokens" in kwargs
+        )
+        if (max_tokens is not None or (_compression_cap_call and _cap_key_inflight)) and (
             "max_tokens" in err_str
+            or "max_completion_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_unsupported_parameter_error(first_err, "max_completion_tokens")
             or _is_zai_param_error
         ):
+            if _compression_cap_call:
+                raise AuxiliaryCompressionLimitError(
+                    "provider rejected mandatory compression output limit"
+                ) from first_err
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
