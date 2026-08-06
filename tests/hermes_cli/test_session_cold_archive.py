@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_SQL, SessionDB
 import hermes_cli.session_cold_archive as cold
 from hermes_cli.session_cold_archive import ColdArchiveError
 
@@ -28,23 +28,30 @@ def _build_current_db(path: Path) -> SessionDB:
 
 
 def _build_archive_candidate(path: Path) -> SessionDB:
-    """Create an explicit candidate contract, not a silent current-schema shim.
-
-    Current fork SessionDB intentionally lacks durable pin/activity columns. The
-    command has a dedicated fail-closed test for that real schema below. Happy
-    path fixtures model a recovered candidate that actually carries both
-    canonical fields required by the archive contract.
-    """
+    """Create a candidate from the runtime schema required by the archive contract."""
 
     db = SessionDB(db_path=path)
     assert db._conn is not None
     columns = {str(row[1]) for row in db._conn.execute('PRAGMA table_info("sessions")')}
-    assert "pinned" not in columns
-    assert "last_activity_at" not in columns
-    db._conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER")
-    db._conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at REAL")
-    db._conn.commit()
+    assert {"pinned", "last_activity_at"} <= columns
     return db
+
+
+def _build_nullable_pin_candidate(path: Path) -> SessionDB:
+    """Create a malformed legacy candidate whose pin field can contain NULL."""
+
+    nullable_schema = SCHEMA_SQL.replace(
+        "    pinned BOOLEAN NOT NULL DEFAULT 0,\n",
+        "    pinned BOOLEAN,\n",
+    )
+    assert nullable_schema != SCHEMA_SQL
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(nullable_schema)
+        conn.commit()
+    finally:
+        conn.close()
+    return SessionDB(db_path=path)
 
 
 def _make_session(
@@ -288,33 +295,30 @@ def _apply(
     )
 
 
-@pytest.mark.parametrize(
-    ("present_column", "definition", "missing_column"),
-    [
-        ("pinned", "INTEGER", "last_activity_at"),
-        ("last_activity_at", "REAL", "pinned"),
-    ],
-)
+@pytest.mark.parametrize("missing_column", ["last_activity_at", "pinned"])
 def test_each_required_canonical_policy_column_fails_closed_when_missing(
     tmp_path: Path,
-    present_column: str,
-    definition: str,
     missing_column: str,
 ) -> None:
     db_path = tmp_path / f"missing-{missing_column}.db"
-    db = _build_current_db(db_path)
+    definitions = {
+        "pinned": "    pinned BOOLEAN NOT NULL DEFAULT 0,\n",
+        "last_activity_at": "    last_activity_at REAL,\n",
+    }
+    malformed_schema = SCHEMA_SQL.replace(definitions[missing_column], "")
+    assert malformed_schema != SCHEMA_SQL
+    conn = sqlite3.connect(db_path)
     try:
-        db.create_session(session_id="old", source="cli")
-        db._conn.execute(
-            f'ALTER TABLE sessions ADD COLUMN "{present_column}" {definition}'
-        )
-        db._conn.execute(
-            "UPDATE sessions SET archived=1, ended_at=?, started_at=? WHERE id='old'",
+        conn.executescript(malformed_schema)
+        conn.execute(
+            """INSERT INTO sessions
+               (id, started_at, ended_at, source, archived)
+               VALUES ('old', ?, ?, 'cli', 1)""",
             (NOW - 80 * DAY, NOW - 80 * DAY),
         )
-        db._conn.commit()
+        conn.commit()
     finally:
-        db.close()
+        conn.close()
 
     with pytest.raises(
         ColdArchiveError, match=rf"missing sessions columns: {missing_column}"
@@ -475,7 +479,7 @@ def test_apply_deletes_exact_37_day_boundary_but_not_one_second_inside(
 
 def test_null_canonical_activity_or_pin_state_is_not_selectable(tmp_path: Path) -> None:
     db_path = tmp_path / "candidate.db"
-    db = _build_archive_candidate(db_path)
+    db = _build_nullable_pin_candidate(db_path)
     try:
         _make_session(db, "no-activity", days_ago=80, content="cold")
         _make_session(db, "no-pin", days_ago=80, content="cold")
