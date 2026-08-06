@@ -14896,8 +14896,8 @@ def main():
             "Purpose-built state.db cold archival. Refuses the active profile "
             "database and every named-profile inode alias. Producer mode requires "
             "a new stage and creates encrypted rollback/restricted packets with "
-            "offsite readback. Apply mode loads externally approved manifest bytes "
-            "from that stage, re-verifies custody, and checks every invariant before "
+            "offsite readback. Apply mode loads externally frozen manifest and "
+            "producer-receipt bytes, re-verifies custody, and checks every invariant before "
             "COMMIT. It never runs VACUUM, optimize, checkpoint, auto-prune, or "
             "live maintenance actions."
         ),
@@ -14929,11 +14929,20 @@ def main():
     sessions_cold_archive.add_argument(
         "--approved-manifest",
         type=Path,
-        help="Existing stage GATE-B-MANIFEST.json approved externally for apply",
+        help="Externally frozen copy of GATE-B-MANIFEST.json for apply",
     )
     sessions_cold_archive.add_argument(
         "--approved-manifest-sha256",
         help="Exact SHA-256 of the approved manifest file bytes (required for apply)",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt",
+        type=Path,
+        help="Externally frozen copy of COLD-ARCHIVE-PRODUCER-RECEIPT.json",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt-sha256",
+        help="Exact SHA-256 of the externally approved producer receipt bytes",
     )
     sessions_cold_archive.add_argument(
         "--hot-days",
@@ -14978,7 +14987,7 @@ def main():
     sessions_cold_archive.add_argument(
         "--rclone-config",
         type=Path,
-        help="Dedicated root-owned/minimal rclone config for the gdrive remote",
+        help="Dedicated current-user mode-0600 unaliased rclone config",
     )
     sessions_cold_archive.add_argument(
         "--remote-namespace",
@@ -15010,6 +15019,8 @@ def main():
         action="store_true",
         help="Confirm the cutover candidate is healthy before starting the 14-day clock",
     )
+    sessions_cold_cutover.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_cutover.add_argument("--rclone-exe", default="rclone")
 
     sessions_cold_prune = sessions_subparsers.add_parser(
         "cold-archive-prune-bundle",
@@ -15021,6 +15032,11 @@ def main():
         action="store_true",
         help="Confirm the cutover candidate remains healthy before local plaintext prune",
     )
+    sessions_cold_prune.add_argument(
+        "--approved-cutover-marker-sha256", required=True
+    )
+    sessions_cold_prune.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_prune.add_argument("--rclone-exe", default="rclone")
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
@@ -15112,6 +15128,8 @@ def main():
                         candidate_health_confirmed=getattr(
                             args, "candidate_health_confirmed", False
                         ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
                     )
                 else:
                     result = prune_source_bundle_after_retention(
@@ -15119,6 +15137,11 @@ def main():
                         candidate_health_confirmed=getattr(
                             args, "candidate_health_confirmed", False
                         ),
+                        approved_cutover_marker_sha256=(
+                            args.approved_cutover_marker_sha256
+                        ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
                     )
             except ColdArchiveError as exc:
                 print(f"Error: cold archive lifecycle failed closed: {exc}")
@@ -15154,6 +15177,12 @@ def main():
                     approved_manifest_sha256=getattr(
                         args, "approved_manifest_sha256", None
                     ),
+                    approved_producer_receipt_path=getattr(
+                        args, "approved_producer_receipt", None
+                    ),
+                    approved_producer_receipt_sha256=getattr(
+                        args, "approved_producer_receipt_sha256", None
+                    ),
                     rclone_remote=getattr(args, "rclone_remote", None),
                     rclone_config=getattr(args, "rclone_config", None),
                     remote_namespace=getattr(args, "remote_namespace", None),
@@ -15164,7 +15193,25 @@ def main():
             except ColdArchiveError as exc:
                 print(f"Error: cold archive failed closed: {exc}")
                 return 1
-            print(_json.dumps(receipt, indent=2, sort_keys=True))
+            public_receipt = dict(receipt)
+            public_receipt.pop("source_db", None)
+            public_receipt.pop("stage_root", None)
+            qmd = public_receipt.get("qmd_export")
+            if isinstance(qmd, dict):
+                public_receipt["qmd_export"] = {
+                    "exported_file_count": len(qmd.get("exported_files") or []),
+                    "message_count": qmd.get("message_count"),
+                    "verified": qmd.get("verified"),
+                }
+            remote = public_receipt.get("remote_publish")
+            if isinstance(remote, list):
+                public_receipt["remote_publish"] = [
+                    {key: value for key, value in item.items() if key != "local_path"}
+                    if isinstance(item, dict)
+                    else item
+                    for item in remote
+                ]
+            print(_json.dumps(public_receipt, indent=2, sort_keys=True))
             return 0
 
         try:

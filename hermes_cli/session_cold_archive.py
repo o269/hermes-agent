@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +40,16 @@ DEFAULT_ARCHIVE_GRACE_DAYS = 7.0
 DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS = 14 * 86_400
 _ARCHIVE_VERSION = 2
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
+_REQUIRED_FTS_OBJECTS = frozenset({
+    "messages_fts",
+    "messages_fts_insert",
+    "messages_fts_delete",
+    "messages_fts_update",
+    "messages_fts_trigram",
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+})
 _REQUIRED_SESSION_COLUMNS = frozenset({
     "id",
     "source",
@@ -98,14 +109,25 @@ class StageArtifacts:
     apply_prepared_path: Path
     retention_receipt_path: Path
     cutover_marker_path: Path
+    source_bundle_prune_prepared_path: Path
     source_bundle_pruned_path: Path
 
 
 def utc_iso(value: float | None = None) -> str:
-    ts = time.time() if value is None else float(value)
+    ts = _finite_epoch(time.time() if value is None else value, "timestamp")
     return (
         datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     )
+
+
+def _finite_epoch(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ColdArchiveError(f"{label} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ColdArchiveError(f"{label} must be a finite number")
+    return result
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -248,17 +270,20 @@ def _safe_immediate_child(root: Path, name: str) -> Path:
 def _exclusive_write_bytes(path: Path, data: bytes) -> Path:
     parent = _require_private_dir(path.parent)
     target = _safe_immediate_child(parent, path.name)
+    partial = _safe_immediate_child(
+        parent, f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.partial"
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(target, flags, 0o600)
+        fd = os.open(partial, flags, 0o600)
     except FileExistsError as exc:
         raise ColdArchiveError(
-            f"refusing to overwrite stage artifact: {target}"
+            f"refusing existing stage partial: {partial}"
         ) from exc
     except OSError as exc:
         raise ColdArchiveError(
-            f"could not create stage artifact {target}: {exc}"
+            f"could not create stage partial {partial}: {exc}"
         ) from exc
     try:
         os.fchmod(fd, 0o600)
@@ -270,8 +295,21 @@ def _exclusive_write_bytes(path: Path, data: bytes) -> Path:
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        target.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         raise
+    try:
+        os.link(partial, target, follow_symlinks=False)
+    except FileExistsError as exc:
+        partial.unlink(missing_ok=True)
+        raise ColdArchiveError(
+            f"refusing to overwrite stage artifact: {target}"
+        ) from exc
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        raise ColdArchiveError(
+            f"could not publish stage artifact without clobber: {target}: {exc}"
+        ) from exc
+    partial.unlink()
     _fsync_directory(parent)
     return target
 
@@ -285,15 +323,56 @@ def _exclusive_write_json(path: Path, payload: dict[str, Any]) -> Path:
     return _exclusive_write_text(path, text)
 
 
-def _load_private_json(path: Path) -> dict[str, Any]:
-    private = _require_private_file(path)
+def _decode_json_object(data: bytes, path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(private.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ColdArchiveError(f"invalid JSON stage artifact {private}: {exc}") from exc
+        payload = json.loads(
+            data.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {value}")
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ColdArchiveError(f"invalid JSON stage artifact {path}: {exc}") from exc
     if not isinstance(payload, dict):
-        raise ColdArchiveError(f"JSON stage artifact must contain an object: {private}")
+        raise ColdArchiveError(f"JSON stage artifact must contain an object: {path}")
     return payload
+
+
+def _read_private_bytes(path: Path) -> tuple[Path, bytes]:
+    """Read one stable private-file snapshot for both hashing and parsing."""
+
+    private = _require_private_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(private, flags)
+    except OSError as exc:
+        raise ColdArchiveError(
+            f"could not open private stage artifact {private}: {exc}"
+        ) from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o600:
+            raise ColdArchiveError(f"stage artifact changed type or mode: {private}")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            data = handle.read()
+            after = os.fstat(handle.fileno())
+        current = private.lstat()
+        if (
+            not os.path.samestat(before, after)
+            or not os.path.samestat(after, current)
+            or len(data) != after.st_size
+        ):
+            raise ColdArchiveError(f"stage artifact changed during read: {private}")
+        return private, data
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _load_private_json(path: Path) -> dict[str, Any]:
+    private, data = _read_private_bytes(path)
+    return _decode_json_object(data, private)
 
 
 def _stage_paths(root: Path) -> StageArtifacts:
@@ -315,6 +394,8 @@ def _stage_paths(root: Path) -> StageArtifacts:
         apply_prepared_path=root / "COLD-ARCHIVE-APPLY-PREPARED.json",
         retention_receipt_path=root / "COLD-ARCHIVE-RETENTION-RECEIPT.json",
         cutover_marker_path=rollback / "CANDIDATE-CUTOVER.json",
+        source_bundle_prune_prepared_path=rollback
+        / "SOURCE-BUNDLE-PRUNE-PREPARED.json",
         source_bundle_pruned_path=rollback / "SOURCE-BUNDLE-PRUNED.json",
     )
 
@@ -604,6 +685,18 @@ def _require_archive_schema(conn: sqlite3.Connection) -> None:
             "cold archive schema is missing required messages columns: "
             + ", ".join(missing_messages)
         )
+    fts_objects = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+        )
+    }
+    missing_fts = sorted(_REQUIRED_FTS_OBJECTS - fts_objects)
+    if missing_fts:
+        raise ColdArchiveError(
+            "cold archive schema cannot prove required FTS roots/triggers: "
+            + ", ".join(missing_fts)
+        )
 
 
 def _count_where(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> int:
@@ -809,11 +902,13 @@ def build_gate_b_manifest(
 ) -> dict[str, Any]:
     """Build a redacted manifest from an offline, schema-provable snapshot."""
 
+    hot_days = _finite_epoch(hot_days, "hot_days")
+    archive_grace_days = _finite_epoch(archive_grace_days, "archive_grace_days")
     if hot_days < 0 or archive_grace_days < 0:
         raise ColdArchiveError("hot_days and archive_grace_days must be non-negative")
-    generated_at = time.time() if now is None else float(now)
-    cutoff = generated_at - (float(hot_days) + float(archive_grace_days)) * 86_400.0
-    hot_cutoff = generated_at - float(hot_days) * 86_400.0
+    generated_at = _finite_epoch(time.time() if now is None else now, "now")
+    cutoff = generated_at - (hot_days + archive_grace_days) * 86_400.0
+    hot_cutoff = generated_at - hot_days * 86_400.0
     source = reject_live_state_db(source_db)
     source_info = source.stat()
     compiled_holds = [re.compile(pattern) for pattern in hold_title_regexes]
@@ -821,6 +916,7 @@ def build_gate_b_manifest(
     normalized_cwds = [str(value) for value in hold_cwd_prefixes]
 
     with _connect_readonly(source) as conn:
+        conn.execute("BEGIN")
         rows = _session_rows(conn)
         components = _connected_components(rows)
         selected_groups: list[dict[str, Any]] = []
@@ -995,15 +1091,15 @@ def load_approved_gate_b_manifest(
             "approved manifest sha256 must be 64 lowercase hex characters"
         )
     stage = _load_stage(stage_root)
-    expected_path = _require_private_file(stage.manifest_path)
-    supplied_path = _require_private_file(approved_manifest_path)
-    if supplied_path != expected_path:
-        raise ColdArchiveError(
-            "approved manifest must be the stage GATE-B-MANIFEST.json"
-        )
-    if sha256_path(expected_path) != approved_manifest_sha256:
+    expected_path, expected_bytes = _read_private_bytes(stage.manifest_path)
+    supplied_path, supplied_bytes = _read_private_bytes(approved_manifest_path)
+    if _sha256_bytes(supplied_bytes) != approved_manifest_sha256:
         raise ColdArchiveError("approved Gate-B manifest exact-byte sha256 mismatch")
-    manifest = _load_private_json(expected_path)
+    if supplied_bytes != expected_bytes:
+        raise ColdArchiveError(
+            "externally approved manifest bytes differ from the stage manifest"
+        )
+    manifest = _decode_json_object(supplied_bytes, supplied_path)
     if manifest.get("archive_manifest_version") != _ARCHIVE_VERSION:
         raise ColdArchiveError("unsupported Gate-B manifest version")
     if _manifest_digest(manifest) != manifest.get("manifest_sha256"):
@@ -1041,6 +1137,81 @@ def load_approved_gate_b_manifest(
         "_restricted_selected_ids": ids,
         "_restricted_parent_map": parent_map,
     }
+
+
+def load_approved_producer_receipt(
+    stage: StageArtifacts,
+    manifest: dict[str, Any],
+    approved_receipt_path: Path,
+    approved_receipt_sha256: str,
+) -> dict[str, Any]:
+    """Load the exact externally frozen producer proof from one stable snapshot."""
+
+    if not re.fullmatch(r"[0-9a-f]{64}", approved_receipt_sha256 or ""):
+        raise ColdArchiveError(
+            "approved producer receipt sha256 must be 64 lowercase hex characters"
+        )
+    _, stage_bytes = _read_private_bytes(stage.producer_receipt_path)
+    supplied_path, supplied_bytes = _read_private_bytes(approved_receipt_path)
+    if _sha256_bytes(supplied_bytes) != approved_receipt_sha256:
+        raise ColdArchiveError("approved producer receipt exact-byte sha256 mismatch")
+    if supplied_bytes != stage_bytes:
+        raise ColdArchiveError(
+            "externally approved producer receipt differs from the stage receipt"
+        )
+    receipt = _decode_json_object(supplied_bytes, supplied_path)
+    if (
+        receipt.get("operation") != "hermes-state-cold-archive-producer"
+        or receipt.get("manifest_only") is not False
+        or receipt.get("producer_complete") is not True
+        or receipt.get("gate_b_manifest_sha256") != manifest.get("manifest_sha256")
+        or receipt.get("manifest_file_sha256") != sha256_path(stage.manifest_path)
+    ):
+        raise ColdArchiveError("approved producer receipt is incomplete or misbound")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}", str(receipt.get("age_recipient_sha256") or "")
+    ):
+        raise ColdArchiveError("approved producer receipt lacks recipient fingerprint")
+    expected = (
+        ("rollback_encrypted", stage.rollback_encrypted_path),
+        ("restricted_encrypted", stage.restricted_encrypted_path),
+    )
+    local_hashes: dict[str, tuple[str, int]] = {}
+    for key, raw_path in expected:
+        path = _require_private_file(raw_path)
+        report = receipt.get(key)
+        if not isinstance(report, dict):
+            raise ColdArchiveError(f"approved producer receipt lacks {key}")
+        digest = sha256_path(path)
+        size = path.stat().st_size
+        if report.get("sha256") != digest or report.get("bytes") != size:
+            raise ColdArchiveError(f"approved producer receipt {key} bytes changed")
+        local_hashes[path.name] = (digest, size)
+    reports = receipt.get("remote_publish")
+    expected_remote_names = [
+        stage.rollback_encrypted_path.name,
+        stage.restricted_encrypted_path.name,
+        stage.manifest_path.name,
+    ]
+    if not isinstance(reports, list) or len(reports) != len(expected_remote_names):
+        raise ColdArchiveError("approved producer receipt lacks complete remote proof")
+    local_hashes[stage.manifest_path.name] = (
+        sha256_path(stage.manifest_path),
+        stage.manifest_path.stat().st_size,
+    )
+    for expected_name, report in zip(expected_remote_names, reports):
+        if not isinstance(report, dict):
+            raise ColdArchiveError("approved producer remote proof is invalid")
+        digest, size = local_hashes[expected_name]
+        if (
+            Path(str(report.get("local_path") or "")).name != expected_name
+            or report.get("sha256") != digest
+            or report.get("readback_sha256") != digest
+            or report.get("bytes") != size
+            or report.get("integrity") != "rclone-checksum-and-readback-ok"
+        ):
+            raise ColdArchiveError("approved producer remote proof is misbound")
+    return receipt
 
 
 def _exclusive_copy(source: Path, destination: Path) -> Path:
@@ -1356,8 +1527,32 @@ def _run_rclone(
     return execute(command, text=True, capture_output=True)
 
 
+def _require_secret_config(path: Path) -> tuple[Path, os.stat_result]:
+    config = _require_private_file(path)
+    info = config.stat()
+    if info.st_uid != os.geteuid():
+        raise ColdArchiveError("rclone config must be owned by the current effective user")
+    if info.st_nlink != 1:
+        raise ColdArchiveError("rclone config must not have hardlink aliases")
+    return config, info
+
+
+def _assert_same_file(path: Path, expected: os.stat_result, label: str) -> None:
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise ColdArchiveError(f"{label} became unavailable: {exc}") from exc
+    if not os.path.samestat(expected, current):
+        raise ColdArchiveError(f"{label} identity changed during operation")
+
+
 def _validate_remote_namespace(remote_root: str, namespace: str) -> tuple[str, str]:
-    if not remote_root or re.search(r"[\r\n\x00]", remote_root):
+    remote_match = re.fullmatch(
+        r"([A-Za-z0-9._-]+):([A-Za-z0-9._/-]*)", remote_root or ""
+    )
+    if remote_match is None or any(
+        part == ".." for part in remote_match.group(2).split("/")
+    ):
         raise ColdArchiveError("invalid rclone remote root")
     if (
         not namespace
@@ -1382,7 +1577,7 @@ def publish_paths_with_rclone(
     """Copy fixed local files and prove checksum plus exact readback."""
 
     remote_base, namespace = _validate_remote_namespace(remote_root, namespace)
-    config = _resolve_existing_file(rclone_config)
+    config, config_identity = _require_secret_config(rclone_config)
     published: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="hermes-cold-archive-rclone-") as temp_name:
         temp = Path(temp_name)
@@ -1392,12 +1587,22 @@ def publish_paths_with_rclone(
                 raise ColdArchiveError(f"unsafe remote object name: {local.name}")
             remote = f"{remote_base}/{namespace}/{local.name}"
             local_sha = sha256_path(local)
+            _assert_same_file(config, config_identity, "rclone config")
             upload = _run_rclone(
-                [rclone_exe, "copyto", str(local), remote, "--config", str(config)],
+                [
+                    rclone_exe,
+                    "copyto",
+                    str(local),
+                    remote,
+                    "--immutable",
+                    "--config",
+                    str(config),
+                ],
                 runner,
             )
             if upload.returncode != 0:
                 raise ColdArchiveError(f"rclone copyto failed for {local.name}")
+            _assert_same_file(config, config_identity, "rclone config")
             check = _run_rclone(
                 [
                     rclone_exe,
@@ -1416,6 +1621,7 @@ def publish_paths_with_rclone(
                     f"rclone checksum verification failed for {local.name}"
                 )
             readback = temp / local.name
+            _assert_same_file(config, config_identity, "rclone config")
             pull = _run_rclone(
                 [rclone_exe, "copyto", remote, str(readback), "--config", str(config)],
                 runner,
@@ -1460,7 +1666,7 @@ def _verify_remote_custody(
         raise ColdArchiveError(
             "producer receipt lacks complete encrypted offsite custody"
         )
-    config = _resolve_existing_file(rclone_config)
+    config, config_identity = _require_secret_config(rclone_config)
     verified: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="hermes-cold-archive-verify-") as temp_name:
         temp = Path(temp_name)
@@ -1483,6 +1689,7 @@ def _verify_remote_custody(
                 "/" + local.name
             ):
                 raise ColdArchiveError("producer remote receipt path is invalid")
+            _assert_same_file(config, config_identity, "rclone config")
             check = _run_rclone(
                 [
                     rclone_exe,
@@ -1501,6 +1708,7 @@ def _verify_remote_custody(
                     f"remote custody checksum failed for {local.name}"
                 )
             readback = temp / local.name
+            _assert_same_file(config, config_identity, "rclone config")
             pull = _run_rclone(
                 [rclone_exe, "copyto", remote, str(readback), "--config", str(config)],
                 runner,
@@ -1794,6 +2002,8 @@ def _selected_prompt_hashes_to_delete(
             f"""
             SELECT DISTINCT selected.system_prompt_hash
             FROM sessions selected
+            JOIN system_prompts
+              ON system_prompts.hash = selected.system_prompt_hash
             WHERE selected.id IN ({placeholders})
               AND selected.system_prompt_hash IS NOT NULL
               AND NOT EXISTS (
@@ -1930,6 +2140,12 @@ def apply_retention_to_candidate(
                     """,
                     (prompt_hash,),
                 )
+            if prompt_hashes and _count_where(
+                conn,
+                f"SELECT COUNT(*) FROM system_prompts WHERE hash IN ({_placeholders(prompt_hashes)})",
+                prompt_hashes,
+            ):
+                raise ColdArchiveError("selected orphan system prompts were not deleted")
 
             verified = _verify_post_delete_invariants(
                 conn,
@@ -1945,6 +2161,7 @@ def apply_retention_to_candidate(
                 "applied": True,
                 "deleted_sessions": len(ids),
                 "deleted_messages_actual": selected_messages,
+                "deleted_system_prompts": len(prompt_hashes),
                 **verified,
                 "post_logical_sha256": _logical_snapshot_sha256(conn),
             }
@@ -1964,6 +2181,10 @@ def apply_retention_to_candidate(
                     )
             else:
                 _exclusive_write_json(prepared_receipt_path, prepared)
+            # Final all-profile device/inode fence is intentionally adjacent to
+            # COMMIT so a late live-profile alias cannot authorize deletion.
+            reject_live_state_db(source)
+            _validate_candidate_path_identity(source, manifest)
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1985,6 +2206,7 @@ def _producer_receipt(
     rollback_encrypted: dict[str, Any] | None,
     restricted_encrypted: dict[str, Any] | None,
     remote_report: list[dict[str, Any]],
+    age_recipient_sha256: str | None,
 ) -> dict[str, Any]:
     return {
         "operation": "hermes-state-cold-archive-producer",
@@ -1999,6 +2221,7 @@ def _producer_receipt(
         "rollback_bundle": rollback_report,
         "rollback_encrypted": rollback_encrypted,
         "restricted_encrypted": restricted_encrypted,
+        "age_recipient_sha256": age_recipient_sha256,
         "remote_publish": remote_report,
         "manifest_only": manifest_only,
         "producer_complete": bool(
@@ -2073,6 +2296,7 @@ def _retention_receipt_payload(
     manifest: dict[str, Any],
     *,
     approved_manifest_file_sha256: str,
+    approved_producer_receipt_sha256: str,
     custody: Sequence[dict[str, Any]],
     report: dict[str, Any],
     recovered_from_prepared: bool = False,
@@ -2082,6 +2306,7 @@ def _retention_receipt_payload(
         "created_at": utc_iso(),
         "approved_manifest_path": str(stage.manifest_path),
         "approved_manifest_file_sha256": approved_manifest_file_sha256,
+        "approved_producer_receipt_sha256": approved_producer_receipt_sha256,
         "gate_b_manifest_sha256": manifest["manifest_sha256"],
         "remote_custody_reverified": list(custody),
         "retention": report,
@@ -2103,6 +2328,7 @@ def _recover_committed_prepared_apply(
     manifest: dict[str, Any],
     *,
     approved_manifest_file_sha256: str,
+    approved_producer_receipt_sha256: str,
     custody: Sequence[dict[str, Any]],
 ) -> dict[str, Any] | None:
     if not stage.apply_prepared_path.exists():
@@ -2152,6 +2378,7 @@ def _recover_committed_prepared_apply(
         stage,
         manifest,
         approved_manifest_file_sha256=approved_manifest_file_sha256,
+        approved_producer_receipt_sha256=approved_producer_receipt_sha256,
         custody=custody,
         report=report,
         recovered_from_prepared=True,
@@ -2162,6 +2389,59 @@ def _recover_committed_prepared_apply(
         "receipt_path": str(stage.retention_receipt_path),
         "receipt_sha256": sha256_path(stage.retention_receipt_path),
     }
+
+
+def _validate_final_retention_receipt(
+    source: Path,
+    stage: StageArtifacts,
+    manifest: dict[str, Any],
+    receipt: dict[str, Any],
+    *,
+    approved_manifest_file_sha256: str,
+    approved_producer_receipt_sha256: str | None,
+) -> None:
+    if (
+        receipt.get("operation") != "hermes-state-cold-archive-retention"
+        or receipt.get("approved_manifest_file_sha256")
+        != approved_manifest_file_sha256
+        or receipt.get("gate_b_manifest_sha256") != manifest.get("manifest_sha256")
+    ):
+        raise ColdArchiveError("final retention receipt does not bind this approval")
+    ids = sorted(str(value) for value in manifest.get("_restricted_selected_ids") or [])
+    report = receipt.get("retention")
+    if not isinstance(report, dict):
+        raise ColdArchiveError("final retention receipt has no retention report")
+    if not ids:
+        if report.get("applied") is not False:
+            raise ColdArchiveError("empty selection receipt incorrectly claims deletion")
+        _validate_candidate_matches_manifest(source, manifest)
+        return
+    if (
+        approved_producer_receipt_sha256 is None
+        or receipt.get("approved_producer_receipt_sha256")
+        != approved_producer_receipt_sha256
+        or report.get("applied") is not True
+        or not stage.apply_prepared_path.exists()
+        or receipt.get("prepared_receipt_sha256")
+        != sha256_path(stage.apply_prepared_path)
+    ):
+        raise ColdArchiveError("final retention receipt lacks approved committed proof")
+    _validate_candidate_path_identity(source, manifest)
+    with _connect_readonly(source) as conn:
+        if _logical_snapshot_sha256(conn) != report.get("post_logical_sha256"):
+            raise ColdArchiveError("final retention receipt post-state no longer matches")
+        if _count_where(
+            conn,
+            f"SELECT COUNT(*) FROM sessions WHERE id IN ({_placeholders(ids)})",
+            ids,
+        ):
+            raise ColdArchiveError("final retention receipt replay found selected sessions")
+        integrity = [
+            str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
+        ]
+        if integrity != ["ok"] or conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise ColdArchiveError("final retention receipt replay failed integrity checks")
+        _verify_fts_counts(conn, deleted_message_ids=[])
 
 
 def run_cold_archive_pass(
@@ -2178,6 +2458,8 @@ def run_cold_archive_pass(
     apply_retention: bool = False,
     approved_manifest_path: Path | None = None,
     approved_manifest_sha256: str | None = None,
+    approved_producer_receipt_path: Path | None = None,
+    approved_producer_receipt_sha256: str | None = None,
     rclone_remote: str | None = None,
     rclone_config: Path | None = None,
     remote_namespace: str | None = None,
@@ -2210,11 +2492,19 @@ def run_cold_archive_pass(
                 approved_manifest_path=approved_manifest_path,
                 approved_manifest_sha256=approved_manifest_sha256,
             )
-            if stage.retention_receipt_path.exists():
-                existing = _load_private_json(stage.retention_receipt_path)
-                return {**existing, "replayed": True}
             ids = manifest.get("_restricted_selected_ids") or []
             if not ids:
+                if stage.retention_receipt_path.exists():
+                    existing = _load_private_json(stage.retention_receipt_path)
+                    _validate_final_retention_receipt(
+                        source,
+                        stage,
+                        manifest,
+                        existing,
+                        approved_manifest_file_sha256=approved_manifest_sha256,
+                        approved_producer_receipt_sha256=None,
+                    )
+                    return {**existing, "replayed": True}
                 _validate_candidate_matches_manifest(source, manifest)
                 report = {"applied": False, "reason": "no selected sessions"}
                 receipt = {
@@ -2231,19 +2521,19 @@ def run_cold_archive_pass(
                     "receipt_path": str(stage.retention_receipt_path),
                     "receipt_sha256": sha256_path(stage.retention_receipt_path),
                 }
-            producer = _load_private_json(stage.producer_receipt_path)
-            if producer.get("manifest_file_sha256") != approved_manifest_sha256:
+            if (
+                approved_producer_receipt_path is None
+                or approved_producer_receipt_sha256 is None
+            ):
                 raise ColdArchiveError(
-                    "producer receipt does not match approved manifest bytes"
+                    "apply requires external --approved-producer-receipt and exact-byte sha256"
                 )
-            if producer.get("gate_b_manifest_sha256") != manifest["manifest_sha256"]:
-                raise ColdArchiveError(
-                    "producer receipt does not match Gate-B manifest"
-                )
-            if not producer.get("producer_complete") or producer.get("manifest_only"):
-                raise ColdArchiveError(
-                    "producer stage is incomplete and cannot authorize retention"
-                )
+            producer = load_approved_producer_receipt(
+                stage,
+                manifest,
+                approved_producer_receipt_path,
+                approved_producer_receipt_sha256,
+            )
             custody = _verify_remote_custody(
                 stage,
                 producer,
@@ -2251,11 +2541,23 @@ def run_cold_archive_pass(
                 rclone_exe=rclone_exe,
                 runner=rclone_runner,
             )
+            if stage.retention_receipt_path.exists():
+                existing = _load_private_json(stage.retention_receipt_path)
+                _validate_final_retention_receipt(
+                    source,
+                    stage,
+                    manifest,
+                    existing,
+                    approved_manifest_file_sha256=approved_manifest_sha256,
+                    approved_producer_receipt_sha256=approved_producer_receipt_sha256,
+                )
+                return {**existing, "replayed": True}
             recovered = _recover_committed_prepared_apply(
                 source,
                 stage,
                 manifest,
                 approved_manifest_file_sha256=approved_manifest_sha256,
+                approved_producer_receipt_sha256=approved_producer_receipt_sha256,
                 custody=custody,
             )
             if recovered is not None:
@@ -2273,6 +2575,7 @@ def run_cold_archive_pass(
                 stage,
                 manifest,
                 approved_manifest_file_sha256=approved_manifest_sha256,
+                approved_producer_receipt_sha256=approved_producer_receipt_sha256,
                 custody=custody,
                 report=report,
             )
@@ -2282,6 +2585,22 @@ def run_cold_archive_pass(
                 "receipt_path": str(stage.retention_receipt_path),
                 "receipt_sha256": sha256_path(stage.retention_receipt_path),
             }
+
+        if not manifest_only:
+            if not rclone_remote or rclone_config is None or age_recipient_file is None:
+                raise ColdArchiveError(
+                    "full producer requires --age-recipient-file, --rclone-config, "
+                    "and --rclone-remote before stage creation"
+                )
+            _require_secret_config(rclone_config)
+            _resolve_existing_file(age_recipient_file)
+            _validate_remote_namespace(
+                rclone_remote, remote_namespace or "hermes-state/preflight"
+            )
+            if rclone_runner is None and shutil.which(rclone_exe) is None:
+                raise ColdArchiveError(f"rclone executable is unavailable: {rclone_exe}")
+            if age_runner is None and shutil.which(age_exe) is None:
+                raise ColdArchiveError(f"age executable is unavailable: {age_exe}")
 
         manifest = build_gate_b_manifest(
             source,
@@ -2302,12 +2621,16 @@ def run_cold_archive_pass(
         rollback_encrypted: dict[str, Any] | None = None
         restricted_encrypted: dict[str, Any] | None = None
         remote_report: list[dict[str, Any]] = []
+        age_recipient_sha256: str | None = None
         if not manifest_only and manifest["counts"]["selected_sessions"]:
             if not rclone_remote or rclone_config is None or age_recipient_file is None:
                 raise ColdArchiveError(
                     "full producer requires --age-recipient-file, --rclone-config, "
                     "and --rclone-remote before any retention can be authorized"
                 )
+            age_recipient_sha256 = sha256_path(
+                _resolve_existing_file(age_recipient_file)
+            )
             _validate_candidate_matches_manifest(source, manifest)
             rollback_report, retention_policy = _copy_rollback_bundle(
                 source, stage, now=now
@@ -2367,6 +2690,7 @@ def run_cold_archive_pass(
             rollback_encrypted=rollback_encrypted,
             restricted_encrypted=restricted_encrypted,
             remote_report=remote_report,
+            age_recipient_sha256=age_recipient_sha256,
         )
         _exclusive_write_json(stage.producer_receipt_path, receipt)
         return {
@@ -2381,6 +2705,12 @@ def run_cold_archive_pass(
 def _producer_has_verified_rollback_remote(
     stage: StageArtifacts, producer: dict[str, Any]
 ) -> bool:
+    if (
+        producer.get("operation") != "hermes-state-cold-archive-producer"
+        or producer.get("producer_complete") is not True
+        or producer.get("manifest_only") is not False
+    ):
+        return False
     encrypted_sha = sha256_path(_require_private_file(stage.rollback_encrypted_path))
     for report in producer.get("remote_publish") or []:
         if (
@@ -2399,48 +2729,168 @@ def record_candidate_cutover(
     stage_root: Path,
     *,
     candidate_health_confirmed: bool,
+    rclone_config: Path,
+    rclone_exe: str = "rclone",
+    rclone_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Exclusively record the real cutover clock; CLI never accepts a timestamp."""
+    """Exclusively record the real cutover clock after a verified apply."""
 
     if not candidate_health_confirmed:
         raise ColdArchiveError("candidate health confirmation is required at cutover")
     stage = _load_stage(stage_root)
+    existing_marker: dict[str, Any] | None = None
     if stage.cutover_marker_path.exists():
-        return {**_load_private_json(stage.cutover_marker_path), "replayed": True}
+        existing_marker = _load_private_json(stage.cutover_marker_path)
     policy = _load_private_json(stage.source_bundle_policy_path)
     producer = _load_private_json(stage.producer_receipt_path)
+    retention_receipt = _load_private_json(stage.retention_receipt_path)
+    prepared = _load_private_json(stage.apply_prepared_path)
+    producer_sha = sha256_path(stage.producer_receipt_path)
+    retention = retention_receipt.get("retention")
+    if (
+        policy.get("operation") != "hermes-source-bundle-retention-policy"
+        or policy.get("state") != "awaiting-cutover"
+        or retention_receipt.get("operation")
+        != "hermes-state-cold-archive-retention"
+        or not isinstance(retention, dict)
+        or retention.get("applied") is not True
+        or retention_receipt.get("approved_producer_receipt_sha256") != producer_sha
+        or retention_receipt.get("prepared_receipt_sha256")
+        != sha256_path(stage.apply_prepared_path)
+        or retention_receipt.get("checks_completed_before_commit") is not True
+        or retention_receipt.get("receipt_written_after_commit") is not True
+        or prepared.get("operation")
+        != "hermes-state-cold-archive-apply-prepared"
+        or prepared.get("post_logical_sha256") != retention.get("post_logical_sha256")
+        or prepared.get("gate_b_manifest_sha256")
+        != retention_receipt.get("gate_b_manifest_sha256")
+        or policy.get("gate_b_manifest_sha256")
+        != producer.get("gate_b_manifest_sha256")
+    ):
+        raise ColdArchiveError("verified applied retention receipt is required at cutover")
     bundle = _require_private_file(stage.rollback_bundle_path)
     bundle_sha = sha256_path(bundle)
     if policy.get("rollback_bundle_sha256") != bundle_sha:
         raise ColdArchiveError("source-bundle policy does not match rollback bundle")
     if not _producer_has_verified_rollback_remote(stage, producer):
         raise ColdArchiveError("verified encrypted rollback remote receipt is required")
-    cutover_epoch = time.time() if now is None else float(now)
+    _verify_remote_custody(
+        stage,
+        producer,
+        rclone_config=rclone_config,
+        rclone_exe=rclone_exe,
+        runner=rclone_runner,
+    )
+    if existing_marker is not None:
+        existing_cutover = _finite_epoch(
+            existing_marker.get("cutover_epoch"), "recorded cutover time"
+        )
+        if (
+            existing_marker.get("operation") != "hermes-candidate-cutover"
+            or existing_marker.get("candidate_health_confirmed") is not True
+            or existing_marker.get("cutover_at") != utc_iso(existing_cutover)
+            or existing_marker.get("rollback_bundle_sha256") != bundle_sha
+            or existing_marker.get("producer_receipt_sha256") != producer_sha
+            or existing_marker.get("retention_receipt_sha256")
+            != sha256_path(stage.retention_receipt_path)
+        ):
+            raise ColdArchiveError("existing cutover marker is invalid")
+        return {**existing_marker, "replayed": True}
+    cutover_epoch = _finite_epoch(time.time() if now is None else now, "cutover time")
     marker = {
         "operation": "hermes-candidate-cutover",
         "cutover_at": utc_iso(cutover_epoch),
         "cutover_epoch": cutover_epoch,
         "rollback_bundle_sha256": bundle_sha,
-        "producer_receipt_sha256": sha256_path(stage.producer_receipt_path),
+        "producer_receipt_sha256": producer_sha,
+        "retention_receipt_sha256": sha256_path(stage.retention_receipt_path),
         "candidate_health_confirmed": True,
     }
     _exclusive_write_json(stage.cutover_marker_path, marker)
     return marker
 
 
-def _delete_private_source_bundle(stage: StageArtifacts) -> list[str]:
-    deleted: list[str] = []
+def _prepare_source_bundle_prune(
+    stage: StageArtifacts,
+    *,
+    rollback_bundle_sha256: str,
+    cutover_marker_sha256: str,
+) -> dict[str, Any]:
+    if stage.source_bundle_prune_prepared_path.exists():
+        prepared = _load_private_json(stage.source_bundle_prune_prepared_path)
+        if (
+            prepared.get("operation") != "hermes-source-bundle-prune-prepared"
+            or prepared.get("rollback_bundle_sha256") != rollback_bundle_sha256
+            or prepared.get("cutover_marker_sha256") != cutover_marker_sha256
+        ):
+            raise ColdArchiveError("prepared source-bundle prune intent is misbound")
+        return prepared
     bundle_root = _require_private_dir(stage.rollback_dir / "source-bundle")
+    members: list[dict[str, Any]] = []
     for child in sorted(bundle_root.iterdir(), key=lambda item: item.name):
         private = _require_private_file(child)
-        private.unlink()
-        deleted.append(str(private))
-    bundle_root.rmdir()
-    deleted.append(str(bundle_root))
+        members.append({
+            "name": private.name,
+            "bytes": private.stat().st_size,
+            "sha256": sha256_path(private),
+        })
     clear_tar = _require_private_file(stage.rollback_bundle_path)
-    clear_tar.unlink()
-    deleted.append(str(clear_tar))
+    if sha256_path(clear_tar) != rollback_bundle_sha256:
+        raise ColdArchiveError("rollback bundle changed before prune intent")
+    prepared = {
+        "operation": "hermes-source-bundle-prune-prepared",
+        "rollback_bundle_sha256": rollback_bundle_sha256,
+        "cutover_marker_sha256": cutover_marker_sha256,
+        "source_bundle_members": members,
+        "rollback_bundle_name": clear_tar.name,
+    }
+    _exclusive_write_json(stage.source_bundle_prune_prepared_path, prepared)
+    return prepared
+
+
+def _delete_private_source_bundle(
+    stage: StageArtifacts, prepared: dict[str, Any]
+) -> list[str]:
+    deleted: list[str] = []
+    bundle_root = stage.rollback_dir / "source-bundle"
+    raw_members = prepared.get("source_bundle_members")
+    if not isinstance(raw_members, list):
+        raise ColdArchiveError("prepared source-bundle member list is invalid")
+    expected: dict[str, dict[str, Any]] = {}
+    for report in raw_members:
+        if not isinstance(report, dict) or not re.fullmatch(
+            r"[A-Za-z0-9._-]+", str(report.get("name") or "")
+        ):
+            raise ColdArchiveError("prepared source-bundle member is invalid")
+        expected[str(report["name"])] = report
+    if bundle_root.exists():
+        private_root = _require_private_dir(bundle_root)
+        current_names = {child.name for child in private_root.iterdir()}
+        if not current_names.issubset(expected):
+            raise ColdArchiveError("unexpected member appeared during source-bundle prune")
+        for name, report in expected.items():
+            child = private_root / name
+            if not child.exists():
+                continue
+            private = _require_private_file(child)
+            if (
+                private.stat().st_size != report.get("bytes")
+                or sha256_path(private) != report.get("sha256")
+            ):
+                raise ColdArchiveError("source-bundle member changed after prune intent")
+            private.unlink()
+            deleted.append(str(private))
+        private_root.rmdir()
+        deleted.append(str(private_root))
+    clear_tar = stage.rollback_bundle_path
+    if clear_tar.exists():
+        private_tar = _require_private_file(clear_tar)
+        if sha256_path(private_tar) != prepared.get("rollback_bundle_sha256"):
+            raise ColdArchiveError("rollback bundle changed after prune intent")
+        private_tar.unlink()
+        deleted.append(str(private_tar))
+    _fsync_directory(stage.rollback_dir)
     return deleted
 
 
@@ -2448,36 +2898,84 @@ def prune_source_bundle_after_retention(
     stage_root: Path,
     *,
     candidate_health_confirmed: bool,
+    approved_cutover_marker_sha256: str,
+    rclone_config: Path,
+    rclone_exe: str = "rclone",
+    rclone_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Prune only plaintext source copies at/after cutover + exactly 14 days."""
 
     if not candidate_health_confirmed:
         raise ColdArchiveError("candidate health confirmation is required before prune")
+    if not re.fullmatch(r"[0-9a-f]{64}", approved_cutover_marker_sha256 or ""):
+        raise ColdArchiveError("approved cutover marker sha256 must be lowercase hex")
     stage = _load_stage(stage_root)
     if stage.source_bundle_pruned_path.exists():
-        return {**_load_private_json(stage.source_bundle_pruned_path), "replayed": True}
+        existing = _load_private_json(stage.source_bundle_pruned_path)
+        if (
+            existing.get("operation") != "hermes-source-bundle-pruned"
+            or existing.get("pruned") is not True
+            or existing.get("approved_cutover_marker_sha256")
+            != approved_cutover_marker_sha256
+        ):
+            raise ColdArchiveError("existing source-bundle prune receipt is invalid")
+        return {**existing, "replayed": True}
     policy = _load_private_json(stage.source_bundle_policy_path)
     if not stage.cutover_marker_path.exists():
         return {"pruned": False, "reason": "awaiting-cutover"}
-    marker = _load_private_json(stage.cutover_marker_path)
+    marker_path, marker_bytes = _read_private_bytes(stage.cutover_marker_path)
+    if _sha256_bytes(marker_bytes) != approved_cutover_marker_sha256:
+        raise ColdArchiveError("approved cutover marker exact-byte sha256 mismatch")
+    marker = _decode_json_object(marker_bytes, marker_path)
     producer = _load_private_json(stage.producer_receipt_path)
+    retention_receipt = _load_private_json(stage.retention_receipt_path)
+    retention_state = retention_receipt.get("retention")
+    if (
+        policy.get("operation") != "hermes-source-bundle-retention-policy"
+        or policy.get("state") != "awaiting-cutover"
+        or policy.get("gate_b_manifest_sha256")
+        != producer.get("gate_b_manifest_sha256")
+        or retention_receipt.get("operation")
+        != "hermes-state-cold-archive-retention"
+        or not isinstance(retention_state, dict)
+        or retention_state.get("applied") is not True
+        or retention_receipt.get("approved_producer_receipt_sha256")
+        != sha256_path(stage.producer_receipt_path)
+        or retention_receipt.get("prepared_receipt_sha256")
+        != sha256_path(stage.apply_prepared_path)
+    ):
+        raise ColdArchiveError("source-bundle lifecycle receipts are invalid")
     if not _producer_has_verified_rollback_remote(stage, producer):
         raise ColdArchiveError("verified encrypted rollback remote receipt is required")
+    _verify_remote_custody(
+        stage,
+        producer,
+        rclone_config=rclone_config,
+        rclone_exe=rclone_exe,
+        runner=rclone_runner,
+    )
     bundle_sha = str(policy.get("rollback_bundle_sha256") or "")
-    if marker.get("rollback_bundle_sha256") != bundle_sha:
-        raise ColdArchiveError(
-            "cutover marker rollback hash does not match retention policy"
-        )
+    cutover = _finite_epoch(marker.get("cutover_epoch"), "recorded cutover time")
+    if (
+        marker.get("operation") != "hermes-candidate-cutover"
+        or marker.get("candidate_health_confirmed") is not True
+        or marker.get("cutover_at") != utc_iso(cutover)
+        or marker.get("rollback_bundle_sha256") != bundle_sha
+    ):
+        raise ColdArchiveError("cutover marker fields are invalid or inconsistent")
     if marker.get("producer_receipt_sha256") != sha256_path(
         stage.producer_receipt_path
     ):
         raise ColdArchiveError("cutover marker producer receipt hash mismatch")
+    if marker.get("retention_receipt_sha256") != sha256_path(
+        stage.retention_receipt_path
+    ) or retention_receipt.get("operation") != "hermes-state-cold-archive-retention":
+        raise ColdArchiveError("cutover marker retention receipt hash mismatch")
     retention = int(policy.get("minimum_retention_seconds_after_cutover", -1))
     if retention != DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS:
         raise ColdArchiveError("source-bundle retention policy is invalid")
-    current = time.time() if now is None else float(now)
-    cutover = float(marker.get("cutover_epoch"))
+    current = _finite_epoch(time.time() if now is None else now, "prune time")
     if current < cutover:
         raise ColdArchiveError("clock is earlier than recorded candidate cutover")
     deadline = cutover + retention
@@ -2488,9 +2986,12 @@ def prune_source_bundle_after_retention(
             "cutover_epoch": cutover,
             "eligible_at_epoch": deadline,
         }
-    if sha256_path(_require_private_file(stage.rollback_bundle_path)) != bundle_sha:
-        raise ColdArchiveError("rollback bundle changed after cutover")
-    deleted = _delete_private_source_bundle(stage)
+    prepared = _prepare_source_bundle_prune(
+        stage,
+        rollback_bundle_sha256=bundle_sha,
+        cutover_marker_sha256=approved_cutover_marker_sha256,
+    )
+    deleted = _delete_private_source_bundle(stage, prepared)
     receipt = {
         "operation": "hermes-source-bundle-pruned",
         "pruned": True,
@@ -2499,6 +3000,8 @@ def prune_source_bundle_after_retention(
         "cutover_epoch": cutover,
         "minimum_retention_seconds": retention,
         "rollback_bundle_sha256": bundle_sha,
+        "approved_cutover_marker_sha256": approved_cutover_marker_sha256,
+        "prepared_prune_sha256": sha256_path(stage.source_bundle_prune_prepared_path),
         "deleted_local_plaintext_paths": deleted,
         "remote_objects_deleted": False,
         "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),

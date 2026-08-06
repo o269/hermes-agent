@@ -5,7 +5,9 @@ This runbook documents the fail-closed 30-day hot / 7-day archived-grace / cold-
 The workflow has separate custody phases:
 
 1. a producer creates a new restricted stage, rollback source bundle, encrypted offsite packets, and producer receipt;
-2. Fable/operator approves the exact `GATE-B-MANIFEST.json` file bytes and SHA-256 externally;
+2. Fable/operator freezes and approves exact external copies of both
+   `GATE-B-MANIFEST.json` and `COLD-ARCHIVE-PRODUCER-RECEIPT.json`, including
+   their SHA-256 values;
 3. apply loads that existing stage without regenerating or overwriting anything, re-verifies encrypted remote custody, and mutates only the offline candidate;
 4. after cutover, an explicit marker starts the 14-day source-bundle retention clock.
 
@@ -16,11 +18,14 @@ The workflow has separate custody phases:
 - Do not run `hermes sessions optimize`, `VACUUM`, FTS optimize, WAL checkpoint, live `DELETE`, config changes, service changes, rclone sync/delete/purge/dedupe, or a production upload as part of author verification.
 - The command never installs a candidate over an active database. Fable is the sole cutover/landing operator.
 - A producer stage must not exist. Existing paths, modes, files, symlinks, and sentinels are refused rather than chmodded, repaired, resumed, or overwritten.
-- Apply accepts only an existing mode-0700 stage with mode-0600 regular artifacts and an external exact-byte manifest SHA-256.
+- Apply accepts only an existing mode-0700 stage with mode-0600 regular artifacts
+  and external exact-byte manifest and producer-receipt SHA-256 approvals.
 
 ## Required candidate schema and policy
 
 Cold retention is intentionally unavailable when durable policy state cannot be proven. The candidate `sessions` table must carry canonical `pinned` and `last_activity_at` columns. Missing columns fail the whole command closed; `NULL` values make that lineage ineligible.
+Both canonical FTS5 roots and all six message-sync triggers are mandatory; missing
+search roots/triggers fail closed before selection or deletion.
 
 The current selection rules are:
 
@@ -78,16 +83,22 @@ The producer creates and verifies, in order:
 5. both encrypted packets uploaded, checksum-checked, and exactly read back;
 6. the clear redacted `GATE-B-MANIFEST.json` uploaded last as the sole clear commit marker.
 
-No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Remote operations are limited to `rclone copyto`, `rclone check --checksum --one-way`, and exact readback. There is no remote delete, sync, purge, dedupe, move, cleanup, or retention verb.
+No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Remote operations are limited to immutable/no-clobber `rclone copyto`,
+`rclone check --checksum --one-way`, and exact readback. There is no remote delete, sync, purge, dedupe, move, cleanup, or retention verb.
 
 The private age identity must never be stored in the repository, bus, board, stage, or runtime path.
 
 ## External approval and destructive apply
 
-Fable/operator must freeze the exact manifest bytes outside the command and record:
+Fable/operator must freeze exact copies of the manifest and final producer receipt
+outside the mutable stage and record both hashes:
 
 ```bash
-sha256sum /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json
+install -m 0600 /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json \
+  /secure/hermes-state-approvals/GATE-B-MANIFEST.json
+install -m 0600 /secure/hermes-state-archive/<producer>/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
+  /secure/hermes-state-approvals/COLD-ARCHIVE-PRODUCER-RECEIPT.json
+sha256sum /secure/hermes-state-approvals/{GATE-B-MANIFEST,COLD-ARCHIVE-PRODUCER-RECEIPT}.json
 ```
 
 Apply requires that exact file and exact SHA-256. It does not regenerate the manifest, rewrite exports, chmod the stage, or upload replacement objects:
@@ -97,8 +108,10 @@ hermes sessions cold-archive \
   --source /secure/offline-candidate/state.db \
   --stage-root /secure/hermes-state-archive/<producer> \
   --apply-retention \
-  --approved-manifest /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json \
+  --approved-manifest /secure/hermes-state-approvals/GATE-B-MANIFEST.json \
   --approved-manifest-sha256 <exact-64-hex-file-sha256> \
+  --approved-producer-receipt /secure/hermes-state-approvals/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
+  --approved-producer-receipt-sha256 <exact-64-hex-producer-receipt-sha256> \
   --rclone-config /var/lib/hermes-state-offsite/rclone.conf
 ```
 
@@ -147,16 +160,25 @@ After a successful healthy cutover, record the real wall clock (the CLI exposes 
 ```bash
 hermes sessions cold-archive-mark-cutover \
   --stage-root /secure/hermes-state-archive/<producer> \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
   --candidate-health-confirmed
 ```
 
-This exclusively creates `rollback/CANDIDATE-CUTOVER.json` and binds the cutover to the rollback-bundle hash, producer-receipt hash, and verified encrypted rollback remote receipt.
+This requires the committed retention receipt, freshly re-reads remote custody, and
+exclusively creates `rollback/CANDIDATE-CUTOVER.json` bound to rollback, producer,
+and retention-receipt hashes. Freeze its exact hash externally before pruning:
+
+```bash
+sha256sum /secure/hermes-state-archive/<producer>/rollback/CANDIDATE-CUTOVER.json
+```
 
 Only after the candidate has remained healthy for at least 1,209,600 seconds (14 days), run:
 
 ```bash
 hermes sessions cold-archive-prune-bundle \
   --stage-root /secure/hermes-state-archive/<producer> \
+  --approved-cutover-marker-sha256 <exact-64-hex-cutover-marker-sha256> \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
   --candidate-health-confirmed
 ```
 
@@ -165,7 +187,13 @@ Before the exact boundary, or forever without a cutover marker, it deletes nothi
 - local plaintext `rollback/source-bundle/`;
 - local plaintext `rollback/rollback-source-bundle.tar.gz`.
 
-It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD, producer/retention receipts, and every remote object, then exclusively creates `SOURCE-BUNDLE-PRUNED.json`. Replay is idempotent. Marker/hash tampering, missing verified remote custody, clock rollback, or missing candidate-health confirmation fails closed.
+It first fsyncs `SOURCE-BUNDLE-PRUNE-PREPARED.json` with exact member hashes, then
+removes the plaintext members and exclusively creates `SOURCE-BUNDLE-PRUNED.json`.
+Replay recovers from any already-deleted prepared member, so a final-receipt crash is
+idempotent. It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD,
+producer/retention receipts, and every remote object. Marker/hash tampering, missing
+freshly verified remote custody, non-finite/rolled-back clocks, or missing
+candidate-health confirmation fails closed.
 
 ## Rebuild / cutover custody
 
