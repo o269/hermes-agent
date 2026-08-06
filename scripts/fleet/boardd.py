@@ -130,7 +130,6 @@ WRITE_CANARY_TIMEOUT_S = float(os.environ.get("BOARDD_WRITE_CANARY_TIMEOUT_S", "
 WRITE_CANARY_ALERT_REPEAT_S = float(
     os.environ.get("BOARDD_WRITE_CANARY_ALERT_REPEAT_S", "3600")
 )
-WRITE_CANARY_STALE_LIMIT = 10
 WRITE_CANARY_MARKER = "__hermes_boardd_write_canary_v1__"
 WRITE_CANARY_TITLE_PREFIX = "[SYSTEM CANARY][DO NOT DISPATCH] boardd write path"
 WRITE_CANARY_CREATED_BY = WRITE_CANARY_MARKER
@@ -336,19 +335,18 @@ class _CanaryFailure(RuntimeError):
 
 
 class _BrokerWriteCanaryOps:
-    """Canonical kanban_db operations carried over the production broker socket.
+    """Run a rollback-only write probe over the production broker socket.
 
-    This deliberately does not call boardd mutation handlers in-process. The
-    loopback Client + BrokerConnection path exercises the same interactive
-    transactions used by ``hermes kanban`` clients, including create_task and
-    archive_task policy/event behavior.
+    The probe uses the same ``BrokerConnection`` interactive transaction surface
+    as kanban clients. It inserts one task, event, and run, verifies them inside
+    the transaction, then explicitly rolls the transaction back and verifies that
+    none of the three rows exists. No canary card or history row is committed.
     """
 
     def __init__(self, sock_path: str, timeout_s: float):
-        from hermes_cli import boardd_shim, kb_client, kanban_db
+        from hermes_cli import boardd_shim, kb_client
 
         socket_timeout = max(0.1, min(float(timeout_s), 2.0))
-        self._kanban_db = kanban_db
         self._client = kb_client.Client(
             sock_path,
             worker_id=f"boardd-write-canary:{os.getpid()}",
@@ -362,67 +360,114 @@ class _BrokerWriteCanaryOps:
             boardd_shim.BrokerConnection(client=self._client),
         )
 
-    def find_active_candidates(self, limit: int) -> list[dict]:
-        key_prefix = f"{WRITE_CANARY_MARKER}:"
-        rows = self._conn.execute(
-            "SELECT id, title, body, status, created_by, idempotency_key, created_at "
-            "FROM tasks WHERE status != 'archived' "
-            "AND (created_by = ? OR substr(idempotency_key, 1, ?) = ? "
-            "OR substr(title, 1, ?) = ? OR instr(body, ?) > 0) "
-            "ORDER BY created_at ASC, id ASC LIMIT ?",
-            (
-                WRITE_CANARY_CREATED_BY,
-                len(key_prefix),
-                key_prefix,
-                len(WRITE_CANARY_TITLE_PREFIX),
-                WRITE_CANARY_TITLE_PREFIX,
-                WRITE_CANARY_MARKER,
-                int(limit),
-            ),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    @staticmethod
+    def _zero_counts() -> dict[str, int]:
+        return {"tasks": 0, "task_events": 0, "task_runs": 0}
 
-    def create(self, identity: dict) -> str:
-        return self._kanban_db.create_task(
-            self._conn,
-            title=identity["title"],
-            body=identity["body"],
-            created_by=WRITE_CANARY_CREATED_BY,
-            workspace_kind="scratch",
-            priority=-2_147_483_648,
-            idempotency_key=identity["idempotency_key"],
-            initial_status="blocked",
-        )
+    def _persisted_counts(self, task_id: str) -> dict[str, int]:
+        row = self._conn.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM tasks WHERE id = ?) AS tasks, "
+            "(SELECT COUNT(*) FROM task_events WHERE task_id = ?) AS task_events, "
+            "(SELECT COUNT(*) FROM task_runs WHERE task_id = ?) AS task_runs",
+            (task_id, task_id, task_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("write canary persistence check returned no row")
+        return {name: int(row[name]) for name in self._zero_counts()}
 
-    def get(self, task_id: str) -> dict | None:
-        task = self._kanban_db.get_task(self._conn, task_id)
-        if task is None:
-            return None
-        return {
-            "id": task.id,
-            "title": task.title,
-            "body": task.body,
-            "status": task.status,
-            "created_by": task.created_by,
-            "idempotency_key": task.idempotency_key,
-            "created_at": task.created_at,
-        }
-
-    def archive(self, task_id: str, identity: dict) -> bool:
-        expected_identity = {
-            "title": identity["title"],
-            "body": identity["body"],
-            "created_by": identity.get("created_by", WRITE_CANARY_CREATED_BY),
-            "idempotency_key": identity["idempotency_key"],
-        }
-        return bool(
-            self._kanban_db.archive_task(
-                self._conn,
-                task_id,
-                expected_identity=expected_identity,
-                recompute_dependents=False,
+    def probe(self, identity: dict) -> dict:
+        """Exercise task/event/run writes and prove the enclosing rollback."""
+        task_id = identity["task_id"]
+        event_id = None
+        run_id = None
+        transaction_open = False
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            transaction_open = True
+            self._conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, body, status, priority, created_by, created_at, "
+                "workspace_kind, idempotency_key) "
+                "VALUES (?, ?, ?, 'blocked', ?, ?, ?, 'scratch', ?)",
+                (
+                    task_id,
+                    identity["title"],
+                    identity["body"],
+                    -2_147_483_648,
+                    WRITE_CANARY_CREATED_BY,
+                    identity["created_at"],
+                    identity["idempotency_key"],
+                ),
             )
-        )
+            event_cursor = self._conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'write_canary_probe', ?, ?)",
+                (task_id, identity["body"], identity["created_at"]),
+            )
+            event_id = event_cursor.lastrowid
+            run_cursor = self._conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'boardd-write-canary', 'done', ?, ?, 'completed')",
+                (task_id, identity["created_at"], identity["created_at"]),
+            )
+            run_id = run_cursor.lastrowid
+            if event_id is None or run_id is None:
+                raise _CanaryFailure(
+                    "verify-write",
+                    "write canary did not receive event/run insert receipts",
+                    kind="write-canary-verification",
+                    task_id=task_id,
+                )
+            written = self._persisted_counts(task_id)
+            expected = {"tasks": 1, "task_events": 1, "task_runs": 1}
+            if written != expected:
+                raise _CanaryFailure(
+                    "verify-write",
+                    f"transactional row counts mismatch: expected {expected}, got {written}",
+                    kind="write-canary-verification",
+                    task_id=task_id,
+                )
+            self._conn.execute("ROLLBACK")
+            transaction_open = False
+        except Exception as exc:
+            if transaction_open:
+                try:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                except Exception as rollback_exc:
+                    raise _CanaryFailure(
+                        "rollback",
+                        f"probe failed ({type(exc).__name__}: {exc}); rollback failed "
+                        f"({type(rollback_exc).__name__}: {rollback_exc})",
+                        kind="write-canary-rollback",
+                        task_id=task_id,
+                    ) from rollback_exc
+                persisted = self._persisted_counts(task_id)
+                if persisted != self._zero_counts():
+                    raise _CanaryFailure(
+                        "verify-rollback",
+                        f"failed probe rollback left canary rows behind: {persisted}",
+                        kind="write-canary-persistence",
+                        task_id=task_id,
+                    ) from exc
+            raise
+
+        persisted = self._persisted_counts(task_id)
+        if persisted != self._zero_counts():
+            raise _CanaryFailure(
+                "verify-rollback",
+                f"rollback left canary rows behind: {persisted}",
+                kind="write-canary-persistence",
+                task_id=task_id,
+            )
+        return {
+            "task_id": task_id,
+            "event_id": int(event_id),
+            "run_id": int(run_id),
+            "persisted_counts": persisted,
+        }
 
     def close(self) -> None:
         self._conn.close()
@@ -536,12 +581,17 @@ class Broker:
             ),
             "interval_s": self._write_canary_interval_s,
             "timeout_s": self._write_canary_timeout_s,
+            "probe_kind": "rollback-transaction",
             "runs": 0,
             "overlap_suppressed": 0,
             "last_run_ts": None,
             "last_success_ts": None,
             "last_failure_ts": None,
+            # Ephemeral transaction receipts only; none of these ids persist.
             "last_task_id": None,
+            "last_event_id": None,
+            "last_run_id": None,
+            "last_persisted_counts": None,
             "last_reconciled_task_ids": [],
         }
         if self._write_canary_mode != "disabled":
@@ -844,61 +894,22 @@ class Broker:
     # ---- functional write-path canary ------------------------------------- #
     @staticmethod
     def _canary_identity(nonce: str | None = None) -> dict:
-        nonce = nonce or f"{_now()}-{secrets.token_hex(8)}"
+        nonce = nonce or secrets.token_hex(12)
         return {
             "nonce": nonce,
+            "task_id": f"t_wc_{nonce}",
             "title": f"{WRITE_CANARY_TITLE_PREFIX} {nonce}",
             "body": json.dumps(
                 {
                     "marker": WRITE_CANARY_MARKER,
                     "nonce": nonce,
-                    "purpose": "boardd-write-path-health",
+                    "purpose": "boardd-rollback-write-path-health",
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            "created_at": _now(),
             "idempotency_key": f"{WRITE_CANARY_MARKER}:{nonce}",
-        }
-
-    @staticmethod
-    def _is_canary_row(row: dict | None, identity: dict | None = None) -> bool:
-        """Require every reserved marker before cleanup can touch a row."""
-        if not row or row.get("created_by") != WRITE_CANARY_CREATED_BY:
-            return False
-        key = row.get("idempotency_key")
-        if not isinstance(key, str) or not key.startswith(f"{WRITE_CANARY_MARKER}:"):
-            return False
-        nonce = key.removeprefix(f"{WRITE_CANARY_MARKER}:")
-        try:
-            body = json.loads(row.get("body") or "")
-        except (TypeError, ValueError):
-            return False
-        valid = (
-            bool(nonce)
-            and row.get("title") == f"{WRITE_CANARY_TITLE_PREFIX} {nonce}"
-            and isinstance(body, dict)
-            and body.get("marker") == WRITE_CANARY_MARKER
-            and body.get("nonce") == nonce
-            and body.get("purpose") == "boardd-write-path-health"
-        )
-        if not valid or identity is None:
-            return valid
-        return (
-            nonce == identity["nonce"]
-            and row.get("title") == identity["title"]
-            and row.get("body") == identity["body"]
-            and key == identity["idempotency_key"]
-        )
-
-    @staticmethod
-    def _canary_identity_from_row(row: dict) -> dict:
-        key = row["idempotency_key"]
-        return {
-            "nonce": key.removeprefix(f"{WRITE_CANARY_MARKER}:"),
-            "title": row["title"],
-            "body": row["body"],
-            "created_by": row["created_by"],
-            "idempotency_key": key,
         }
 
     @staticmethod
@@ -947,179 +958,45 @@ class Broker:
             "orphan_task_ids": list(getattr(exc, "orphan_task_ids", [])),
         }
 
-    def _best_effort_canary_cleanup(self, ops, identity: dict, task_id: str | None) -> dict:
-        """One bounded cleanup retry, touching only rows with all reserved markers."""
-        orphan_ids: list[str] = []
-        cleanup_errors: list[str] = []
-        try:
-            candidates = ops.find_active_candidates(WRITE_CANARY_STALE_LIMIT + 1)
-        except Exception as exc:
-            cleanup_errors.append(f"discovery: {type(exc).__name__}: {exc}")
-            if task_id:
-                orphan_ids.append(task_id)
-            return {"orphan_task_ids": orphan_ids, "cleanup_errors": cleanup_errors}
-        exact = [row for row in candidates if self._is_canary_row(row, identity)]
-        if task_id and task_id not in {row.get("id") for row in exact}:
-            # The task may already be archived; verify through the broker before
-            # calling it an orphan. A missing/mismatched row remains diagnostic.
-            try:
-                shown = ops.get(task_id)
-            except Exception as exc:
-                cleanup_errors.append(f"verify: {type(exc).__name__}: {exc}")
-            else:
-                if shown and self._is_canary_row(shown, identity):
-                    if shown.get("status") != "archived":
-                        exact.append(shown)
-                elif shown:
-                    cleanup_errors.append(
-                        f"{task_id}: identity changed; guarded cleanup refused"
-                    )
-        for row in exact:
-            candidate_id = row["id"]
-            try:
-                archived = ops.archive(candidate_id, identity)
-                shown = ops.get(candidate_id)
-                if not archived or not shown or shown.get("status") != "archived":
-                    raise RuntimeError("archive receipt or terminal verification failed")
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"{candidate_id}: {type(exc).__name__}: {exc}"
-                )
-                if candidate_id not in orphan_ids:
-                    orphan_ids.append(candidate_id)
-            else:
-                orphan_ids = [orphan for orphan in orphan_ids if orphan != candidate_id]
-        return {"orphan_task_ids": orphan_ids, "cleanup_errors": cleanup_errors}
-
     def _execute_write_canary(self, ops) -> dict:
         started = time.monotonic()
-        reconciled: list[str] = []
         identity = self._canary_identity()
-        cleanup_identity = None
-        task_id = None
-        phase = "reconcile-discovery"
+        task_id = identity["task_id"]
+        phase = "transaction-probe"
         try:
-            candidates = ops.find_active_candidates(WRITE_CANARY_STALE_LIMIT + 1)
-            collision = next(
-                (row for row in candidates if not self._is_canary_row(row)), None
-            )
-            if collision is not None:
+            receipt = ops.probe(identity)
+            if not isinstance(receipt, dict) or receipt.get("task_id") != task_id:
                 raise _CanaryFailure(
-                    "reconcile-identity",
-                    "reserved canary namespace matched a row without the full marker set",
-                    kind="write-canary-identity-collision",
-                    task_id=collision.get("id"),
-                )
-            if len(candidates) > WRITE_CANARY_STALE_LIMIT:
-                orphan_ids = [
-                    str(row["id"])
-                    for row in candidates
-                    if row.get("id")
-                ]
-                raise _CanaryFailure(
-                    phase,
-                    f"more than {WRITE_CANARY_STALE_LIMIT} active canary candidates; "
-                    "bounded reconciliation refused",
-                    kind="write-canary-reconcile-limit",
-                    orphan_task_ids=orphan_ids,
-                )
-            for row in candidates:
-                stale_id = row.get("id")
-                stale_identity = self._canary_identity_from_row(row)
-                cleanup_identity = stale_identity
-                phase = "reconcile-archive"
-                if not ops.archive(stale_id, stale_identity):
-                    raise _CanaryFailure(
-                        phase,
-                        "stale canary archive returned false",
-                        kind="write-canary-archive",
-                        task_id=stale_id,
-                    )
-                phase = "reconcile-verify"
-                shown = ops.get(stale_id)
-                if (
-                    not shown
-                    or shown.get("status") != "archived"
-                    or not self._is_canary_row(shown)
-                ):
-                    raise _CanaryFailure(
-                        phase,
-                        "stale canary did not reach verified archived state",
-                        kind="write-canary-verification",
-                        task_id=stale_id,
-                    )
-                reconciled.append(stale_id)
-                cleanup_identity = None
-
-            phase = "create"
-            cleanup_identity = identity
-            task_id = ops.create(identity)
-            if not isinstance(task_id, str) or not task_id.startswith("t_"):
-                raise _CanaryFailure(
-                    "create-receipt",
-                    "create_task returned an invalid task id receipt",
-                    kind="write-canary-verification",
-                )
-
-            phase = "verify-create"
-            shown = ops.get(task_id)
-            if (
-                not shown
-                or shown.get("status") != "blocked"
-                or not self._is_canary_row(shown, identity)
-            ):
-                raise _CanaryFailure(
-                    phase,
-                    "created canary receipt did not match the reserved blocked card",
+                    "probe-receipt",
+                    "transaction probe returned an invalid task id receipt",
                     kind="write-canary-verification",
                     task_id=task_id,
                 )
-
-            phase = "archive"
-            if not ops.archive(task_id, identity):
+            expected = {"tasks": 0, "task_events": 0, "task_runs": 0}
+            if receipt.get("persisted_counts") != expected:
                 raise _CanaryFailure(
-                    phase,
-                    "archive_task returned false",
-                    kind="write-canary-archive",
-                    task_id=task_id,
-                )
-
-            phase = "verify-cleanup"
-            shown = ops.get(task_id)
-            if (
-                not shown
-                or shown.get("status") != "archived"
-                or not self._is_canary_row(shown, identity)
-            ):
-                raise _CanaryFailure(
-                    phase,
-                    "canary did not reach verified archived state",
-                    kind="write-canary-verification",
+                    "verify-rollback",
+                    "transaction probe did not prove zero persisted task/event/run rows",
+                    kind="write-canary-persistence",
                     task_id=task_id,
                 )
             return {
                 "ok": True,
                 "status": "healthy",
                 "task_id": task_id,
-                "reconciled_task_ids": reconciled,
+                "event_id": receipt.get("event_id"),
+                "run_id": receipt.get("run_id"),
+                "persisted_counts": expected,
+                # Retained for health-payload compatibility with the previous
+                # create/archive canary. Rollback probes never reconcile rows.
+                "reconciled_task_ids": [],
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }
         except Exception as exc:
             result = self._canary_failure(phase, exc, task_id)
-            cleanup = (
-                self._best_effort_canary_cleanup(
-                    ops, cleanup_identity, result["task_id"]
-                )
-                if cleanup_identity is not None
-                else {"orphan_task_ids": [], "cleanup_errors": []}
-            )
-            result["orphan_task_ids"] = list(
-                dict.fromkeys(
-                    [*result["orphan_task_ids"], *cleanup["orphan_task_ids"]]
-                )
-            )
-            result["cleanup_errors"] = cleanup["cleanup_errors"]
-            result["reconciled_task_ids"] = reconciled
+            result["cleanup_errors"] = []
+            result["reconciled_task_ids"] = []
+            result["persisted_counts"] = None
             result["duration_ms"] = int((time.monotonic() - started) * 1000)
             return result
 
@@ -1215,6 +1092,11 @@ class Broker:
             )
             self._write_canary_state["last_run_ts"] = now
             self._write_canary_state["last_task_id"] = result.get("task_id")
+            self._write_canary_state["last_event_id"] = result.get("event_id")
+            self._write_canary_state["last_run_id"] = result.get("run_id")
+            self._write_canary_state["last_persisted_counts"] = result.get(
+                "persisted_counts"
+            )
             self._write_canary_state["last_reconciled_task_ids"] = result.get(
                 "reconciled_task_ids", []
             )
