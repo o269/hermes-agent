@@ -3868,6 +3868,40 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _claim_lock_worker_host(claim_lock: Optional[str]) -> Optional[str]:
+    """Return the worker host encoded in a native or brokered claim lock.
+
+    Native claims use ``<worker-host>:<pid>``. Boardd prefixes broker-routed
+    identities with its own host, producing
+    ``<broker-host>:<worker-host>:<pid>``. The PID is meaningful only on the
+    worker host, so locality checks must read from the right-hand side instead
+    of mistaking the broker prefix for worker ownership.
+
+    Unknown identities without an unambiguous worker-host field fail closed as
+    non-local: probing or signalling a process without that host is unsafe.
+    The final owner token is intentionally opaque for compatibility with legacy
+    ``host:worker-id`` claims; production dispatchers use a numeric PID.
+    """
+    if not claim_lock:
+        return None
+    parts = str(claim_lock).rsplit(":", 2)
+    if len(parts) == 2:
+        worker_host, owner_id = parts
+    elif len(parts) == 3:
+        _broker_prefix, worker_host, owner_id = parts
+    else:
+        return None
+    if not worker_host or not owner_id:
+        return None
+    return worker_host
+
+
+def _claim_lock_is_host_local(claim_lock: Optional[str]) -> bool:
+    """Whether ``claim_lock`` names a worker owned by this process's host."""
+    local_host = _claimer_id().rsplit(":", 1)[0]
+    return _claim_lock_worker_host(claim_lock) == local_host
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -5868,7 +5902,6 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
     stale = conn.execute(
         "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
@@ -5892,7 +5925,7 @@ def release_stale_claims(
     ) if stale else []
     for row in stale:
         lock = row["claim_lock"] or ""
-        host_local = lock.startswith(host_prefix)
+        host_local = _claim_lock_is_host_local(lock)
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -11374,8 +11407,7 @@ def _terminate_reclaimed_worker(
     if not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if not _claim_lock_is_host_local(claim_lock):
         return info
     info["host_local"] = True
 
@@ -11816,7 +11848,6 @@ def enforce_max_runtime(
     """
     timed_out: list[str] = []
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
 
     rows = conn.execute(
@@ -11834,7 +11865,7 @@ def enforce_max_runtime(
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _claim_lock_is_host_local(lock):
             continue
         # Runtime is per attempt, not lifetime-of-task. ``tasks.started_at``
         # intentionally records the first time a task ever started, so retries
@@ -11967,7 +11998,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
     reclaimed: list[str] = []
 
@@ -12174,10 +12204,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     Different from ``release_stale_claims``: this checks liveness
     immediately rather than waiting for the claim TTL.
 
-    Only considers tasks claimed by *this host* — PIDs from other hosts
-    are meaningless here. The host-local check is enough because
-    ``_default_spawn`` always runs the worker on the same host as the
-    dispatcher (the whole design is single-host).
+    Only considers tasks whose claim lock identifies *this worker host* — PIDs
+    from other hosts are meaningless here. Broker-routed locks include both the
+    broker and worker hosts, so locality is resolved from the worker-host field
+    rather than from the lock's first component.
 
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
@@ -12221,12 +12251,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     candidates: list[sqlite3.Row] = []
     for row in rows:
         # Only check liveness for claims owned by this host.
         lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _claim_lock_is_host_local(lock):
             continue
         # Grace is per attempt. ``tasks.started_at`` is intentionally sticky
         # across retries and made a fresh retry look hours old (#t_86a7e7a9).
