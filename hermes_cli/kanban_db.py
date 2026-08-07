@@ -4698,6 +4698,7 @@ def recompute_ready(
         # Phase 2 — per-task write txn. Re-check CAS conditions inside
         # the lock so concurrent complete/block/unblock cannot race a
         # stale autocommit snapshot into a wrong promotion.
+        _promoted_this_task = False
         with write_txn(conn):
             live = conn.execute(
                 "SELECT id, title, body, assignee, status, dispatch_origin, "
@@ -4754,6 +4755,12 @@ def recompute_ready(
             if cur.rowcount != 1:
                 continue
             _append_event(conn, task_id, "promoted", None)
+            # ``promoted`` is incremented AFTER the write_txn commits. A
+            # boardd cap (TxnStale) rolls back the UPDATE; counting the
+            # promotion before commit would over-report promotions for a
+            # tick whose writes did not persist.
+            _promoted_this_task = True
+        if _promoted_this_task:
             promoted += 1
     return promoted
 
@@ -9790,6 +9797,15 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    write_failures: list[str] = field(default_factory=list)
+    """Phase labels whose write_txn was rolled back by the broker (boardd
+    TXN_MAX_S cap / TxnStale). A non-empty list means the tick's mutations
+    did NOT all persist — the CLI MUST exit non-zero so a rolled-back write
+    is never reported as success (silent data loss). Each entry names the
+    dispatch phase that lost its write (``reclaim``, ``stale``, ``crash``,
+    ``promote``). The per-phase subroutines catch TxnStale per-task so the
+    tick can still report partial progress instead of crashing with an
+    opaque traceback."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -11962,6 +11978,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 event_payload["exit_kind"] = kind
                 event_payload["exit_code"] = code
 
+        # Buffer the per-task outcome so the local accounting lists
+        # (crashed / rate_limited / crash_details) are appended ONLY after
+        # the write_txn commits. If boardd caps the txn (TxnStale on
+        # COMMIT) the UPDATE rolls back and we must NOT report a crash for
+        # a task that is still ``running`` — that false positive was the
+        # exact-head crash-accounting race (the local list was mutated
+        # inside the `with write_txn` block, so a rolled-back commit still
+        # surfaced the id to the caller).
+        _pending_rate_limited = False
+        _pending_crash: Optional[tuple[str, int, str, bool, str]] = None
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -12004,7 +12030,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (error_text[:500], row["id"]),
                 )
-                rate_limited.append(row["id"])
+                _pending_rate_limited = True
             else:
                 if protocol_violation:
                     # Stamp the failure error now: a below-budget
@@ -12018,11 +12044,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         "WHERE id = ?",
                         (error_text[:500], row["id"]),
                     )
-                crashed.append(row["id"])
-                crash_details.append(
-                    (row["id"], pid, row["claim_lock"],
-                     protocol_violation, error_text)
+                _pending_crash = (
+                    row["id"], pid, row["claim_lock"],
+                    protocol_violation, error_text,
                 )
+        # COMMIT succeeded — the mutation is durable. NOW it is safe to
+        # surface the id in the caller-facing accounting lists.
+        if _pending_rate_limited:
+            rate_limited.append(row["id"])
+        if _pending_crash is not None:
+            crashed.append(_pending_crash[0])
+            crash_details.append(_pending_crash)
 
     # After per-task mutations: account each crashed task and maybe trip
     # the breaker (the task transitions ready → blocked with a ``gave_up``
@@ -13183,11 +13215,27 @@ def _dispatch_once_locked(
     result = DispatchResult()
     validate_skills = skill_validator or _missing_forced_skills
     board_db, board_slug = _connection_worker_board_identity(conn)
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
+    # Each dispatch phase writes through its own short write_txns. If boardd
+    # caps a txn (TXN_MAX_S=2.0 over tunnel RTT) the shim raises
+    # OperationalError("...TxnStale..."). Rather than let that crash the
+    # whole tick with an opaque traceback, catch it per-phase, record the
+    # lost write in ``result.write_failures``, and continue — the tick
+    # reports partial progress and the CLI exits non-zero so a rolled-back
+    # write is never reported as success (the false-success class).
+    try:
+        result.reclaimed = release_stale_claims(conn)
+    except sqlite3.OperationalError:
+        result.write_failures.append("reclaim")
+    try:
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+    except sqlite3.OperationalError:
+        result.write_failures.append("stale")
+    try:
+        result.crashed = detect_crashed_workers(conn)
+    except sqlite3.OperationalError:
+        result.write_failures.append("crash")
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -13205,7 +13253,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    try:
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    except sqlite3.OperationalError:
+        result.write_failures.append("promote")
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

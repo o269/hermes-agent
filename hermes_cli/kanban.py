@@ -2605,8 +2605,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "respawn_guarded": _respawn_guard_details(res),
             "dispositions": res.normalized_dispositions(),
             "auto_assigned_default": res.auto_assigned_default,
+            "write_failures": res.write_failures,
         }, indent=2))
-        return 0
+        # A rolled-back write (boardd TXN_MAX_S cap / TxnStale) is data loss.
+        # Exit non-zero so the tick is never reported as success — the
+        # acceptance criterion is "CLI must not return 0 on rollback".
+        return 1 if res.write_failures else 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2646,7 +2650,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    return 0
+    if res.write_failures:
+        # Surface rolled-back writes prominently in text mode too. The
+        # non-zero exit below is what prevents systemd / monitoring from
+        # treating a data-loss tick as healthy.
+        print(
+            f"Write failures (broker rolled back — data NOT persisted): "
+            f"{', '.join(res.write_failures)}"
+        )
+    # A rolled-back write (boardd TXN_MAX_S cap / TxnStale) is data loss.
+    # Exit non-zero so the tick is never reported as success.
+    return 1 if res.write_failures else 0
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
