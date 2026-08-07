@@ -44,7 +44,15 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
-For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
+For non-Hermes lanes (registered via a plugin), the plugin supplies its own
+`spawn_fn` callable. Explicit `Resource-Class: light` tasks retain the
+historical `(task, workspace, board) -> optional pid` contract. Local tasks are
+heavy by default; for those, the callable must accept the keyword-only
+`heavy_workspace_lease`, start a **distinct** worker process with every file
+descriptor from `heavy_workspace_lease.filenos()` inherited (for example via
+`subprocess.Popen(..., pass_fds=...)` on POSIX), and return that worker's live
+PID. Dispatch fails closed when descriptor inheritance cannot be proven; the
+dispatcher PID itself is never valid worker proof.
 
 ### 3. A lifecycle terminator
 

@@ -943,6 +943,18 @@ def _reap_idle_sessions() -> None:
     now = time.time()
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
+        # Snapshot registry aggregates under the lock (content-free sizes only).
+        _registry_snapshot = dict(_sessions)
+    try:
+        from agent.compression_lifecycle_telemetry import log_gateway_registry
+
+        log_gateway_registry(
+            _registry_snapshot,
+            transport_is_dead=_transport_is_dead,
+            log=logger,
+        )
+    except Exception:
+        pass
     for sid in victims:
         _close_session_by_id(sid, end_reason="idle_timeout")
     _enforce_session_cap()

@@ -50,6 +50,11 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        kb,
+        "_heavy_workspace_slots_root",
+        lambda: tmp_path / "heavy-workspace-slots",
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home

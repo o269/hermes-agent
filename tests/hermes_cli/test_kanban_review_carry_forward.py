@@ -210,7 +210,7 @@ def test_review_origin_survives_every_recovery_path(
             )
             _move_to_review(conn, task_id)
 
-            def fail_spawn(_task, _workspace, board=None):
+            def fail_spawn(_task, _workspace, board=None, **_kwargs):
                 raise RuntimeError("review worker launch failed")
 
             result = kb.dispatch_once(
@@ -279,6 +279,7 @@ def test_forced_skill_failure_then_review_retry_delivers_verdict(
         task_id = kb.create_task(
             conn,
             title="review with required skill",
+            body="Resource-Class: light\nReview carry-forward unit test.",
             assignee="default",
         )
         _move_to_review(conn, task_id)
@@ -323,9 +324,16 @@ def test_forced_skill_failure_then_review_retry_delivers_verdict(
 
         spawned: list[kb.Task] = []
 
-        def capture_spawn(task: kb.Task, _workspace: str, board=None):
+        def capture_spawn(
+            task: kb.Task,
+            _workspace: str,
+            board=None,
+            *,
+            heavy_workspace_lease: kb._HeavyWorkspaceLease | None = None,
+        ):
+            assert heavy_workspace_lease is None
             spawned.append(task)
-            return None
+            return 12345
 
         second = kb.dispatch_once(conn, spawn_fn=capture_spawn)
         assert [item[0] for item in second.spawned] == [task_id]

@@ -2172,6 +2172,33 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             )
             return None
 
+        _summary_tel_started = now
+        _summary_attempt_id = ""
+        try:
+            from agent.compression_lifecycle_telemetry import (
+                log_compression_phase,
+                measure_message_field_bytes,
+                new_attempt_id,
+            )
+
+            _summary_attempt_id = (
+                str(getattr(self, "_lifecycle_attempt_id", "") or "")
+                or new_attempt_id()
+            )
+            log_compression_phase(
+                "pre_generate_summary",
+                attempt_id=_summary_attempt_id,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                started_at=_summary_tel_started,
+                extra={
+                    "turns_to_summarize": len(turns_to_summarize or []),
+                    **measure_message_field_bytes(turns_to_summarize),
+                },
+                log=logger,
+            )
+        except Exception:
+            pass
+
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
         _sanitized_memory_context = sanitize_memory_context(memory_context)
@@ -3472,11 +3499,34 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(
-            turns_to_summarize,
-            focus_topic=summary_focus_topic,
-            memory_context=memory_context,
-        )
+        _gen_started = time.monotonic()
+        summary = None
+        try:
+            summary = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+                memory_context=memory_context,
+            )
+        finally:
+            try:
+                from agent.compression_lifecycle_telemetry import log_compression_phase
+
+                log_compression_phase(
+                    "post_generate_summary",
+                    attempt_id=str(getattr(self, "_lifecycle_attempt_id", "") or ""),
+                    started_at=_gen_started,
+                    extra={
+                        "summary_bytes": (
+                            len(summary.encode("utf-8"))
+                            if isinstance(summary, str)
+                            else 0
+                        ),
+                        "summary_present": bool(summary),
+                    },
+                    log=logger,
+                )
+            except Exception:
+                pass
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

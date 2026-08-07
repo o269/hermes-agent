@@ -60,7 +60,18 @@ def kanban_home(tmp_path, monkeypatch):
 @pytest.fixture
 def client(kanban_home):
     app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    router = _load_plugin_router()
+    # Earlier test modules may replace ``sys.modules['hermes_cli.kanban_db']``
+    # while this file's collection-time ``kb`` alias remains valid. Pin the
+    # dynamically loaded plugin to the same module object that owns this
+    # fixture's isolated DB and monkeypatches so full-suite order cannot split
+    # endpoint state from assertions.
+    setattr(
+        sys.modules["hermes_dashboard_plugin_kanban_worker_runs_test"],
+        "kanban_db",
+        kb,
+    )
+    app.include_router(router, prefix="/api/plugins/kanban")
     return TestClient(app)
 
 
@@ -90,6 +101,9 @@ def test_workers_active_empty_board(client):
     assert body["workers"] == []
     assert body["count"] == 0
     assert "checked_at" in body
+    assert body["heavy_workspace"]["scope"] == "host"
+    assert body["heavy_workspace"]["host_ceiling"] == 3
+    assert body["heavy_workspace"]["state"] in {"ok", "lock_unavailable"}
 
 
 def test_workers_active_with_running_task(client):

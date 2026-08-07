@@ -24,10 +24,32 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+
+    def is_reloaded_module(name: str) -> bool:
+        return (
+            name.startswith("hermes_cli")
+            or name.startswith("hermes_state")
+            or name == "hermes_constants"
+        )
+
+    # These tests deliberately reload the CLI under an isolated home. Preserve
+    # the collection-time module objects and restore them afterward; otherwise
+    # later test modules keep stale aliases while sys.modules points at the
+    # reloaded objects, so monkeypatches silently target the wrong module.
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if is_reloaded_module(name)
+    }
+    for name in list(saved_modules):
+        del sys.modules[name]
+    try:
+        yield test_home
+    finally:
+        for name in list(sys.modules):
+            if is_reloaded_module(name):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
@@ -44,6 +66,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_spawn": 5,
             "default_assignee": "default",
             "max_in_progress_per_profile": 2,
+            "max_heavy_workspaces": 3,
         }
     }
     monkeypatch.setattr(
@@ -70,6 +93,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("max_heavy_workspaces") == 3
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):

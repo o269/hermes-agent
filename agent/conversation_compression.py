@@ -29,6 +29,7 @@ these paths see no behavioural change.
 from __future__ import annotations
 
 import copy
+import time
 import inspect
 import logging
 import os
@@ -1056,8 +1057,82 @@ def compress_context(
                     engine_name,
                 )
 
+        # Content-free lifecycle telemetry (seat-survival RSS diagnosis).
+        # Never logs message contents — only RSS/byte counts/hashes.
+        _lifecycle_attempt_id = ""
+        _lifecycle_started_at = time.monotonic()
+        try:
+            from agent.compression_lifecycle_telemetry import (
+                log_compression_phase,
+                measure_message_field_bytes,
+                new_attempt_id,
+            )
+
+            _lifecycle_attempt_id = new_attempt_id()
+            try:
+                agent._compression_lifecycle_attempt_id = _lifecycle_attempt_id
+            except Exception:
+                pass
+            try:
+                agent.context_compressor._lifecycle_attempt_id = _lifecycle_attempt_id
+            except Exception:
+                pass
+            _field_stats = measure_message_field_bytes(messages)
+            log_compression_phase(
+                "pre_deepcopy",
+                attempt_id=_lifecycle_attempt_id,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                started_at=_lifecycle_started_at,
+                extra=_field_stats,
+                log=logger,
+            )
+        except Exception:
+            _field_stats = None
+
         messages_before_compression = copy.deepcopy(messages)
-        compressed = compress_fn(messages, **compress_kwargs)
+
+        try:
+            from agent.compression_lifecycle_telemetry import log_compression_phase
+
+            log_compression_phase(
+                "post_deepcopy",
+                attempt_id=_lifecycle_attempt_id,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                started_at=_lifecycle_started_at,
+                extra={"message_count": len(messages_before_compression or [])},
+                log=logger,
+            )
+            log_compression_phase(
+                "pre_compress_fn",
+                attempt_id=_lifecycle_attempt_id,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                started_at=_lifecycle_started_at,
+                log=logger,
+            )
+        except Exception:
+            pass
+
+        compressed = None
+        try:
+            compressed = compress_fn(messages, **compress_kwargs)
+        finally:
+            try:
+                from agent.compression_lifecycle_telemetry import log_compression_phase
+
+                log_compression_phase(
+                    "post_compress_fn",
+                    attempt_id=_lifecycle_attempt_id,
+                    session_id=str(getattr(agent, "session_id", "") or ""),
+                    started_at=_lifecycle_started_at,
+                    extra={
+                        "compressed_message_count": (
+                            len(compressed) if isinstance(compressed, list) else None
+                        )
+                    },
+                    log=logger,
+                )
+            except Exception:
+                pass
     except BaseException:
         # ANY exception after lock acquisition — memory hook, capability
         # inspection, engine lookup, or compress() — must release the lock so
