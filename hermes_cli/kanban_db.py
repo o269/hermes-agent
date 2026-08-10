@@ -7503,6 +7503,34 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
+    """Set a task's status directly or via broker.
+
+    For status='running', sets claim_lock='seat-sticky', claim_expires=now+315360000,
+    and last_heartbeat_at=now so manual sessions don't lapse or get flagged.
+    """
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    now = int(time.time())
+    with write_txn(conn):
+        if status == "running":
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'running', started_at = COALESCE(started_at, ?), "
+                "last_heartbeat_at = ?, claim_lock = 'seat-sticky', claim_expires = ? "
+                "WHERE id = ?",
+                (now, now, now + 315360000, task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
+                (status, now, task_id),
+            )
+        if cur.rowcount > 0:
+            _append_event(conn, task_id, "status_changed", {"status": status})
+            return True
+        return False
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -16477,6 +16505,7 @@ if os.environ.get("HERMES_KANBAN_BROKER") == "1":
         heartbeat_worker = _boardd_shim.heartbeat_worker
         set_workspace_path = _boardd_shim.set_workspace_path
         set_branch_name = _boardd_shim.set_branch_name
+        set_status = _boardd_shim.set_status
         _check_file_length_invariant = _boardd_shim.noop_flen
     except Exception as _boardd_shim_err:  # never break the module on shim import
         import logging as _logging

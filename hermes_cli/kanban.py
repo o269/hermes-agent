@@ -762,6 +762,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    p_review = sub.add_parser(
+        "review",
+        help="Move one or more tasks to review status",
+    )
+    p_review.add_argument("task_ids", nargs="+", help="One or more task ids")
+    p_review.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note — recorded as a comment before moving to review.",
+    )
+
+    p_set_status = sub.add_parser(
+        "set-status",
+        aliases=["setstatus"],
+        help="Set task status directly (e.g. running, review, ready, blocked)",
+    )
+    p_set_status.add_argument("task_id", help="Task id")
+    p_set_status.add_argument("status", help=f"Target status ({', '.join(sorted(kb.VALID_STATUSES))})")
+    p_set_status.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note recorded as a comment before status change.",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1108,6 +1132,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "review":   _cmd_review,
+            "set-status": _cmd_set_status,
+            "setstatus":  _cmd_set_status,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -2483,6 +2510,55 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author() if reason else None
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if reason:
+                kb.add_comment(conn, tid, author, f"REVIEW: {reason}")
+            try:
+                ok = kb.set_status(conn, tid, "review")
+            except Exception as exc:
+                print(f"cannot move {tid} to review: {exc}", file=sys.stderr)
+                ok = False
+            if not ok:
+                failed.append(tid)
+                print(f"cannot set status of {tid} to review", file=sys.stderr)
+            else:
+                print(f"Moved {tid} -> review" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_set_status(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    st = args.status
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author() if reason else None
+    with kb.connect_closing() as conn:
+        if reason:
+            kb.add_comment(conn, tid, author, f"SET STATUS ({st}): {reason}")
+        try:
+            ok = kb.set_status(conn, tid, st)
+        except ValueError as exc:
+            print(f"kanban set-status: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"cannot set status of {tid} to {st}", file=sys.stderr)
+            return 1
+        print(f"Moved {tid} -> {st}" + (f": {reason}" if reason else ""))
+    return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
