@@ -153,14 +153,12 @@ def test_detect_crashed_workers_opens_one_write_txn_per_reclaim(
 
         crashed, txn_count = _count_write_txns(kb.detect_crashed_workers, conn)
         assert set(crashed) == set(tids)
-        # One write_txn per reclaim. Failure accounting opens its own txn per
-        # crash via _record_task_failure, so total is typically 2N. Must not
-        # collapse to a single mega write_txn.
-        assert txn_count >= n
-        assert txn_count != 1, (
-            "single mega write_txn for all crashes regresses tunnel TXN_MAX_S"
+        # One write_txn per reclaim including in-txn failure accounting.
+        # Must not collapse to a single mega write_txn across all crashes.
+        assert txn_count == n, (
+            f"expected {n} per-crash write_txns (reclaim+accounting), "
+            f"got {txn_count}"
         )
-        assert txn_count >= 2 * n or txn_count == n
         for tid in tids:
             task = kb.get_task(conn, tid)
             assert task is not None and task.status in ("ready", "blocked")
@@ -337,5 +335,175 @@ def test_crash_accounting_not_surfaced_on_rolled_back_txn(
         assert task is not None and task.status == "running", (
             "rolled-back crash reclaim must leave the task running"
         )
+    finally:
+        conn.close()
+
+
+def test_crash_failure_accounting_does_not_mutate_successor_claim(
+    kanban_home, monkeypatch,
+):
+    """PR37 FIX_REQUIRED race: deferred post-reclaim failure accounting must
+    never block a newly claimed successor while leaving its claim/run open.
+
+    Two-candidate, two-connection repro:
+      - candidate 2 is classified/reclaimed first in the mutation order
+      - between candidate-1 reclaim commit and any deferred accounting, a
+        second connection claims candidate 1 as a successor attempt
+      - final state must NOT be blocked+claimed with an open successor run
+    """
+    conn = kb.connect()
+    try:
+        monkeypatch.setattr(kb, "_claimer_id", lambda: "testhost:1")
+        monkeypatch.setattr(kb, "_recorded_worker_alive", lambda *a, **k: False)
+        monkeypatch.setattr(
+            kb, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1),
+        )
+        monkeypatch.setattr(kb, "_snapshot_worker_processes", lambda **k: [])
+        monkeypatch.setattr(kb, "_owned_worker_processes", lambda *a, **k: [])
+        monkeypatch.setattr(
+            kb, "_connection_worker_board_identity", lambda conn: (None, None),
+        )
+
+        # Two host-local running tasks that will both be crash candidates.
+        # Use failure_limit-equivalent by planting consecutive_failures so the
+        # next failure trips the breaker (DEFAULT_FAILURE_LIMIT is typically 2).
+        tids = []
+        for i in range(2):
+            tid = kb.create_task(
+                conn, title=f"race-{i}", assignee=f"worker-race-{i}",
+            )
+            claimed = kb.claim_task(conn, tid, claimer="testhost:1")
+            assert claimed is not None
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ?, consecutive_failures = ? "
+                    "WHERE id = ?",
+                    (91000 + i, max(0, kb.DEFAULT_FAILURE_LIMIT - 1), tid),
+                )
+                run_id = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id = ?",
+                    (tid,),
+                ).fetchone()["current_run_id"]
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (91000 + i, run_id),
+                )
+            tids.append(tid)
+
+        # Interleave a second connection's claim on the first candidate the
+        # moment its reclaim write_txn commits, simulating a concurrent
+        # dispatcher that picks up the reclaimed card before deferred
+        # accounting would have run under the old two-phase design.
+        real_write_txn = kb.write_txn
+        claim_state = {"n": 0, "claimed": False, "claim_ok": False, "depth": 0}
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def interleaving_write_txn(c):
+            # Re-entrancy guard: claim_task opens its own write_txn; those
+            # nested calls must use the real helper or we recurse forever.
+            claim_state["depth"] += 1
+            try:
+                with real_write_txn(c) as yielded:
+                    yield yielded
+            finally:
+                claim_state["depth"] -= 1
+            if claim_state["depth"] != 0 or claim_state["claimed"]:
+                return
+            claim_state["n"] += 1
+            other = kb.connect()
+            try:
+                # Prefer whichever candidate is ready after this commit.
+                for tid in tids:
+                    row = other.execute(
+                        "SELECT status FROM tasks WHERE id = ?",
+                        (tid,),
+                    ).fetchone()
+                    if row is not None and row["status"] == "ready":
+                        got = kb.claim_task(
+                            other, tid, claimer="testhost:competitor",
+                        )
+                        claim_state["claimed"] = True
+                        claim_state["claim_ok"] = got is not None
+                        claim_state["claimed_tid"] = tid
+                        break
+            finally:
+                other.close()
+
+        with mock.patch.object(kb, "write_txn", interleaving_write_txn):
+            crashed = kb.detect_crashed_workers(conn)
+
+        # At least one crash was recorded; the other may have been claimed
+        # as a successor before the loop finished.
+        assert crashed, "expected at least one durable crash reclaim"
+
+        # Invariant must hold for EVERY candidate.
+        for tid in tids:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            run = conn.execute(
+                "SELECT id, status, outcome, ended_at, claim_lock "
+                "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            blocked_with_live_claim_and_open_run = (
+                task.status == "blocked"
+                and task.claim_lock is not None
+                and task.current_run_id is not None
+                and run is not None
+                and run["status"] == "running"
+                and run["outcome"] is None
+                and run["ended_at"] is None
+            )
+            assert not blocked_with_live_claim_and_open_run, (
+                "deferred crash failure accounting mutated a successor "
+                f"attempt on {tid}: status={task.status} "
+                f"claim={task.claim_lock} run={task.current_run_id} "
+                f"run_row={dict(run) if run else None}"
+            )
+
+        if claim_state["claim_ok"]:
+            tid = claim_state["claimed_tid"]
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            # Successor won the race: healthy running claim, not blocked.
+            assert task.status == "running"
+            assert task.claim_lock == "testhost:competitor"
+            assert task.current_run_id is not None
+            # Old-attempt failure counter must not land on the successor.
+            assert int(task.consecutive_failures) == max(
+                0, kb.DEFAULT_FAILURE_LIMIT - 1
+            )
+    finally:
+        conn.close()
+
+
+def test_record_task_failure_cas_ignores_running_successor(kanban_home):
+    """Standalone CAS: release_claim=False must not accept status=running."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cas-running", assignee="w")
+        claimed = kb.claim_task(conn, tid, claimer="testhost:comp")
+        assert claimed is not None
+        # Plant high failure count so a trip would fire if CAS accepted running.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                (max(0, kb.DEFAULT_FAILURE_LIMIT - 1), tid),
+            )
+        tripped = kb._record_task_failure(
+            conn, tid,
+            error="stale accounting",
+            outcome="crashed",
+            release_claim=False,
+            end_run=False,
+        )
+        assert tripped is False
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.current_run_id is not None
     finally:
         conn.close()
