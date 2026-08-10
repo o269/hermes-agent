@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -2393,6 +2394,70 @@ def count_db_holders(db_path: Path) -> Optional[int]:
         return None
 
 
+# ── Idle read-connection sweeper (process-global) ──
+#
+# The dashboard's long-lived SessionDB instances (gateway, TUI) create
+# per-thread read-only connections under WAL.  ThreadPoolExecutor worker
+# threads stay alive for the process lifetime, so their connections
+# accumulate indefinitely — one db+wal+shm fd per thread per SessionDB.
+# The sweeper is a single daemon thread that wakes every _SWEEP_INTERVAL_S
+# seconds and asks each registered SessionDB to close connections whose
+# owning thread has exited OR that have been idle (unused) for longer than
+# _READ_CONN_IDLE_TIMEOUT_S seconds.
+#
+# Closing a connection cross-thread is safe because we open with
+# check_same_thread=False; the doomed-set pattern avoids closing a
+# connection that is mid-query: the sweeper only *marks* idle connections
+# as doomed, and the owning thread closes its own connection on the next
+# _get_read_conn call (or on thread exit, picked up by dead-thread pruning).
+
+_SWEEP_INTERVAL_S = 60.0
+_READ_CONN_IDLE_TIMEOUT_S = 300.0  # 5 min — dashboard polls /api/sessions every 2-5s
+
+_sweeper_lock = threading.Lock()
+_sweeper_thread: Optional[threading.Thread] = None
+_sweeper_stop = threading.Event()
+# WeakSet so SessionDB.close() + GC doesn't need explicit unregister;
+# the sweeper skips dead references automatically.
+_live_session_dbs: "weakref.WeakSet[SessionDB]" = weakref.WeakSet()
+
+
+def _ensure_sweeper_started() -> None:
+    """Start the background idle-conn sweeper if it isn't running."""
+    global _sweeper_thread
+    if _sweeper_thread is not None and _sweeper_thread.is_alive():
+        return
+    with _sweeper_lock:
+        if _sweeper_thread is not None and _sweeper_thread.is_alive():
+            return
+        _sweeper_stop.clear()
+        t = threading.Thread(
+            target=_idle_sweep_loop,
+            name="hermes-read-conn-sweeper",
+            daemon=True,
+        )
+        _sweeper_thread = t
+        t.start()
+
+
+def _idle_sweep_loop() -> None:
+    """Background loop: prune dead/idle read conns on every registered SessionDB."""
+    while not _sweeper_stop.wait(timeout=_SWEEP_INTERVAL_S):
+        try:
+            dbs = list(_live_session_dbs)
+        except Exception:
+            continue
+        for db in dbs:
+            try:
+                db._sweep_idle_read_conns()
+            except Exception:
+                logger.debug(
+                    "idle read-conn sweep error on %s",
+                    getattr(db, "db_path", "?"),
+                    exc_info=True,
+                )
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -2525,7 +2590,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # hold a reference so short-lived reader threads' connections are
         # not GC'd without close() — that would leak tracked fds in
         # _live_connections.  close() drains this set.
+        #
+        # Owner threads are tracked alongside each connection so dead-thread
+        # and idle-connection pruning can close orphaned read conns. Without
+        # that, a long-lived SessionDB (dashboard TUI gateway, messaging
+        # gateway) leaks one ro connection (db+wal+shm fds) per worker thread
+        # for the process lifetime — the dashboard hit 1024/1024 FDs after
+        # ~6 days (Errno 24) and took the fleet with it (p87 / 2026-08-07).
         self._read_conns: "set[sqlite3.Connection]" = set()
+        self._read_conn_owners: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2761,6 +2834,87 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Read-path split ──
 
+    def _prune_dead_read_conns_unlocked(self) -> int:
+        """Close read-only connections whose owning thread has exited.
+
+        Must be called while holding ``self._read_conns_lock``. Returns the
+        number of connections closed. Safe no-op when the owner list is empty.
+        """
+        if not self._read_conn_owners:
+            return 0
+        survivors: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
+        closed = 0
+        for owner, conn in self._read_conn_owners:
+            try:
+                alive = owner.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                survivors.append((owner, conn))
+                continue
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._read_conns.discard(conn)
+            closed += 1
+        if closed:
+            self._read_conn_owners = survivors
+            logger.debug(
+                "pruned %d dead-thread read connection(s) for %s (live=%d)",
+                closed,
+                self.db_path,
+                len(survivors),
+            )
+        return closed
+
+    def _sweep_idle_read_conns(self) -> int:
+        """Close read-only connections that are idle beyond the timeout.
+
+        Called by the background sweeper thread.  Rather than closing
+        cross-thread (which races with an in-flight query), this marks idle
+        connections as *doomed* via a flag on the connection object.  The
+        owning thread checks the doomed flag on its next ``_get_read_conn``
+        call and closes the connection itself.  Dead-thread connections are
+        closed immediately (safe — no query can be in flight on a dead
+        thread).
+
+        Returns the number of connections closed or marked doomed.
+        """
+        if not self._wal_active or self.read_only:
+            return 0
+        now = time.monotonic()
+        closed_or_doomed = 0
+        with self._read_conns_lock:
+            if self._read_conns_closed or not self._read_conn_owners:
+                return 0
+            # Phase 1: close dead-thread connections immediately.
+            closed_or_doomed += self._prune_dead_read_conns_unlocked()
+            if not self._read_conn_owners:
+                return closed_or_doomed
+            # Phase 2: mark idle-but-alive connections as doomed.
+            survivors: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
+            for owner, conn in self._read_conn_owners:
+                last_used = getattr(conn, "_hermes_last_used", now)
+                idle = now - last_used
+                if idle < _READ_CONN_IDLE_TIMEOUT_S:
+                    survivors.append((owner, conn))
+                    continue
+                # Mark doomed — the owning thread will close it on next access.
+                conn._hermes_doomed = True  # type: ignore[attr-defined]
+                survivors.append((owner, conn))
+                closed_or_doomed += 1
+            if closed_or_doomed:
+                self._read_conn_owners = survivors
+                logger.debug(
+                    "marked %d idle read connection(s) doomed for %s "
+                    "(idle > %.0fs)",
+                    closed_or_doomed,
+                    self.db_path,
+                    _READ_CONN_IDLE_TIMEOUT_S,
+                )
+        return closed_or_doomed
+
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
 
@@ -2773,21 +2927,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Fresh read transactions begin per statement (autocommit), so each
         query observes everything committed so far — read-your-writes holds
         for the flush-then-search patterns in a turn.
+
+        Each connection is owned by the creating thread and registered in
+        ``_read_conn_owners``. On every open (and cheaply on cache hit every
+        so often) dead-thread owners are pruned so long-lived SessionDB
+        instances do not accumulate fds forever. The background sweeper
+        additionally marks idle connections as doomed; the owning thread
+        closes doomed connections here on the next access.
         """
         if not self._wal_active or self.read_only:
             return None
         conn = getattr(self._read_local, "conn", None)
         if conn is not None:
-            return conn
+            # Check if the sweeper marked this connection as doomed (idle
+            # for too long). If so, close it and open a fresh one — the
+            # owning thread does its own close to avoid a cross-thread
+            # close racing with an in-flight query.
+            if getattr(conn, "_hermes_doomed", False):
+                with self._read_conns_lock:
+                    if not self._read_conns_closed:
+                        self._read_conns.discard(conn)
+                        try:
+                            self._read_conn_owners.remove(
+                                (threading.current_thread(), conn)
+                            )
+                        except ValueError:
+                            pass  # already removed by sweeper
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._read_local.conn = None
+                conn = None  # fall through to open a new connection
+                # Fall through to re-open below.
+            else:
+                # Update last-used timestamp for idle tracking.
+                conn._hermes_last_used = time.monotonic()  # type: ignore[attr-defined]
+                # Opportunistic prune on the hot path, rate-limited so a busy
+                # reader does not walk the owner list on every SELECT.
+                n = getattr(self._read_local, "prune_ticks", 0) + 1
+                self._read_local.prune_ticks = n
+                if n % 64 == 0:
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            self._prune_dead_read_conns_unlocked()
+                return conn
         if getattr(self._read_local, "failed", False):
             return None
         try:
+            # check_same_thread=False: these conns are owned by SessionDB and
+            # must be close()-able from another thread during dead-thread
+            # pruning and SessionDB.close(). Default True makes close() raise
+            # ProgrammingError (silently swallowed), permanently leaking the
+            # db+wal fds — root cause of the dashboard Errno 24 outage.
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
                 timeout=5.0,
                 isolation_level=None,
+                check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
@@ -2804,7 +3003,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
+                # Drop orphans before registering a new owner so a burst of
+                # short-lived worker threads cannot grow the set unboundedly.
+                self._prune_dead_read_conns_unlocked()
                 self._read_conns.add(conn)
+                self._read_conn_owners.append((threading.current_thread(), conn))
+                conn._hermes_last_used = time.monotonic()  # type: ignore[attr-defined]
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -2812,6 +3016,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             return None
         self._read_local.conn = conn
+        self._read_local.prune_ticks = 0
+        # Register with the sweeper so idle/dead conns are pruned.
+        _live_session_dbs.add(self)
+        _ensure_sweeper_started()
         return conn
 
     @contextmanager
@@ -2826,6 +3034,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         conn = self._get_read_conn()
         if conn is not None:
+            # Refresh last-used so the sweeper doesn't mark us idle.
+            conn._hermes_last_used = time.monotonic()  # type: ignore[attr-defined]
             yield conn
             return
         with self._lock:
@@ -3401,11 +3611,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # The strong set holds references so short-lived reader threads'
         # connections survive until close() drains them.  Setting the closed
         # flag under the lock prevents a reader from registering a new
-        # connection after the drain.
+        # connection after the drain.  Owner tracking is cleared too so
+        # dead-thread pruning has nothing to walk post-close.
         with self._read_conns_lock:
             self._read_conns_closed = True
             read_conns = list(self._read_conns)
             self._read_conns.clear()
+            self._read_conn_owners.clear()
         for conn in read_conns:
             try:
                 conn.close()

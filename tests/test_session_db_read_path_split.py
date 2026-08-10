@@ -167,3 +167,202 @@ def test_session_resume_reads_do_not_take_writer_lock(db):
         assert len(done["ancestor_prefix"]) == 2
     finally:
         db._lock.release()
+
+
+# ── FD leak prevention tests (p87) ──
+#
+# The dashboard/TUI gateway keeps one long-lived SessionDB; without pruning,
+# every ephemeral worker thread that touches a recall/browse path leaked a
+# mode=ro connection (state.db + state.db-wal + state.db-shm fds) for the
+# process lifetime.  These tests pin the contract that dead-thread and idle
+# connections are closed.
+
+
+@pytest.mark.requires_wal
+def test_dead_thread_read_conns_are_pruned(db):
+    """Short-lived reader threads must not leave fds in _read_conns forever.
+
+    Without dead-thread pruning, each ThreadPoolExecutor worker that touches
+    the read path leaks a mode=ro connection (db+wal+shm fds) until process
+    exit.  A new open on a surviving thread must prune all dead owners.
+    """
+    opened = []
+    barrier = threading.Barrier(9)  # 8 workers + main release
+
+    def worker():
+        c = db._get_read_conn()
+        opened.append(c)
+        barrier.wait(timeout=5.0)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    barrier.wait(timeout=5.0)
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    assert len(opened) == 8
+    assert all(c is not None for c in opened)
+    # Connections stay registered until a subsequent open triggers prune.
+    assert len(db._read_conns) >= 8
+
+    # A new open on this thread must prune the 8 dead owners.
+    survivors_before = len(db._read_conns)
+    mine = db._get_read_conn()
+    assert mine is not None
+    # Dead owners closed; only live-thread conns remain (at least `mine`).
+    assert len(db._read_conns) < survivors_before
+    assert mine in db._read_conns
+    # Every surviving owner must still be alive.
+    for owner, conn in db._read_conn_owners:
+        assert owner.is_alive(), "pruned list still holds a dead thread"
+        assert conn in db._read_conns
+    # Closed connections must not remain in the strong set.
+    for c in opened:
+        if c is not mine:
+            assert c not in db._read_conns
+
+
+@pytest.mark.requires_wal
+def test_idle_read_conns_are_doomed_and_closed(db):
+    """Idle-but-alive connections must be marked doomed and then closed.
+
+    The background sweeper marks connections idle beyond the timeout as
+    doomed.  The owning thread closes doomed connections on its next
+    _get_read_conn call, preventing fd accumulation from long-lived
+    ThreadPoolExecutor threads that never exit.
+    """
+    # Get a read conn on this thread (alive).
+    conn = db._get_read_conn()
+    assert conn is not None
+    assert conn in db._read_conns
+
+    # Simulate the sweeper marking the connection as doomed.
+    conn._hermes_doomed = True
+
+    # Next _get_read_conn on this thread should close the doomed conn
+    # and open a fresh one.
+    new_conn = db._get_read_conn()
+    assert new_conn is not None
+    assert new_conn is not conn
+    assert conn not in db._read_conns
+    assert new_conn in db._read_conns
+
+
+@pytest.mark.requires_wal
+def test_sweep_idle_read_conns_closes_dead_threads(db):
+    """_sweep_idle_read_conns must close connections from dead threads.
+
+    Uses a barrier to keep worker threads alive while they hold connections,
+    so dead-thread pruning during open doesn't race with the test setup.
+    After releasing the barrier and joining, the sweeper closes all
+    dead-thread connections.
+    """
+    opened = []
+    barrier = threading.Barrier(5)  # 4 workers + main release
+
+    def worker():
+        c = db._get_read_conn()
+        opened.append(c)
+        barrier.wait(timeout=5.0)  # hold conn while alive
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    barrier.wait(timeout=5.0)  # release workers
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    assert len(opened) == 4
+    assert len(db._read_conns) >= 4
+
+    # The sweeper should close all dead-thread connections.
+    closed = db._sweep_idle_read_conns()
+    assert closed >= 4
+    assert len(db._read_conns) == 0
+
+
+@pytest.mark.requires_wal
+def test_sweep_marks_idle_alive_conns_doomed(db, monkeypatch):
+    """_sweep_idle_read_conns must mark idle-but-alive conns as doomed.
+
+    The sweeper should not close idle connections cross-thread (that would
+    race with an in-flight query); it marks them doomed so the owning
+    thread closes them on its next access.
+    """
+    import hermes_state as hs
+
+    # Shorten the idle timeout so we don't have to wait 5 minutes.
+    monkeypatch.setattr(hs, "_READ_CONN_IDLE_TIMEOUT_S", 0.0)
+
+    # Get a read conn on this thread (alive).
+    conn = db._get_read_conn()
+    assert conn is not None
+    assert conn in db._read_conns
+
+    # Backdate the last-used timestamp so it's considered idle.
+    conn._hermes_last_used = 0.0
+
+    # The sweeper should mark it doomed (not close it — thread is alive).
+    closed = db._sweep_idle_read_conns()
+    assert closed >= 1
+    assert getattr(conn, "_hermes_doomed", False)
+
+    # The connection is still in _read_conns (sweeper didn't close it).
+    assert conn in db._read_conns
+
+    # Next _get_read_conn on this thread should close the doomed conn
+    # and open a fresh one.
+    new_conn = db._get_read_conn()
+    assert new_conn is not None
+    assert new_conn is not conn
+    assert conn not in db._read_conns
+    assert new_conn in db._read_conns
+
+
+@pytest.mark.requires_wal
+def test_check_same_thread_false_on_read_conns(db):
+    """Read connections must be opened with check_same_thread=False.
+
+    Without this, cross-thread close() during dead-thread pruning and
+    SessionDB.close() raises ProgrammingError (silently swallowed),
+    permanently leaking the db+wal+shm fds — the root cause of the
+    dashboard Errno 24 outage.
+    """
+    conn = db._get_read_conn()
+    assert conn is not None
+    # The connection must be closeable from a different thread without
+    # raising ProgrammingError.  If check_same_thread=True were set,
+    # this would raise: "SQLite objects created in a thread can only
+    # be used in that same thread."
+    errors = []
+
+    def closer():
+        try:
+            conn.close()
+        except Exception as e:
+            errors.append(e)
+
+    t = threading.Thread(target=closer)
+    t.start()
+    t.join(timeout=5.0)
+    assert not errors, f"cross-thread close raised: {errors}"
+
+
+@pytest.mark.requires_wal
+def test_close_drains_owners(db):
+    """close() must drain _read_conn_owners as well as _read_conns."""
+    # Create a read conn on a worker thread.
+    def worker():
+        db._get_read_conn()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=5.0)
+
+    assert len(db._read_conn_owners) >= 1
+    db.close()
+    assert len(db._read_conn_owners) == 0
+    assert len(db._read_conns) == 0
