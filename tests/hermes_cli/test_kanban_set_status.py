@@ -99,6 +99,53 @@ def test_set_status_repairs_already_ready_stale_claim(conn):
     assert kb.claim_task(conn, task_id, claimer="test-dispatcher") is not None
 
 
+def test_dispatch_tick_repairs_preexisting_sticky_ready_and_spawns(
+    conn, monkeypatch, tmp_path,
+):
+    """Rollout heals already-corrupted queue rows in the same dispatch tick."""
+    task_id = kb.create_task(
+        conn,
+        title="legacy invisible ready",
+        body="Resource-Class: light",
+        assignee="worker1",
+        workspace_kind="dir",
+        workspace_path=str(tmp_path),
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = 'seat-sticky', claim_expires = ? "
+            "WHERE id = ? AND status = 'ready'",
+            (2_101_406_907, task_id),
+        )
+    monkeypatch.setattr(kb, "_assignee_has_spawn_target", lambda _assignee: True)
+
+    dry = kb.dispatch_once(
+        conn,
+        dry_run=True,
+        spawn_fn=lambda *_args, **_kwargs: 4242,
+    )
+    assert dry.reclaimed == 0
+    assert any(
+        disposition.task_id == task_id
+        and disposition.reason == "stale_manual_custody"
+        for disposition in dry.dispositions
+    )
+    still_stale = kb.get_task(conn, task_id)
+    assert still_stale is not None
+    assert still_stale.claim_lock == "seat-sticky"
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: 4242,
+    )
+    assert result.reclaimed == 1
+    assert task_id in [spawned_id for spawned_id, _, _ in result.spawned]
+    running = kb.get_task(conn, task_id)
+    assert running is not None
+    assert running.status == "running"
+    assert running.claim_lock != "seat-sticky"
+
+
 def test_set_status_review(conn):
     task_id = kb.create_task(conn, title="Test task", assignee="worker1")
     ok = kb.set_status(conn, task_id, "review")

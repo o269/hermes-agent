@@ -7701,6 +7701,62 @@ def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
     return True
 
 
+def _stale_manual_queue_custody_ids(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status IN ('ready', 'review') "
+        "AND claim_lock = 'seat-sticky' "
+        "AND worker_pid IS NULL "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def repair_stale_manual_queue_custody(conn: sqlite3.Connection) -> list[str]:
+    """Repair queue rows stranded by the retired native status mutation.
+
+    The unsafe writer changed ``status`` from manual ``running`` to ``ready``
+    without releasing its ten-year ``seat-sticky`` lease.  Dispatch deliberately
+    selects only queue rows with ``claim_lock IS NULL``, so those cards vanished
+    before any disposition could be recorded.
+
+    This reconciler is intentionally narrow: only ``ready``/``review`` rows with
+    the distinctive manual lease and no worker PID are repaired.  A normal host
+    claim is never cleared automatically, avoiding duplicate workers if a legacy
+    status write raced a still-live dispatcher process.  The next non-dry-run
+    dispatch tick invokes this before candidate selection, so pre-existing
+    corruption heals and is considered in the same tick.
+    """
+    repaired: list[str] = []
+    with write_txn(conn):
+        for task_id in _stale_manual_queue_custody_ids(conn):
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="repaired stale manual custody before dispatch",
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "current_run_id = NULL "
+                "WHERE id = ? AND status IN ('ready', 'review') "
+                "AND worker_pid IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                task_id,
+                "custody_repaired",
+                {"source": "legacy_native_set_status", "claim_lock": "seat-sticky"},
+                run_id=run_id,
+            )
+            repaired.append(task_id)
+    return repaired
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13983,6 +14039,16 @@ def _dispatch_once_locked(
         result.reclaimed = release_stale_claims(conn)
     except sqlite3.OperationalError:
         result.write_failures.append("reclaim")
+    dry_run_stale_manual_custody: set[str] = set()
+    if not dry_run:
+        try:
+            result.reclaimed += len(repair_stale_manual_queue_custody(conn))
+        except sqlite3.OperationalError:
+            result.write_failures.append("custody_repair")
+    else:
+        dry_run_stale_manual_custody = set(
+            _stale_manual_queue_custody_ids(conn)
+        )
     try:
         result.stale = detect_stale_running(
             conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -14044,9 +14110,15 @@ def _dispatch_once_locked(
             spawn_target_cache[assignee] = _assignee_has_spawn_target(assignee)
         return spawn_target_cache[assignee]
 
+    ready_claim_predicate = "claim_lock IS NULL"
+    if dry_run_stale_manual_custody:
+        ready_claim_predicate = (
+            "(claim_lock IS NULL OR "
+            "(claim_lock = 'seat-sticky' AND worker_pid IS NULL))"
+        )
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        f"WHERE status = 'ready' AND {ready_claim_predicate} "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     review_rows = conn.execute(
@@ -14178,6 +14250,20 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        if row["id"] in dry_run_stale_manual_custody:
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="stale_manual_custody",
+                detail={
+                    "claim_lock": "seat-sticky",
+                    "next_action": "non-dry-run dispatch repairs then retries",
+                },
+                dry_run=True,
+            )
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
                 conn,
