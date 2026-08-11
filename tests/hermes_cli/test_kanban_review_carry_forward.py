@@ -481,14 +481,13 @@ def test_manual_promote_preserves_review_origin(
         assert review_retry.dispatch_origin == "review"
 
 
-def test_dashboard_direct_running_to_ready_preserves_review_origin(
+def test_dashboard_direct_running_to_ready_requires_structured_reclaim(
     isolated_board: Path,
 ) -> None:
-    """Dashboard running->ready recovery must not leak review work to authors.
+    """Generic dashboard status writes cannot release dispatcher custody.
 
-    Operator yank via dashboard requests ``ready``, but review-origin custody
-    must return to ``review``: one run closed as reclaimed, zero open runs,
-    generic claim_task refused, claim_review_task succeeds.
+    The explicit reclaim path still recovers an orphaned run pointer and returns
+    review-origin work to ``review`` rather than leaking it to the author queue.
     """
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
@@ -500,7 +499,23 @@ def test_dashboard_direct_running_to_ready_preserves_review_origin(
             (task_id,),
         )
 
-        assert _set_status_direct(conn, task_id, "ready") is True
+        assert _set_status_direct(conn, task_id, "ready") is False
+
+        preserved = kb.get_task(conn, task_id)
+        still_open = kb.latest_run(conn, task_id)
+        assert preserved is not None
+        assert preserved.status == "running"
+        assert preserved.claim_lock == review_run.claim_lock
+        assert preserved.current_run_id is None
+        assert still_open is not None
+        assert still_open.id == review_run.id
+        assert still_open.ended_at is None
+
+        assert kb.reclaim_task(
+            conn,
+            task_id,
+            reason="test structured dashboard recovery",
+        ) is True
 
         recovered = kb.get_task(conn, task_id)
         closed = kb.latest_run(conn, task_id)
@@ -509,9 +524,9 @@ def test_dashboard_direct_running_to_ready_preserves_review_origin(
             "WHERE task_id = ? AND ended_at IS NULL",
             (task_id,),
         ).fetchone()
-        status_event = conn.execute(
+        reclaim_event = conn.execute(
             "SELECT run_id, payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'status' "
+            "WHERE task_id = ? AND kind = 'reclaimed' "
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -526,14 +541,10 @@ def test_dashboard_direct_running_to_ready_preserves_review_origin(
         assert closed.outcome == "reclaimed"
         assert closed.ended_at is not None
         assert closed.dispatch_origin == "review"
-        assert closed.summary == "status changed to review (direct)"
         assert open_runs is not None and int(open_runs["n"]) == 0
-        assert status_event is not None
-        assert status_event["run_id"] == review_run.id
-        assert json.loads(status_event["payload"]) == {
-            "status": "review",
-            "requested_status": "ready",
-        }
+        assert reclaim_event is not None
+        assert reclaim_event["run_id"] == review_run.id
+        assert json.loads(reclaim_event["payload"])["prev_lock"] == review_run.claim_lock
 
         assert kb.claim_task(conn, task_id, claimer="test-host:author") is None
         review_retry = kb.claim_review_task(
