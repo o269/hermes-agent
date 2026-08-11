@@ -2542,6 +2542,12 @@ def _cmd_review(args: argparse.Namespace) -> int:
 def _cmd_set_status(args: argparse.Namespace) -> int:
     tid = args.task_id
     st = args.status
+    if st not in kb.VALID_STATUSES:
+        print(
+            f"kanban set-status: status must be one of {sorted(kb.VALID_STATUSES)}",
+            file=sys.stderr,
+        )
+        return 1
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None

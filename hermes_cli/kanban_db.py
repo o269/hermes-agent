@@ -7512,11 +7512,13 @@ def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
     owner, while the ordinary stale-heartbeat reconciler still reclaims abandoned
     work.
 
-    Every transition *off* ``running`` closes all open runs and clears the task's
-    denormalized claim fields.  The cleanup also repairs non-running rows left
-    with a stale claim by the retired boardd-native ``set_status`` operation.  A
-    queue row is therefore either claimable or rejected by a visible policy gate;
-    it can no longer disappear from dispatch solely because ``claim_lock`` leaked.
+    A transition off a manually owned ``running`` row closes all open runs and
+    clears the task's denormalized claim fields.  Dispatcher-owned running rows
+    are rejected under the same writer lock that would perform the transition;
+    callers must use the structured reclaim authority, whose claim/run CAS fences
+    prevent a stale manual snapshot from erasing a newer dispatcher claim.  The
+    cleanup also repairs non-running rows left with a stale manual claim by the
+    retired boardd-native ``set_status`` operation.
     """
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -7583,13 +7585,20 @@ def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
         if prev is None:
             return False
 
+        was_running = prev["status"] == "running"
+        if was_running and prev["claim_lock"] != "seat-sticky":
+            # Generic/manual status mutation is not dispatcher release authority.
+            # This check deliberately lives after BEGIN IMMEDIATE and uses the
+            # in-transaction row, not ``current`` above: a dispatcher may claim
+            # the task after the caller's snapshot but before this writer wins.
+            return False
+
         open_run = conn.execute(
             "SELECT id, dispatch_origin FROM task_runs "
             "WHERE task_id = ? AND ended_at IS NULL "
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        was_running = prev["status"] == "running"
         effective_status = status
         if was_running and status == "ready":
             origin = (
@@ -14111,11 +14120,13 @@ def _dispatch_once_locked(
         return spawn_target_cache[assignee]
 
     ready_claim_predicate = "claim_lock IS NULL"
+    review_claim_predicate = "claim_lock IS NULL"
     if dry_run_stale_manual_custody:
         ready_claim_predicate = (
             "(claim_lock IS NULL OR "
             "(claim_lock = 'seat-sticky' AND worker_pid IS NULL))"
         )
+        review_claim_predicate = ready_claim_predicate
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = 'ready' AND {ready_claim_predicate} "
@@ -14123,7 +14134,7 @@ def _dispatch_once_locked(
     ).fetchall()
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
+        f"WHERE status = 'review' AND {review_claim_predicate} "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     ready_heavy_pending = any(
@@ -14170,7 +14181,28 @@ def _dispatch_once_locked(
                     },
                     dry_run=dry_run,
                 )
-            result.validate_dispositions([row["id"] for row in ready_rows])
+            stale_review_rows = [
+                row
+                for row in review_rows
+                if row["id"] in dry_run_stale_manual_custody
+            ]
+            for row in stale_review_rows:
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    row["id"],
+                    "skipped",
+                    reason="stale_manual_custody",
+                    detail={
+                        "claim_lock": "seat-sticky",
+                        "next_action": "non-dry-run dispatch repairs then retries",
+                    },
+                    dry_run=True,
+                )
+            result.validate_dispositions(
+                [row["id"] for row in ready_rows]
+                + [row["id"] for row in stale_review_rows]
+            )
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -14928,6 +14960,20 @@ def _dispatch_once_locked(
     # running workers stays bounded.
     review_process_snapshot = _profile_process_snapshot
     for row in review_rows:
+        if row["id"] in dry_run_stale_manual_custody:
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="stale_manual_custody",
+                detail={
+                    "claim_lock": "seat-sticky",
+                    "next_action": "non-dry-run dispatch repairs then retries",
+                },
+                dry_run=True,
+            )
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:

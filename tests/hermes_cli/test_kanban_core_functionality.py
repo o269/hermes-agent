@@ -2106,11 +2106,13 @@ def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
         conn.close()
 
 
-def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
-    """Dashboard drag-drop running->ready must close the active run.
+def test_dashboard_direct_status_change_off_dispatcher_run_requires_reclaim(
+    kanban_home,
+):
+    """Dashboard drag-drop cannot bypass dispatcher run custody.
 
-    Importing _set_status_direct directly to simulate the PATCH handler
-    without spinning up FastAPI.
+    Importing _set_status_direct directly simulates the PATCH handler without
+    spinning up FastAPI.  The structured reclaim path performs the release.
     """
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
@@ -2122,9 +2124,18 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
         assert open_run.ended_at is None
         prev_run_id = open_run.id
 
-        # Simulate yanking the worker back to the queue.
-        assert _set_status_direct(conn, tid, "ready") is True
+        assert _set_status_direct(conn, tid, "ready") is False
+        preserved = kb.get_task(conn, tid)
+        assert preserved.status == "running"
+        assert preserved.current_run_id == prev_run_id
+        assert preserved.claim_lock != "seat-sticky"
+        assert kb.get_run(conn, prev_run_id).ended_at is None
 
+        assert kb.reclaim_task(
+            conn,
+            tid,
+            reason="manual_reclaim: dashboard test",
+        )
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
         assert task.current_run_id is None
