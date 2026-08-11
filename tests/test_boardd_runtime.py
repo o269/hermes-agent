@@ -405,6 +405,78 @@ def test_native_create_idempotency_ignores_archived_task(tmp_path: Path):
 
 
 @pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_client_set_status_releases_manual_claim_for_dispatch(tmp_path: Path):
+    """Broker-backed helper path must clear custody before ready dispatch."""
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        task = _native_create(
+            client,
+            title="broker status lifecycle",
+            status="ready",
+            assignee="default",
+        )
+
+        assert client.set_status(task["id"], "running") == {
+            "rowcount": 1,
+            "status": "running",
+        }
+        running = client.query(
+            "SELECT status, claim_lock, claim_expires, current_run_id "
+            "FROM tasks WHERE id = ?",
+            [task["id"]],
+        )[0]
+        assert running["status"] == "running"
+        assert running["claim_lock"] == "seat-sticky"
+        assert running["claim_expires"] is not None
+        assert running["current_run_id"] is not None
+        run_id = running["current_run_id"]
+
+        assert client.set_status(task["id"], "ready") == {
+            "rowcount": 1,
+            "status": "ready",
+        }
+        queued = client.query(
+            "SELECT status, claim_lock, claim_expires, current_run_id "
+            "FROM tasks WHERE id = ?",
+            [task["id"]],
+        )[0]
+        assert queued == {
+            "status": "ready",
+            "claim_lock": None,
+            "claim_expires": None,
+            "current_run_id": None,
+        }
+        run = client.query(
+            "SELECT ended_at, outcome FROM task_runs WHERE id = ?",
+            [run_id],
+        )[0]
+        assert run["ended_at"] is not None
+        assert run["outcome"] == "reclaimed"
+
+        # Same final CAS used by dispatch: the formerly invisible row is now
+        # claimable rather than filtered out before disposition reporting.
+        assert client.claim(task["id"], claimer="test-dispatcher")["won"] is True
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_boardd_native_set_status_fails_closed(tmp_path: Path):
+    """No second status writer may bypass the canonical lifecycle transaction."""
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        task = _native_create(client, title="raw status rejected", status="ready")
+        with pytest.raises(BoarddError, match="native set_status is disabled"):
+            client._request(
+                "set_status",
+                {"task_id": task["id"], "status": "running"},
+                mutation=True,
+                op_id="test-raw-set-status-rejected",
+            )
+
+        assert client.query(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?",
+            [task["id"]],
+        ) == [{"status": "ready", "claim_lock": None}]
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_native_create_idempotency_selects_newest_active_duplicate(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (client, _, _):
         key = "native-duplicate-key"

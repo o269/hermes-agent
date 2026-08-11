@@ -7503,6 +7503,260 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
+    """Policy-complete direct status transition for every UI/client surface.
+
+    ``running`` is entered through the normal claim authority so a manual run has
+    the same task/run bookkeeping and dependency/continuation guards as a
+    dispatcher run.  A long-lived ``seat-sticky`` lease identifies the manual
+    owner, while the ordinary stale-heartbeat reconciler still reclaims abandoned
+    work.
+
+    Every transition *off* ``running`` closes all open runs and clears the task's
+    denormalized claim fields.  The cleanup also repairs non-running rows left
+    with a stale claim by the retired boardd-native ``set_status`` operation.  A
+    queue row is therefore either claimable or rejected by a visible policy gate;
+    it can no longer disappear from dispatch solely because ``claim_lock`` leaked.
+    """
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+
+    current = get_task(conn, task_id)
+    if current is None:
+        return False
+
+    if status == "running":
+        if current.status == "running":
+            # Never steal or rewrite a dispatcher-owned lease.  Repeating the
+            # manual transition is an idempotent heartbeat only for its own
+            # explicit seat-sticky claim.
+            if current.claim_lock != "seat-sticky":
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual status refresh",
+                expected_run_id=current.current_run_id,
+            )
+        if current.status == "ready":
+            claimed = claim_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+            if claimed is None:
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual status claim",
+                expected_run_id=claimed.current_run_id,
+            )
+        if current.status == "review":
+            claimed = claim_review_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+            if claimed is None:
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual review status claim",
+                expected_run_id=claimed.current_run_id,
+            )
+        raise ValueError(
+            "status 'running' requires a ready or review task; "
+            "use the structured transition into a queue first"
+        )
+
+    recompute_after = False
+    with write_txn(conn):
+        prev = conn.execute(
+            "SELECT status, dispatch_origin, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        open_run = conn.execute(
+            "SELECT id, dispatch_origin FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        was_running = prev["status"] == "running"
+        effective_status = status
+        if was_running and status == "ready":
+            origin = (
+                open_run["dispatch_origin"]
+                if open_run is not None and open_run["dispatch_origin"] is not None
+                else prev["dispatch_origin"]
+            )
+            effective_status = _dispatch_retry_status(origin)
+
+        # A non-running row must never retain lease/run custody, even when the
+        # requested transition later fails a policy check.  This repairs the
+        # exact ready+seat-sticky corruption that made cards invisible to the
+        # dispatch candidate query.
+        stale_nonrunning_custody = prev["status"] != "running" and (
+            prev["current_run_id"] is not None
+            or prev["claim_lock"] is not None
+            or prev["claim_expires"] is not None
+            or prev["worker_pid"] is not None
+            or open_run is not None
+        )
+        run_id: Optional[int] = None
+        if stale_nonrunning_custody:
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="repaired stale custody before direct status transition",
+            )
+
+        # Ready is a real queue, not a visual label: refuse a new ready
+        # transition until every dependency is terminal.  Archived parents count
+        # as satisfied everywhere else in the state machine, so include them.
+        if effective_status == "ready":
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone_parent is not None:
+                return False
+
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and effective_status not in {"done", "archived"}
+        )
+
+        if was_running:
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary=f"status changed to {effective_status} (direct)",
+            )
+
+        clean_noop = (
+            prev["status"] == effective_status
+            and not stale_nonrunning_custody
+            and not was_running
+        )
+        if clean_noop:
+            return True
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ?",
+            (effective_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        payload: dict[str, Any] = {"status": effective_status}
+        if effective_status != status:
+            payload["requested_status"] = status
+        if stale_nonrunning_custody:
+            payload["repaired_stale_custody"] = True
+        _append_event(conn, task_id, "status", payload, run_id=run_id)
+
+        if reopening_satisfied_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {
+                            "status": "todo",
+                            "reason": "parent_reopened",
+                            "parent": task_id,
+                        },
+                    )
+        recompute_after = effective_status in {"done", "archived", "ready"}
+
+    if recompute_after:
+        recompute_ready(conn)
+    return True
+
+
+def _stale_manual_queue_custody_ids(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status IN ('ready', 'review') "
+        "AND claim_lock = 'seat-sticky' "
+        "AND worker_pid IS NULL "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def repair_stale_manual_queue_custody(conn: sqlite3.Connection) -> list[str]:
+    """Repair queue rows stranded by the retired native status mutation.
+
+    The unsafe writer changed ``status`` from manual ``running`` to ``ready``
+    without releasing its ten-year ``seat-sticky`` lease.  Dispatch deliberately
+    selects only queue rows with ``claim_lock IS NULL``, so those cards vanished
+    before any disposition could be recorded.
+
+    This reconciler is intentionally narrow: only ``ready``/``review`` rows with
+    the distinctive manual lease and no worker PID are repaired.  A normal host
+    claim is never cleared automatically, avoiding duplicate workers if a legacy
+    status write raced a still-live dispatcher process.  The next non-dry-run
+    dispatch tick invokes this before candidate selection, so pre-existing
+    corruption heals and is considered in the same tick.
+    """
+    repaired: list[str] = []
+    with write_txn(conn):
+        for task_id in _stale_manual_queue_custody_ids(conn):
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="repaired stale manual custody before dispatch",
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "current_run_id = NULL "
+                "WHERE id = ? AND status IN ('ready', 'review') "
+                "AND worker_pid IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                task_id,
+                "custody_repaired",
+                {"source": "legacy_native_set_status", "claim_lock": "seat-sticky"},
+                run_id=run_id,
+            )
+            repaired.append(task_id)
+    return repaired
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13785,6 +14039,16 @@ def _dispatch_once_locked(
         result.reclaimed = release_stale_claims(conn)
     except sqlite3.OperationalError:
         result.write_failures.append("reclaim")
+    dry_run_stale_manual_custody: set[str] = set()
+    if not dry_run:
+        try:
+            result.reclaimed += len(repair_stale_manual_queue_custody(conn))
+        except sqlite3.OperationalError:
+            result.write_failures.append("custody_repair")
+    else:
+        dry_run_stale_manual_custody = set(
+            _stale_manual_queue_custody_ids(conn)
+        )
     try:
         result.stale = detect_stale_running(
             conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -13846,9 +14110,15 @@ def _dispatch_once_locked(
             spawn_target_cache[assignee] = _assignee_has_spawn_target(assignee)
         return spawn_target_cache[assignee]
 
+    ready_claim_predicate = "claim_lock IS NULL"
+    if dry_run_stale_manual_custody:
+        ready_claim_predicate = (
+            "(claim_lock IS NULL OR "
+            "(claim_lock = 'seat-sticky' AND worker_pid IS NULL))"
+        )
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        f"WHERE status = 'ready' AND {ready_claim_predicate} "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     review_rows = conn.execute(
@@ -13980,6 +14250,20 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        if row["id"] in dry_run_stale_manual_custody:
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "skipped",
+                reason="stale_manual_custody",
+                detail={
+                    "claim_lock": "seat-sticky",
+                    "next_action": "non-dry-run dispatch repairs then retries",
+                },
+                dry_run=True,
+            )
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
                 conn,
@@ -16477,6 +16761,7 @@ if os.environ.get("HERMES_KANBAN_BROKER") == "1":
         heartbeat_worker = _boardd_shim.heartbeat_worker
         set_workspace_path = _boardd_shim.set_workspace_path
         set_branch_name = _boardd_shim.set_branch_name
+        set_status = _boardd_shim.set_status
         _check_file_length_invariant = _boardd_shim.noop_flen
     except Exception as _boardd_shim_err:  # never break the module on shim import
         import logging as _logging

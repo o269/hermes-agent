@@ -233,8 +233,30 @@ class Client:
                              mutation=True, op_id=op_id)["result"]
 
     def set_status(self, task_id, status, *, op_id=None):
-        return self._request("set_status", {"task_id": task_id, "status": status},
-                             mutation=True, op_id=op_id)["result"]
+        """Apply a status transition through kanban_db's lifecycle authority.
+
+        The broker's legacy native ``set_status`` mutation only changed the task
+        row.  Returning a seat-sticky/manual run to ``ready`` therefore left its
+        claim behind, while dispatch intentionally selects only
+        ``ready AND claim_lock IS NULL``.  Use the canonical transaction over a
+        BrokerConnection so every official client preserves task/run/claim
+        invariants.  ``op_id`` remains accepted for source compatibility; the
+        transition is idempotent and native applied-ops are deliberately bypassed.
+        """
+        del op_id
+        from hermes_cli import boardd_shim, kanban_db
+
+        conn = boardd_shim.BrokerConnection(client=self)
+        try:
+            ok = kanban_db.set_status(conn, task_id, status)
+        finally:
+            conn.close()
+        if not ok:
+            raise BoarddError(
+                f"cannot set status of {task_id} to {status}",
+                "StatusTransitionRejected",
+            )
+        return {"rowcount": 1, "status": status}
 
     def heartbeat(self, task_id, note=None, *, op_id=None):
         return self._request("heartbeat", {"task_id": task_id, "note": note},

@@ -1657,11 +1657,14 @@ def test_patch_status_ready_preserves_review_origin_queue(client):
         assert run.id == run_id
         assert run.outcome == "reclaimed"
         assert run.ended_at is not None
-        assert run.summary == "status changed to review (dashboard/direct)"
+        assert run.summary == "status changed to review (direct)"
         assert open_count is not None and int(open_count["n"]) == 0
         assert status_event is not None
         assert status_event["run_id"] == run_id
-        assert json.loads(status_event["payload"]) == {"status": "review"}
+        assert json.loads(status_event["payload"]) == {
+            "status": "review",
+            "requested_status": "ready",
+        }
         assert kb.claim_task(conn, tid, claimer="test-host:author") is None
         review_retry = kb.claim_review_task(
             conn, tid, claimer="test-host:reviewer-retry"
