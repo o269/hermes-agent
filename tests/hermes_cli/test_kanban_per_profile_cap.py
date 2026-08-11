@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import contextlib
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 
 import pytest
+
+
+_LEASE_CHILDREN: list[subprocess.Popen[bytes]] = []
 
 
 @pytest.fixture()
@@ -31,11 +35,35 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         ):
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    real_create_task = kanban_db.create_task
 
-    yield kanban_db
+    def create_light_task(*args, **kwargs):
+        kwargs.setdefault(
+            "body", "Resource-Class: light\nPer-profile cap unit test."
+        )
+        return real_create_task(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", create_light_task)
+
+    try:
+        yield kanban_db
+    finally:
+        for child in _LEASE_CHILDREN:
+            if child.poll() is None:
+                child.kill()
+        for child in _LEASE_CHILDREN:
+            child.wait(timeout=5)
+        _LEASE_CHILDREN.clear()
 
 
-def _fake_spawn(*args, **kwargs):
+def _fake_spawn(*args, heavy_workspace_lease=None, **kwargs):
+    if heavy_workspace_lease is not None:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            pass_fds=heavy_workspace_lease.filenos(),
+        )
+        _LEASE_CHILDREN.append(child)
+        return child.pid
     return 12345
 
 
@@ -379,15 +407,28 @@ def test_ready_and_review_same_profile_share_one_card_limit(
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         ready = kb.create_task(
-            conn, title="ready A", assignee="alpha", priority=100
+            conn,
+            title="ready A",
+            body="Heavy phase/profile-cap regression.",
+            assignee="alpha",
+            priority=100,
         )
         review = kb.create_task(
-            conn, title="review B", assignee="alpha", priority=10
+            conn,
+            title="review B",
+            body="Heavy phase/profile-cap regression.",
+            assignee="alpha",
+            priority=10,
         )
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'review' WHERE id = ?", (review,)
             )
+        # Pin this assertion to a ready phase turn so the review card reaches
+        # the profile-cap guard after ready has acquired the one active slot.
+        kb._advance_heavy_workspace_phase_turn(
+            conn, review, attempted_phase="review"
+        )
         result = kb.dispatch_once(conn, spawn_fn=_fake_spawn, max_spawn=2)
         review_row = conn.execute(
             "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",

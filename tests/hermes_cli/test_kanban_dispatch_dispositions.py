@@ -162,7 +162,7 @@ def test_ready_failure_paths_emit_compact_secret_free_dispositions(
 
         monkeypatch.setattr(kb, "resolve_workspace", fail_workspace)
 
-    def spawn(_task, _workspace):
+    def spawn(_task, _workspace, **_kwargs):
         if failure_stage == "spawn":
             raise RuntimeError(secret)
         raise AssertionError("spawn must not run after workspace resolution fails")

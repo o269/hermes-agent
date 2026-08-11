@@ -284,6 +284,11 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+# Script exit 75 (sysexits EX_TEMPFAIL) is a deliberate protective deferral,
+# not a job failure. It suppresses delivery, does not consume finite repeat
+# budget, and is persisted as last_status="skipped".
+CRON_SKIP_EXIT_CODE = 75
+CRON_SKIP_MARKER = "[CRON_SKIPPED]"
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -2110,7 +2115,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str) -> tuple[Optional[bool], str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2138,8 +2143,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             are also validated to ensure they stay within the scripts dir.
 
     Returns:
-        (success, output) — on failure *output* contains the error message so the
-        LLM can report the problem to the user.
+        ``(True, output)`` on success, ``(None, output)`` for a deliberate
+        exit-75 protective skip, and ``(False, error)`` on failure.
     """
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -2228,6 +2233,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
+        if result.returncode == CRON_SKIP_EXIT_CODE:
+            parts = [f"Script skipped with code {CRON_SKIP_EXIT_CODE}"]
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout}")
+            return None, "\n".join(parts)
+
         if result.returncode != 0:
             parts = [f"Script exited with code {result.returncode}"]
             if stderr:
@@ -2246,7 +2259,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str
-) -> tuple[bool, str]:
+) -> tuple[Optional[bool], str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
     Script execution is synchronous and may legitimately outlive the stale
@@ -2692,6 +2705,7 @@ def run_job(
     # Semantics:
     #   - script stdout (trimmed) → delivered verbatim as the final message
     #   - empty stdout            → silent run (no delivery, success=True)
+    #   - exit 75                 → protective skip (no delivery, status=skipped)
     #   - non-zero exit / timeout → delivered as an error alert, success=False
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
@@ -2725,6 +2739,22 @@ def run_job(
                     pass
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if ok is None:
+            logger.info(
+                "Job '%s' (no_agent): protective script skip (exit %d)",
+                job_id,
+                CRON_SKIP_EXIT_CODE,
+            )
+            skipped_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                f"**Mode:** no_agent (script)\n"
+                f"**Status:** skipped (protective gate)\n\n"
+                f"{output}\n"
+            )
+            return True, skipped_doc, CRON_SKIP_MARKER, None
 
         if not ok:
             # Script crashed / timed out / exited non-zero.  Deliver the
@@ -2865,6 +2895,21 @@ def run_job(
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
         _ran_ok, _script_output = prerun_script
+        if _ran_ok is None:
+            logger.info(
+                "Job '%s' (ID: %s): protective script skip (exit %d)",
+                job_name,
+                job_id,
+                CRON_SKIP_EXIT_CODE,
+            )
+            skipped_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** skipped (protective gate)\n\n"
+                f"{_script_output}\n"
+            )
+            return True, skipped_doc, CRON_SKIP_MARKER, None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3789,6 +3834,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             raise
         finally:
             reset_secret_scope(_scope_token)
+        skipped = success and final_response == CRON_SKIP_MARKER
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -3811,6 +3857,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # right before mark_job_run below.
             if success and _is_interrupted(job["id"]):
                 success = False
+                skipped = False
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
@@ -3819,7 +3866,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            deliver_content = (
+                ""
+                if skipped
+                else (
+                    final_response
+                    if success
+                    else _summarize_cron_failure_for_delivery(job, error)
+                )
+            )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -3850,13 +3905,35 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
-        if success and not final_response.strip():
+        if success and not skipped and not final_response.strip():
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
+            if skipped:
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    status="skipped",
+                )
+            else:
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                )
+        if skipped:
+            finish_execution(
+                execution_id,
+                success=True,
+                error=None,
+                status="skipped",
+            )
+        else:
+            finish_execution(execution_id, success=success, error=error)
         return True
 
     except Exception as e:

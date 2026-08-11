@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,34 +21,98 @@ from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "skipped", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_EXECUTIONS_TABLE_SQL = """CREATE TABLE IF NOT EXISTS executions (
+     id TEXT PRIMARY KEY,
+     job_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     process_id TEXT NOT NULL,
+     pid INTEGER NOT NULL,
+     process_started_at INTEGER,
+     status TEXT NOT NULL CHECK(status IN
+       ('claimed','running','completed','failed','skipped','unknown')),
+     claimed_at TEXT NOT NULL,
+     started_at TEXT,
+     finished_at TEXT,
+     error TEXT
+   )"""
+
+
+def _retryable_sqlite_contention(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return (
+        "locked" in message
+        or "busy" in message
+        or "unable to open database file" in message
+    )
+
+
+def _connect_with_retry() -> sqlite3.Connection:
+    """Open the ledger through short-lived filesystem/SQLite contention."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+        except sqlite3.OperationalError as exc:
+            if not _retryable_sqlite_contention(exc) or time.monotonic() >= deadline:
+                raise
+            EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(0.025)
+
+
+def _execute_with_retry(conn: sqlite3.Connection, sql: str) -> sqlite3.Cursor:
+    """Retry pragmas whose lock negotiation bypasses SQLite busy_timeout."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return conn.execute(sql)
+        except sqlite3.OperationalError as exc:
+            if not _retryable_sqlite_contention(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.025)
 
 
 def _connect() -> sqlite3.Connection:
     EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    conn = _connect_with_retry()
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    _execute_with_retry(conn, "PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
-             id TEXT PRIMARY KEY,
-             job_id TEXT NOT NULL,
-             source TEXT NOT NULL,
-             process_id TEXT NOT NULL,
-             pid INTEGER NOT NULL,
-             process_started_at INTEGER,
-             status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
-             claimed_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             error TEXT
-           )"""
-    )
+    conn.execute(_EXECUTIONS_TABLE_SQL)
+    schema_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    schema_sql = str(schema_row["sql"] or "") if schema_row is not None else ""
+    if "'skipped'" not in schema_sql:
+        # SQLite cannot alter a CHECK constraint in place. Serialize the
+        # schema decision across scheduler processes, then re-read it after
+        # taking the write lock: another process may have migrated while this
+        # connection was waiting.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            schema_row = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='executions'"
+            ).fetchone()
+            schema_sql = (
+                str(schema_row["sql"] or "") if schema_row is not None else ""
+            )
+            if "'skipped'" not in schema_sql:
+                conn.execute("ALTER TABLE executions RENAME TO executions_pre_skip")
+                conn.execute(_EXECUTIONS_TABLE_SQL)
+                conn.execute(
+                    "INSERT INTO executions "
+                    "SELECT * FROM executions_pre_skip"
+                )
+                conn.execute("DROP TABLE executions_pre_skip")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -89,7 +154,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','skipped','unknown')
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
@@ -133,17 +198,27 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 
 def finish_execution(
-    execution_id: str, *, success: bool, error: Optional[str] = None,
+    execution_id: str,
+    *,
+    success: bool,
+    error: Optional[str] = None,
+    status: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
-    status = "completed" if success else "failed"
-    detail = None if success else (str(error) if error else "unknown failure")
+    terminal_status = status or ("completed" if success else "failed")
+    if terminal_status not in {"completed", "failed", "skipped"}:
+        raise ValueError(f"unsupported execution terminal status: {terminal_status}")
+    detail = (
+        (str(error) if error else "unknown failure")
+        if terminal_status == "failed"
+        else None
+    )
     with _lock, _connect() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (terminal_status, now, detail, execution_id),
         )
         if cur.rowcount != 1:
             return None

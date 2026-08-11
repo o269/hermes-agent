@@ -601,6 +601,32 @@ class TestMarkJobRun:
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
 
+    def test_skip_does_not_consume_preclaimed_one_shot(self, tmp_cron_dir):
+        job = create_job(prompt="Load-gated", schedule="30m", repeat=1)
+        assert claim_dispatch(job["id"]) is True
+        claimed = get_job(job["id"])
+        assert claimed is not None
+        assert claimed["repeat"]["completed"] == 1
+
+        mark_job_run(job["id"], success=True, status="skipped")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "skipped"
+        assert updated["last_error"] is None
+        assert updated["repeat"]["completed"] == 0
+        assert updated["enabled"] is True
+        assert updated["state"] == "scheduled"
+        assert updated["next_run_at"] is not None
+
+    def test_skip_does_not_increment_recurring_repeat_budget(self, tmp_cron_dir):
+        job = create_job(prompt="Recurring gate", schedule="every 1h", repeat=2)
+        mark_job_run(job["id"], success=True, status="skipped")
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "skipped"
+        assert updated["repeat"]["completed"] == 0
+
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
         job = create_job(prompt="Report", schedule="every 1h")

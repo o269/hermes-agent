@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -796,6 +796,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    last_activity_at REAL,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -806,6 +807,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    pinned BOOLEAN NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -1868,6 +1870,33 @@ class SessionDB:
                         )
                 except sqlite3.OperationalError as exc:
                     logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+            if current_version < 23:
+                # v23: durable cold-archive policy fields. Column creation is
+                # handled declaratively above; historical activity must come
+                # from actual persisted messages, never session creation time.
+                # The MAX/current comparison makes this safe to replay after a
+                # partial migration and prevents an older import from moving a
+                # previously recorded activity watermark backwards.
+                cursor.execute(
+                    """UPDATE sessions
+                       SET last_activity_at = (
+                           SELECT MAX(m.timestamp)
+                           FROM messages m
+                           WHERE m.session_id = sessions.id
+                       )
+                       WHERE EXISTS (
+                           SELECT 1 FROM messages m
+                           WHERE m.session_id = sessions.id
+                       )
+                         AND (
+                           last_activity_at IS NULL
+                           OR last_activity_at < (
+                               SELECT MAX(m.timestamp)
+                               FROM messages m
+                               WHERE m.session_id = sessions.id
+                           )
+                         )"""
+                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -4258,13 +4287,23 @@ class SessionDB:
             if num_tool_calls > 0:
                 conn.execute(
                     """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
+                       tool_call_count = tool_call_count + ?,
+                       last_activity_at = CASE
+                           WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+                           ELSE last_activity_at
+                       END
+                       WHERE id = ?""",
+                    (num_tool_calls, message_timestamp, message_timestamp, session_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                    (session_id,),
+                    """UPDATE sessions SET message_count = message_count + 1,
+                       last_activity_at = CASE
+                           WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+                           ELSE last_activity_at
+                       END
+                       WHERE id = ?""",
+                    (message_timestamp, message_timestamp, session_id),
                 )
             return msg_id
 
@@ -4282,6 +4321,7 @@ class SessionDB:
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
+        latest_message_timestamp: Optional[float] = None
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
@@ -4349,11 +4389,22 @@ class SessionDB:
                 ),
             )
             inserted += 1
+            if latest_message_timestamp is None or message_timestamp > latest_message_timestamp:
+                latest_message_timestamp = message_timestamp
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+        if latest_message_timestamp is not None:
+            conn.execute(
+                """UPDATE sessions SET last_activity_at = CASE
+                       WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+                       ELSE last_activity_at
+                   END
+                   WHERE id = ?""",
+                (latest_message_timestamp, latest_message_timestamp, session_id),
+            )
         return inserted, tool_calls_total
 
     def replace_messages(
@@ -6297,6 +6348,7 @@ class SessionDB:
                 if started_at is None:
                     started_at = time.time()
                 archived = 1 if raw.get("archived") else 0
+                pinned = 1 if self._int_or_default(raw.get("pinned")) else 0
 
                 conn.execute(
                     """INSERT INTO sessions (
@@ -6307,7 +6359,8 @@ class SessionDB:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, last_activity_at, api_call_count,
+                           archived, pinned
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -6318,7 +6371,7 @@ class SessionDB:
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :last_activity_at, :api_call_count, :archived, :pinned
                        )""",
                     {
                         "id": session_id,
@@ -6357,8 +6410,12 @@ class SessionDB:
                         "cost_source": raw.get("cost_source"),
                         "pricing_version": raw.get("pricing_version"),
                         "title": raw.get("title"),
+                        "last_activity_at": self._float_or_none(
+                            raw.get("last_activity_at")
+                        ),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
+                        "pinned": pinned,
                     },
                 )
 

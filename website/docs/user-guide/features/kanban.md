@@ -790,15 +790,32 @@ All commands are also available as a slash command in the interactive CLI and in
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_heavy_workspaces` | `3` | Host-wide cap for resource-intensive local workers, shared across every board and dispatcher process on the machine. Three is also the non-disableable safety ceiling: lower positive values are honored, while missing, invalid, non-positive, or larger values resolve to three. Local cards are heavy by default; an exact `Resource-Class: light` line in the card body opts into the light lane. Heavy admission uses inherited kernel-lock slots, so normal exit, crash, OOM, timeout, and dispatcher restart release capacity without stale counters. A saturated host leaves excess cards unclaimed in a `queue_wait` state; it is not recorded as a task failure. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
   max_in_progress: 2
+  max_heavy_workspaces: 3
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+`max_heavy_workspaces` is deliberately fail-closed and cannot be disabled or
+raised above three: workspace kind alone does not reveal whether a scratch task
+will clone, install, build, or run tests after launch, so every local worker
+consumes a heavy slot by default. Use the light marker only for mechanically
+constrained work (for example API GET-only inspection) whose card contract
+forbids CPU/RAM/I/O-heavy actions:
+
+```text
+Resource-Class: light
+```
+
+Remote workers configured through `kanban.vps2_ssh` do not consume a local
+heavy-workspace slot. The light marker does not change global or per-profile
+caps; all configured limits must allow a spawn.
 
 ### Scheduled task starts (`scheduled_at`)
 
