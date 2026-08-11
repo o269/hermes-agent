@@ -898,7 +898,11 @@ def test_run_slash_decompose_json_reports_stale_skip(kanban_home):
         root_status="ready",
     )
     with patch.object(decomp, "decompose_task", return_value=outcome):
-        payload = json.loads(kc.run_slash("decompose t_stale --json"))
+        payload = json.loads(
+            kc.run_slash(
+                "decompose t_stale --idempotency-key test:t_stale --json"
+            )
+        )
 
     assert payload["ok"] is False
     assert payload["skipped"] is True
@@ -919,7 +923,9 @@ def test_run_slash_decompose_reports_dependency_closure(kanban_home):
         leaf_count=1,
     )
     with patch.object(decomp, "decompose_task", return_value=outcome):
-        out = kc.run_slash("decompose t_graph")
+        out = kc.run_slash(
+            "decompose t_graph --idempotency-key test:t_graph"
+        )
 
     assert "root custody preserved in triage" in out
     assert "dependency closure: 2 internal edge(s)" in out

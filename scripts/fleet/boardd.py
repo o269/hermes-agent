@@ -2031,6 +2031,19 @@ def _h_create_task(broker, conn, a):
     title = a.get("title")
     if not title or not str(title).strip():
         raise ValueError("title is required")
+    # Keep broker-native creates on the same title+scope identity contract as
+    # hermes_cli.kanban_db.create_task. This import is pure Python and cached;
+    # the handler remains pure SQL on boardd's owned connection.
+    from hermes_cli import kanban_db as _kb  # noqa: WPS433
+
+    workspace_kind = a.get("workspace_kind", "scratch")
+    scope = _kb._normalize_task_scope(
+        tenant=None,
+        parents=(),
+        project_id=None,
+        workspace_kind=workspace_kind,
+        workspace_path=None,
+    )
     # A retried native create with the same non-empty key returns the existing
     # card rather than minting a duplicate. This mirrors the effective runtime
     # hotfix while preserving all newer handler fields and validation below.
@@ -2043,7 +2056,44 @@ def _h_create_task(broker, conn, a):
             (idem,),
         ).fetchone()
         if row:
+            _kb._record_create_dedup(
+                conn,
+                existing_task_id=str(row[0]),
+                reason="idempotency_key",
+                title=str(title),
+                scope=scope,
+                attempted_by=a.get("created_by"),
+                idempotency_key_supplied=True,
+            )
             return {"id": row[0], "status": row[1], "deduplicated": True}
+    duplicate_id, scope = _kb._find_open_title_scope_duplicate(
+        conn,
+        title=str(title),
+        tenant=None,
+        parents=(),
+        project_id=None,
+        workspace_kind=workspace_kind,
+        workspace_path=None,
+    )
+    if duplicate_id is not None:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?",
+            (duplicate_id,),
+        ).fetchone()
+        _kb._record_create_dedup(
+            conn,
+            existing_task_id=duplicate_id,
+            reason="normalized_title_scope",
+            title=str(title),
+            scope=scope,
+            attempted_by=a.get("created_by"),
+            idempotency_key_supplied=bool(idem),
+        )
+        return {
+            "id": duplicate_id,
+            "status": row[0] if row else "unknown",
+            "deduplicated": True,
+        }
     tid = a.get("id") or _new_task_id()
     status = a.get("status", "running")
     reasoning_effort = _canon_reasoning_effort(a.get("reasoning_effort"))
@@ -2053,7 +2103,7 @@ def _h_create_task(broker, conn, a):
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (tid, str(title), a.get("body"), _canon_assignee(a.get("assignee")),
          status, int(a.get("priority", 0)), _canon_assignee(a.get("created_by")),
-         _now(), a.get("workspace_kind", "scratch"), reasoning_effort, idem),
+         _now(), workspace_kind, reasoning_effort, idem),
     )
     _ev(conn, tid, "created", {"title": str(title)})
     return {"id": tid, "status": status}

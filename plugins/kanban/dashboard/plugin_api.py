@@ -2193,6 +2193,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 
 class DecomposeBody(BaseModel):
     author: Optional[str] = None
+    idempotency_key: str = Field(min_length=1)
 
 
 @router.post("/tasks/{task_id}/decompose")
@@ -2221,6 +2222,7 @@ def decompose_task_endpoint(
         from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
         outcome = kanban_decompose.decompose_task(
             task_id,
+            idempotency_key=payload.idempotency_key,
             author=(payload.author or None),
         )
 

@@ -3292,7 +3292,7 @@
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ idempotency_key: `dashboard-decompose:${props.taskId}` }),
         }
       ).then(function (res) {
         load();

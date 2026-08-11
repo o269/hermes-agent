@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -55,6 +57,11 @@ def _patch_extra_body():
     # No-op shim retained for call-site compatibility: extra_body plumbing
     # now lives inside call_llm, which _patch_aux_client already mocks.
     return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
+
+
+def _decompose(task_id: str, **kwargs):
+    kwargs.setdefault("idempotency_key", f"test-decompose:{task_id}")
+    return decomp.decompose_task(task_id, **kwargs)
 
 
 def _patch_list_profiles(names: list[str]):
@@ -151,7 +158,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         p.start()
     try:
         with _patch_aux_client(llm_payload), _patch_extra_body():
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -173,6 +180,117 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+
+
+def test_decompose_rerun_key_is_noop_before_llm_call(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="keyed rerun", triage=True)
+
+    payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "tasks": [
+                {"title": "one", "assignee": "engineer", "parents": []},
+                {"title": "two", "assignee": "engineer", "parents": [0]},
+            ],
+        }
+    )
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(payload):
+            first = _decompose(tid, author="auto-decomposer")
+        llm = MagicMock()
+        with patch("agent.auxiliary_client.call_llm", llm):
+            second = _decompose(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert first.ok is True and first.child_ids
+    assert second.ok is True
+    assert second.skipped is True
+    assert second.child_ids == first.child_ids
+    assert "idempotent no-op" in second.reason
+    llm.assert_not_called()
+
+
+def test_concurrent_single_task_decomposition_key_returns_idempotent_noop(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="concurrent single task", triage=True)
+
+    payload = jsonlib.dumps(
+        {
+            "fanout": False,
+            "title": "specified once",
+            "body": "one durable decomposition result",
+            "assignee": "engineer",
+        }
+    )
+    barrier = threading.Barrier(2)
+
+    def synchronized_answer(*_args, **_kwargs):
+        barrier.wait(timeout=10)
+        return _fake_aux_response(payload)
+
+    patches = _patch_list_profiles(["engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=synchronized_answer,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(
+                    pool.map(
+                        lambda _: _decompose(tid, author="auto-decomposer"),
+                        range(2),
+                    )
+                )
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert all(outcome.ok for outcome in outcomes)
+    assert sum(outcome.skipped for outcome in outcomes) == 1
+    assert any("idempotent no-op" in outcome.reason for outcome in outcomes)
+    with kb.connect() as conn:
+        decomposed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='decomposed'",
+            (tid,),
+        ).fetchone()[0]
+    assert decomposed_events == 1
+
+
+def test_decompose_missing_key_and_live_parent_guard_before_llm(
+    kanban_home,
+    caplog,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="live parent for guard")
+        root = kb.create_task(
+            conn,
+            title="guarded triage root",
+            parents=[parent],
+            triage=True,
+        )
+
+    llm = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", llm):
+        missing = decomp.decompose_task(root, author="auto-decomposer")
+        guarded = _decompose(root, author="auto-decomposer")
+
+    assert missing.ok is False
+    assert "idempotency key is required" in missing.reason
+    assert guarded.ok is False and guarded.skipped is True
+    assert "live parent chain detected" in guarded.reason
+    assert f"task={root}" in caplog.text
+    llm.assert_not_called()
 
 
 def test_fanout_preserves_exact_metadata_body_bytes(kanban_home):
@@ -204,7 +322,7 @@ def test_fanout_preserves_exact_metadata_body_bytes(kanban_home):
         item.start()
     try:
         with _patch_aux_client(llm_payload):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -237,7 +355,7 @@ def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -280,7 +398,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -332,7 +450,7 @@ def test_no_fanout_skips_when_custody_changes_while_llm_runs(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -383,7 +501,7 @@ def test_fanout_skips_all_children_when_custody_changes_while_llm_runs(
             "agent.auxiliary_client.call_llm",
             side_effect=assign_during_llm,
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -440,7 +558,7 @@ def test_no_fanout_skips_assignment_aba_from_public_transitions(kanban_home):
             "agent.auxiliary_client.call_llm",
             side_effect=assign_and_restore,
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -509,7 +627,7 @@ def test_fanout_skips_assignment_aba_from_public_transitions(kanban_home):
             "agent.auxiliary_client.call_llm",
             side_effect=assign_and_restore,
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -600,7 +718,7 @@ def test_fanout_rejects_profile_removed_during_inference(kanban_home):
         "agent.auxiliary_client.call_llm",
         side_effect=retire_then_answer,
     ):
-        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+        outcome = _decompose(tid, author="auto-decomposer")
 
     assert outcome.ok is False
     assert "has no resolvable profile" in outcome.reason
@@ -650,7 +768,7 @@ def test_no_fanout_rechecks_gate_added_while_llm_runs(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -690,7 +808,7 @@ def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -723,7 +841,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
             "_load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -766,7 +884,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
                     }
                 },
             ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -813,7 +931,7 @@ def test_decompose_fanout_preserves_assigned_root_custody(kanban_home):
         item.start()
     try:
         with _patch_aux_client(payload), _patch_extra_body():
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -836,7 +954,7 @@ def test_control_plane_hold_skips_llm_and_auto_triage_list(kanban_home):
 
     llm = MagicMock()
     with patch("agent.auxiliary_client.call_llm", llm):
-        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+        outcome = _decompose(tid, author="auto-decomposer")
 
     assert outcome.ok is False
     assert "control-plane hold" in outcome.reason
@@ -857,7 +975,7 @@ def test_no_resolvable_profile_fails_loud_without_default_lane(kanban_home):
     for item in patches:
         item.start()
     try:
-        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+        outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -881,7 +999,7 @@ def test_fleet_implicit_default_is_not_a_routable_lane(kanban_home):
         item.start()
     try:
         with patch.object(decomp, "_fleet_named_lanes_only", return_value=True):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -914,7 +1032,7 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
         p.start()
     try:
         with _patch_aux_client("not json at all, sorry"), _patch_extra_body():
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -931,7 +1049,7 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     for p in patches:
         p.start()
     try:
-        outcome = decomp.decompose_task(tid, author="me")
+        outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()
@@ -962,7 +1080,7 @@ def test_decompose_reports_status_race_as_skip(kanban_home):
             "agent.auxiliary_client.call_llm",
             side_effect=move_status_during_llm,
         ):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -978,8 +1096,8 @@ def test_decompose_reports_status_race_as_skip(kanban_home):
     assert task.body is None
 
 
-@pytest.mark.parametrize("task_count", [1, 7])
-def test_decompose_rejects_fanout_outside_two_through_six(
+@pytest.mark.parametrize("task_count", [1, 16])
+def test_decompose_rejects_fanout_outside_two_through_fifteen(
     kanban_home,
     task_count,
 ):
@@ -1005,13 +1123,13 @@ def test_decompose_rejects_fanout_outside_two_through_six(
         item.start()
     try:
         with _patch_aux_client(llm_payload):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
 
     assert outcome.ok is False
-    assert f"{task_count} tasks; expected 2-6" in outcome.reason
+    assert f"{task_count} tasks; expected 2-15" in outcome.reason
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
         task_count_after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
@@ -1060,7 +1178,7 @@ def test_decompose_rejects_invalid_dependency_with_diagnostic(
         item.start()
     try:
         with _patch_aux_client(llm_payload):
-            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decompose(tid, author="auto-decomposer")
     finally:
         for item in patches:
             item.stop()
@@ -1101,7 +1219,7 @@ def test_decompose_no_aux_client_configured(kanban_home):
             "agent.auxiliary_client.call_llm",
             side_effect=RuntimeError("No LLM provider configured"),
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = _decompose(tid, author="me")
     finally:
         for p in patches:
             p.stop()

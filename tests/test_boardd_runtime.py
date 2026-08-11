@@ -350,6 +350,132 @@ def test_native_create_idempotency_preserves_newer_fields_and_empty_key_behavior
 
 
 @pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_native_create_normalized_title_scope_dedup_and_audit(tmp_path: Path):
+    with running_boardd(tmp_path, import_schema=True) as (client, _, _):
+        first = _native_create(
+            client,
+            title="  Fix  ＡPI retry ",
+            status="ready",
+            created_by="Fable",
+            idempotency_key="native-title-attempt-1",
+        )
+        fresh_key_retry = _native_create(
+            client,
+            title="fix api retry",
+            status="running",
+            created_by="Codex7",
+            idempotency_key="native-title-attempt-2",
+        )
+        no_key_retry = _native_create(
+            client,
+            title=" FIX API   RETRY ",
+            status="blocked",
+            created_by="S4",
+        )
+        distinct_workspace = _native_create(
+            client,
+            title="fix api retry",
+            status="ready",
+            workspace_kind="dir",
+            idempotency_key="native-title-dir",
+        )
+
+        assert fresh_key_retry == {
+            "id": first["id"],
+            "status": first["status"],
+            "deduplicated": True,
+        }
+        assert no_key_retry == fresh_key_retry
+        assert distinct_workspace["id"] != first["id"]
+
+        rows = client.query(
+            "SELECT id, title, workspace_kind FROM tasks ORDER BY id",
+            [],
+        )
+        assert len(rows) == 2
+        events = client.query(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "ORDER BY id",
+            [first["id"]],
+        )
+        dedup_payloads = [
+            json.loads(event["payload"])
+            for event in events
+            if event["kind"] == "create_deduplicated"
+        ]
+        assert [payload["reason"] for payload in dedup_payloads] == [
+            "normalized_title_scope",
+            "normalized_title_scope",
+        ]
+        assert all(
+            payload["existing_task_id"] == first["id"]
+            for payload in dedup_payloads
+        )
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_kanban_db_broker_create_dedup_preserves_distinct_parent_scope(
+    tmp_path: Path,
+):
+    """Exercise the exact BrokerConnection path used by kanban_create tools."""
+    with running_boardd(tmp_path, import_schema=True) as (_, db_path, socket_path):
+        result = _run_kanban_db_script(
+            db_path,
+            socket_path,
+            """
+import json
+from hermes_cli import kanban_db as kb
+with kb.connect() as conn:
+    assert type(conn).__name__ == "BrokerConnection"
+    parent_a = kb.create_task(conn, title="broker parent A")
+    parent_b = kb.create_task(conn, title="broker parent B")
+    first = kb.create_task(
+        conn,
+        title="  Broker  ＡPI retry ",
+        parents=[parent_a],
+        tenant="tenant-a",
+        idempotency_key="broker-title-attempt-1",
+    )
+    repeated = kb.create_task(
+        conn,
+        title="broker api retry",
+        parents=[parent_a],
+        tenant="tenant-a",
+        idempotency_key="broker-title-attempt-2",
+    )
+    distinct = kb.create_task(
+        conn,
+        title="BROKER API RETRY",
+        parents=[parent_b],
+        tenant="tenant-a",
+        idempotency_key="broker-title-attempt-3",
+    )
+    events = [
+        event.payload
+        for event in kb.list_events(conn, first)
+        if event.kind == "create_deduplicated"
+    ]
+    count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    print(json.dumps({
+        "first": first,
+        "repeated": repeated,
+        "distinct": distinct,
+        "parent_a": parent_a,
+        "events": events,
+        "count": count,
+    }))
+""",
+        )
+
+    assert result["repeated"] == result["first"]
+    assert result["distinct"] != result["first"]
+    assert result["count"] == 4
+    assert len(result["events"]) == 1
+    assert result["events"][0]["reason"] == "normalized_title_scope"
+    assert result["events"][0]["scope"]["parents"] == [result["parent_a"]]
+
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_native_create_idempotency_ignores_archived_task(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (client, _, _):
         key = "native-archived-key"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import inspect
+import itertools
 import json
 import os
 import sqlite3
@@ -1884,6 +1885,9 @@ def _open_draft_pr(pr: kb.ContinuationPR) -> kb.GitHubPRState:
     )
 
 
+_CONTINUATION_TASK_FIXTURE_IDS = itertools.count()
+
+
 def _create_continuation_task(
     conn: sqlite3.Connection,
     *pr_tuples: str,
@@ -1891,7 +1895,10 @@ def _create_continuation_task(
 ) -> str:
     task_id = kb.create_task(
         conn,
-        title="repair active PR",
+        # One test may need several independent synthetic cards for the same
+        # PR tuple. Keep their create identities distinct now that production
+        # title+scope de-duplication is intentionally unconditional.
+        title=f"repair active PR fixture {next(_CONTINUATION_TASK_FIXTURE_IDS)}",
         body="Resource-Class: light",
         assignee=assignee,
     )

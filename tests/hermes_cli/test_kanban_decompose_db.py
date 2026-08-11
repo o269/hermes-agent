@@ -35,6 +35,11 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
     )
 
 
+def _decompose(conn, task_id: str, **kwargs):
+    kwargs.setdefault("idempotency_key", f"test-decompose:{task_id}")
+    return kb.decompose_triage_task(conn, task_id, **kwargs)
+
+
 def test_decompose_creates_children_and_promotes_root(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a feature")
@@ -45,7 +50,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
     ]
     with kb.connect() as conn:
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orchestrator",
@@ -72,6 +77,165 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+
+
+def test_decompose_requires_nonempty_idempotency_key(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="keyed root")
+        with pytest.raises(ValueError, match="idempotency key is required"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{"title": "child", "assignee": "worker"}],
+                valid_assignees=VALID_ASSIGNEES,
+                idempotency_key=" ",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_live_parent_chain_blocks_decomposition_without_writes(
+    kanban_home,
+    caplog,
+):
+    with kb.connect() as conn:
+        ancestor = kb.create_task(conn, title="live ancestor")
+        parent = kb.create_task(conn, title="live parent", parents=[ancestor])
+        root = kb.create_task(
+            conn,
+            title="must stay whole",
+            parents=[parent],
+            triage=True,
+        )
+        reason = kb.decomposition_hold_reason(conn, root)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        result = _decompose(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "must not exist", "assignee": "worker"}],
+            valid_assignees=VALID_ASSIGNEES,
+        )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        eligible = kb.list_decomposition_eligible_triage_ids(conn)
+
+    assert reason is not None and "live parent chain detected" in reason
+    assert ancestor in reason and parent in reason
+    assert result is None
+    assert before == after
+    assert root not in eligible
+    assert "live parent chain detected" in caplog.text
+    assert f"task_id={root}" in caplog.text
+
+
+def test_decompose_hard_cap_blocks_sixteen_and_logs_guard(
+    kanban_home,
+    caplog,
+):
+    with kb.connect() as conn:
+        root = _create_triage(conn, title="oversized graph")
+        children = [
+            {"title": f"child {index}", "assignee": "worker"}
+            for index in range(kb.MAX_DECOMPOSITION_CHILDREN + 1)
+        ]
+        with pytest.raises(ValueError, match="exceeds hard cap 15"):
+            _decompose(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=children,
+                valid_assignees=VALID_ASSIGNEES,
+            )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert count == 1
+    assert "reason=fanout_cap" in caplog.text
+    assert "requested_children=16" in caplog.text
+
+
+def test_decompose_allows_fifteen_without_live_parents_and_rerun_is_noop(
+    kanban_home,
+):
+    key = "decomposition:legitimate-fifteen"
+    with kb.connect() as conn:
+        done_parent = kb.create_task(conn, title="finished prerequisite")
+        assert kb.complete_task(conn, done_parent)
+        root = kb.create_task(
+            conn,
+            title="legitimate graph",
+            parents=[done_parent],
+            triage=True,
+        )
+        assert root in kb.list_decomposition_eligible_triage_ids(conn)
+        children = [
+            {"title": f"bounded child {index}", "assignee": "worker"}
+            for index in range(kb.MAX_DECOMPOSITION_CHILDREN)
+        ]
+        first = _decompose(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=children,
+            valid_assignees=VALID_ASSIGNEES,
+            idempotency_key=key,
+        )
+        count_after_first = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        second = _decompose(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "replacement must be ignored", "assignee": "worker"}],
+            valid_assignees=VALID_ASSIGNEES,
+            idempotency_key=key,
+        )
+        count_after_second = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        persisted_keys = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE created_by = 'decomposer' "
+            "ORDER BY idempotency_key"
+        ).fetchall()
+
+    assert first is not None and len(first) == kb.MAX_DECOMPOSITION_CHILDREN
+    assert second == first
+    assert count_after_second == count_after_first
+    assert {row["idempotency_key"] for row in persisted_keys} == {
+        f"{key}:{root}:{index}"
+        for index in range(kb.MAX_DECOMPOSITION_CHILDREN)
+    }
+
+
+def test_decomposition_child_keys_are_namespaced_by_root(kanban_home):
+    shared_key = "shared-decomposition-attempt"
+    with kb.connect() as conn:
+        first_root = _create_triage(conn, title="first keyed root")
+        second_root = _create_triage(conn, title="second keyed root")
+        first_children = _decompose(
+            conn,
+            first_root,
+            root_assignee="orchestrator",
+            children=[{"title": "first child", "assignee": "worker"}],
+            valid_assignees=VALID_ASSIGNEES,
+            idempotency_key=shared_key,
+        )
+        second_children = _decompose(
+            conn,
+            second_root,
+            root_assignee="orchestrator",
+            children=[{"title": "second child", "assignee": "worker"}],
+            valid_assignees=VALID_ASSIGNEES,
+            idempotency_key=shared_key,
+        )
+        assert first_children and second_children
+        rows = conn.execute(
+            "SELECT id, idempotency_key FROM tasks "
+            "WHERE id IN (?, ?) ORDER BY id",
+            (first_children[0], second_children[0]),
+        ).fetchall()
+
+    assert first_children != second_children
+    assert {row["idempotency_key"] for row in rows} == {
+        f"{shared_key}:{first_root}:0",
+        f"{shared_key}:{second_root}:0",
+    }
 
 
 def test_assignment_generation_tracks_public_assignment_transitions(kanban_home):
@@ -105,7 +269,7 @@ def test_decompose_preserves_assigned_root_custody_and_triage_status(kanban_home
             title="PR17 cross-agent preflight gate",
             assignee="fable",
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="default",
@@ -129,7 +293,7 @@ def test_decompose_preserves_assigned_root_custody_and_triage_status(kanban_home
 
         # Assigned roots intentionally stay in triage; the decomposed event is
         # the durable replay guard that prevents a second fan-out next tick.
-        second = kb.decompose_triage_task(
+        second = _decompose(
             conn,
             tid,
             root_assignee="fable",
@@ -137,14 +301,14 @@ def test_decompose_preserves_assigned_root_custody_and_triage_status(kanban_home
             valid_assignees={"fable", "engineer"},
             author="auto-decomposer",
         )
-        assert second is None
+        assert second == child_ids
 
 
 def test_decompose_rejects_unroutable_assignee_atomically(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="no resolvable profile"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orchestrator",
@@ -183,7 +347,7 @@ def test_specify_rejects_unroutable_assignee_before_write(kanban_home):
 def test_decompose_returns_none_for_control_plane_gate(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="PR17 [QUIESCE-GATE]")
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="orchestrator",
@@ -263,7 +427,7 @@ def test_active_pr_custody_blocks_decomposition_with_repair_guidance(kanban_home
         assert f"/kanban continuation review {tid}" in reason
         assert f"/kanban continuation authorize {tid}" in reason
 
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="worker",
@@ -383,7 +547,7 @@ def test_batched_triage_eligibility_uses_one_bounded_read(kanban_home):
 
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             "nonexistent",
             root_assignee="orch",
@@ -397,7 +561,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="already a real task")  # not triage
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -411,7 +575,7 @@ def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
 def test_decompose_empty_children_returns_none(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -426,7 +590,7 @@ def test_decompose_rejects_self_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cannot list itself"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -440,7 +604,7 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="not a valid index"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -454,7 +618,7 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cyclic dependency"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -470,7 +634,7 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -496,7 +660,7 @@ def test_decompose_children_inherit_dir_workspace(kanban_home):
             conn, title="codegen root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[{"title": "part A"}, {"title": "part B", "parents": [0]}],
             valid_assignees=VALID_ASSIGNEES,
@@ -517,7 +681,7 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
             conn, title="scratch root", assignee="worker",
             workspace_kind="scratch", triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[{"title": "s1"}],
             valid_assignees=VALID_ASSIGNEES,
@@ -537,7 +701,7 @@ def test_decompose_per_child_workspace_override(kanban_home):
             conn, title="root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[
                 {"title": "override", "workspace_kind": "dir",

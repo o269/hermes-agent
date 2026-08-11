@@ -805,6 +805,7 @@ def test_decompose_atomically_creates_dependency_held_fable_sibling(
         conn,
         root,
         root_assignee="orchestrator",
+        idempotency_key=f"test-decompose:{root}",
         auto_promote=False,
         valid_assignees={"orchestrator", "codex1", "fable"},
         children=[
@@ -839,6 +840,7 @@ def test_decompose_unparented_fable_executor_rolls_back_every_child(
             conn,
             root,
             root_assignee="orchestrator",
+            idempotency_key=f"test-decompose:{root}",
             auto_promote=False,
             valid_assignees={"orchestrator", "codex1", "fable"},
             children=[
@@ -903,6 +905,7 @@ def test_decompose_partial_graph_is_invisible_to_concurrent_reader(
                 worker_conn,
                 root,
                 root_assignee="orchestrator",
+                idempotency_key=f"test-decompose:{root}",
                 auto_promote=False,
                 valid_assignees={"orchestrator", "codex1", "fable"},
                 children=[

@@ -148,6 +148,7 @@ _DECOMPOSITION_HOLD_RE = re.compile(
 )
 _EXPECTED_ASSIGNEE_UNSET = object()
 _EXPECTED_ASSIGNMENT_GENERATION_UNSET = object()
+MAX_DECOMPOSITION_CHILDREN = 15
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3881,6 +3882,128 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_task_title(title: str) -> str:
+    """Return the conservative identity form used by create de-duplication.
+
+    NFKC folds compatibility-equivalent Unicode, whitespace runs collapse, and
+    case differences disappear. Punctuation and control tags stay significant,
+    so ``[REVIEW] Fix X`` and ``[LAND] Fix X`` remain different work.
+    """
+    normalized = unicodedata.normalize("NFKC", str(title or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+def _normalize_task_scope(
+    *,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return the create scope paired with a normalized title.
+
+    The board is implicit in ``conn``. Within it, tenant + dependency-parent
+    set identify the workflow namespace. A first-class project is the location
+    scope; otherwise workspace kind/path are. Creator, assignee, body, status,
+    priority, session, and idempotency key are deliberately excluded so a
+    cross-creator retry (or a retry with a fresh key) cannot mint the same unit
+    of work again.
+    """
+    tenant_scope = str(tenant).strip() if tenant is not None else ""
+    parent_scope = tuple(sorted({str(parent).strip() for parent in parents if parent}))
+    if project_id:
+        location_scope = ("project", str(project_id).strip())
+    else:
+        normalized_path = ""
+        if workspace_path:
+            normalized_path = os.path.normpath(str(workspace_path).strip())
+        location_scope = (
+            "workspace",
+            str(workspace_kind or "scratch").strip().casefold(),
+            normalized_path,
+        )
+    return tenant_scope, parent_scope, location_scope
+
+
+def _find_open_title_scope_duplicate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[Optional[str], tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Return the oldest open task with the same normalized title + scope."""
+    normalized_title = _normalize_task_title(title)
+    target_scope = _normalize_task_scope(
+        tenant=tenant,
+        parents=parents,
+        project_id=project_id,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    rows = conn.execute(
+        "SELECT id, title, tenant, project_id, workspace_kind, workspace_path "
+        "FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        if _normalize_task_title(row["title"] or "") != normalized_title:
+            continue
+        parent_rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (row["id"],),
+        ).fetchall()
+        candidate_scope = _normalize_task_scope(
+            tenant=row["tenant"],
+            parents=(parent["parent_id"] for parent in parent_rows),
+            project_id=row["project_id"],
+            workspace_kind=row["workspace_kind"] or "scratch",
+            workspace_path=row["workspace_path"],
+        )
+        if candidate_scope == target_scope:
+            return str(row["id"]), target_scope
+    return None, target_scope
+
+
+def _record_create_dedup(
+    conn: sqlite3.Connection,
+    *,
+    existing_task_id: str,
+    reason: str,
+    title: str,
+    scope: tuple[str, tuple[str, ...], tuple[str, ...]],
+    attempted_by: Optional[str],
+    idempotency_key_supplied: bool,
+) -> None:
+    """Durably expose every suppressed create re-mint on the existing card."""
+    tenant_scope, parent_scope, location_scope = scope
+    payload = {
+        "existing_task_id": existing_task_id,
+        "reason": reason,
+        "normalized_title": _normalize_task_title(title),
+        "scope": {
+            "tenant": tenant_scope,
+            "parents": list(parent_scope),
+            "location": list(location_scope),
+        },
+        "attempted_by": attempted_by,
+        "idempotency_key_supplied": idempotency_key_supplied,
+    }
+    _append_event(conn, existing_task_id, "create_deduplicated", payload)
+    _log.warning(
+        "kanban create re-mint suppressed existing_task_id=%s reason=%s "
+        "normalized_title=%r scope=%r",
+        existing_task_id,
+        reason,
+        payload["normalized_title"],
+        payload["scope"],
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3920,8 +4043,10 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate. Independently, an open task with the same
+    conservative normalized title + scope (board, tenant, parent set, and
+    project/workspace identity) wins even when the retry supplies a fresh key.
+    Both paths append ``create_deduplicated`` to the existing task timeline.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -4043,21 +4168,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -4085,6 +4195,59 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Both idempotency-key and title+scope checks live under the
+                # same BEGIN IMMEDIATE as the insert. Concurrent creators can
+                # no longer both observe absence and mint two open cards.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        existing_id = str(row["id"])
+                        _, scope = _find_open_title_scope_duplicate(
+                            conn,
+                            title=title,
+                            tenant=tenant,
+                            parents=parents,
+                            project_id=project_id,
+                            workspace_kind=workspace_kind,
+                            workspace_path=workspace_path,
+                        )
+                        _record_create_dedup(
+                            conn,
+                            existing_task_id=existing_id,
+                            reason="idempotency_key",
+                            title=title,
+                            scope=scope,
+                            attempted_by=created_by,
+                            idempotency_key_supplied=True,
+                        )
+                        return existing_id
+
+                duplicate_id, scope = _find_open_title_scope_duplicate(
+                    conn,
+                    title=title,
+                    tenant=tenant,
+                    parents=parents,
+                    project_id=project_id,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                )
+                if duplicate_id is not None:
+                    _record_create_dedup(
+                        conn,
+                        existing_task_id=duplicate_id,
+                        reason="normalized_title_scope",
+                        title=title,
+                        scope=scope,
+                        attempted_by=created_by,
+                        idempotency_key_supplied=bool(idempotency_key),
+                    )
+                    return duplicate_id
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -7770,6 +7933,7 @@ def specify_triage_task(
         Iterable[str] | Callable[[], Iterable[str]]
     ] = None,
     decomposition_guard: bool = False,
+    decomposition_idempotency_key: Optional[str] = None,
     expected_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
     expected_assignment_generation: object = _EXPECTED_ASSIGNMENT_GENERATION_UNSET,
 ) -> bool:
@@ -7794,9 +7958,15 @@ def specify_triage_task(
     assignee and assignment generation must still exactly match the pre-LLM
     snapshot; a mismatch returns ``False`` before title, body, status, comments,
     or events are mutated. The monotonic generation closes assignee-value ABA.
+    Decomposer calls must supply a non-empty idempotency key, which is persisted
+    on the ``decomposed`` event even when fan-out is unnecessary.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
+    if decomposition_guard and not str(decomposition_idempotency_key or "").strip():
+        raise ValueError("decomposition idempotency key is required")
+    if decomposition_idempotency_key is not None:
+        decomposition_idempotency_key = str(decomposition_idempotency_key).strip()
     requested_assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
@@ -7807,8 +7977,15 @@ def specify_triage_task(
         if existing is None:
             return False
         # --- decomposition_guard logic (backward compat from main) ---
-        if decomposition_guard and decomposition_hold_reason(conn, task_id) is not None:
-            return False
+        if decomposition_guard:
+            hold_reason = decomposition_hold_reason(conn, task_id)
+            if hold_reason is not None:
+                _log.warning(
+                    "kanban decomposition blocked task_id=%s reason=%s",
+                    task_id,
+                    hold_reason,
+                )
+                return False
         existing_assignee = _canonical_assignee(existing["assignee"])
         if decomposition_guard and expected_assignee is not _EXPECTED_ASSIGNEE_UNSET:
             expected_canonical = _canonical_assignee(
@@ -7928,6 +8105,7 @@ def specify_triage_task(
                     "fanout": False,
                     "child_ids": [],
                     "custody_preserved": preserve_status,
+                    "idempotency_key": decomposition_idempotency_key,
                 },
             )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
@@ -7939,6 +8117,67 @@ def specify_triage_task(
     if not preserve_status:
         recompute_ready(conn)
     return True
+
+
+def decomposition_result_for_key(
+    conn: sqlite3.Connection,
+    task_id: str,
+    idempotency_key: str,
+) -> Optional[list[str]]:
+    """Return the first decomposition result for ``key``, or ``None``.
+
+    A present empty list is meaningful: it is the successful no-fanout result.
+    This lookup lets retries return before another LLM call or graph write.
+    """
+    key = str(idempotency_key or "").strip()
+    if not key:
+        return None
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposed' ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("idempotency_key") != key:
+            continue
+        child_ids = payload.get("child_ids")
+        if isinstance(child_ids, list) and all(
+            isinstance(child_id, str) for child_id in child_ids
+        ):
+            return list(child_ids)
+    return None
+
+
+def _live_parent_chain(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[tuple[str, str]]:
+    """Return every live/missing ancestor in ``task_id``'s parent chain."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE ancestors(id) AS (
+            SELECT parent_id FROM task_links WHERE child_id = ?
+            UNION
+            SELECT links.parent_id
+            FROM task_links AS links
+            JOIN ancestors ON links.child_id = ancestors.id
+        )
+        SELECT ancestors.id, tasks.status
+        FROM ancestors
+        LEFT JOIN tasks ON tasks.id = ancestors.id
+        WHERE tasks.id IS NULL OR tasks.status NOT IN ('done', 'archived')
+        ORDER BY ancestors.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [
+        (str(row["id"]), str(row["status"] or "missing"))
+        for row in rows
+    ]
 
 
 def decomposition_hold_reason(
@@ -7967,6 +8206,15 @@ def decomposition_hold_reason(
     ).fetchone()
     if prior is not None:
         return "already decomposed"
+
+    live_parents = _live_parent_chain(conn, task_id)
+    if live_parents:
+        rendered = ", ".join(
+            f"{parent_id}({status})" for parent_id, status in live_parents[:5]
+        )
+        if len(live_parents) > 5:
+            rendered += f", +{len(live_parents) - 5} more"
+        return f"live parent chain detected: {rendered}"
 
     active_prs = _active_pr_custody(
         conn,
@@ -8015,12 +8263,20 @@ def list_decomposition_eligible_triage_ids(
     params.extend((bounded_limit, cutoff))
     rows = conn.execute(
         f"""
-        WITH candidates AS (
+        WITH RECURSIVE candidates AS (
             SELECT t.id, t.title, t.body, t.priority, t.created_at
             FROM tasks AS t
             WHERE t.status = 'triage'{tenant_clause}
             ORDER BY t.priority DESC, t.created_at ASC
             LIMIT ?
+        ), ancestor_chain(root_id, ancestor_id) AS (
+            SELECT c.id, links.parent_id
+            FROM candidates AS c
+            JOIN task_links AS links ON links.child_id = c.id
+            UNION
+            SELECT chain.root_id, links.parent_id
+            FROM ancestor_chain AS chain
+            JOIN task_links AS links ON links.child_id = chain.ancestor_id
         )
         SELECT c.id, c.title, c.body,
                EXISTS (
@@ -8032,7 +8288,17 @@ def list_decomposition_eligible_triage_ids(
                    WHERE own.task_id = c.id
                      AND own.last_seen_at >= ?
                      AND own.declared = 1
-               ) AS has_active_pr
+               ) AS has_active_pr,
+               EXISTS (
+                   SELECT 1
+                   FROM ancestor_chain AS chain
+                   LEFT JOIN tasks AS ancestor ON ancestor.id = chain.ancestor_id
+                   WHERE chain.root_id = c.id
+                     AND (
+                         ancestor.id IS NULL
+                         OR ancestor.status NOT IN ('done', 'archived')
+                     )
+               ) AS has_live_parent_chain
         FROM candidates AS c
         ORDER BY c.priority DESC, c.created_at ASC
         """,
@@ -8043,6 +8309,7 @@ def list_decomposition_eligible_triage_ids(
         for row in rows
         if not bool(row["was_decomposed"])
         and not bool(row["has_active_pr"])
+        and not bool(row["has_live_parent_chain"])
         and _DECOMPOSITION_HOLD_RE.search(row["title"] or "") is None
         and _DECOMPOSITION_HOLD_RE.search(row["body"] or "") is None
     ]
@@ -8138,6 +8405,7 @@ def decompose_triage_task(
     root_assignee: Optional[str],
     children: list[dict],
     valid_assignees: Iterable[str] | Callable[[], Iterable[str]],
+    idempotency_key: str,
     author: Optional[str] = None,
     auto_promote: bool = True,
     expected_root_assignee: object = _EXPECTED_ASSIGNEE_UNSET,
@@ -8169,12 +8437,35 @@ def decompose_triage_task(
     snapshot. The transactional helper compares both before any child creation;
     the monotonic generation makes even ``None -> name -> None`` a miss.
 
+    ``idempotency_key`` is mandatory. It is persisted on the root event and
+    namespaces every child key as ``<key>:<root-id>:<index>``. Re-running the
+    same key returns the original child ids without validating or writing the
+    replacement graph.
+
     Returns the list of created child task ids (in input order) on success.
     Returns ``None`` when the root is missing, no longer in ``triage``, already
     decomposed, or protected by a control-plane hold.
     """
+    idempotency_key = str(idempotency_key or "").strip()
+    if not idempotency_key:
+        raise ValueError("decomposition idempotency key is required")
+    repeated = decomposition_result_for_key(conn, task_id, idempotency_key)
+    if repeated is not None:
+        return repeated
     if not children:
         return None
+    if len(children) > MAX_DECOMPOSITION_CHILDREN:
+        _log.warning(
+            "kanban decomposition blocked task_id=%s reason=fanout_cap "
+            "requested_children=%d max_children=%d",
+            task_id,
+            len(children),
+            MAX_DECOMPOSITION_CHILDREN,
+        )
+        raise ValueError(
+            f"decomposition fan-out {len(children)} exceeds hard cap "
+            f"{MAX_DECOMPOSITION_CHILDREN}"
+        )
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -8230,6 +8521,9 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        repeated = decomposition_result_for_key(conn, task_id, idempotency_key)
+        if repeated is not None:
+            return repeated
         root_row = conn.execute(
             "SELECT id, status, assignee, assignment_generation, tenant, "
             "workspace_kind, workspace_path "
@@ -8242,6 +8536,11 @@ def decompose_triage_task(
             return None
         hold_reason = decomposition_hold_reason(conn, task_id)
         if hold_reason is not None:
+            _log.warning(
+                "kanban decomposition blocked task_id=%s reason=%s",
+                task_id,
+                hold_reason,
+            )
             return None
 
         existing_root_assignee = _canonical_assignee(root_row["assignee"])
@@ -8330,8 +8629,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, idempotency_key) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -8342,6 +8641,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    f"{idempotency_key}:{task_id}:{idx}",
                 ),
             )
             _append_event(
@@ -8407,6 +8707,7 @@ def decompose_triage_task(
                 "root_assignee": effective_root_assignee,
                 "root_status": effective_root_status,
                 "custody_preserved": preserve_root_custody,
+                "idempotency_key": idempotency_key,
             },
         )
 
