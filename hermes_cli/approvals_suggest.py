@@ -177,12 +177,14 @@ def _iter_terminal_calls(
             for call in calls:
                 if not isinstance(call, dict):
                     continue
-                fn = call.get("function") or {}
-                if fn.get("name") != "terminal":
+                fn = call.get("function")
+                if not isinstance(fn, dict) or fn.get("name") != "terminal":
                     continue
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                 except (TypeError, ValueError):
+                    continue
+                if not isinstance(args, dict):
                     continue
                 command = args.get("command")
                 if isinstance(command, str) and command.strip():

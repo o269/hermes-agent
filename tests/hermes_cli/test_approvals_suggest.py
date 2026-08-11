@@ -14,6 +14,7 @@ import json
 import sqlite3
 import time
 from argparse import Namespace
+from typing import TypedDict
 
 import pytest
 
@@ -54,6 +55,11 @@ def _make_db(path):
     return con
 
 
+class _AllowlistStore(TypedDict):
+    patterns: set[str]
+    saves: int
+
+
 _ID_COUNTER = [0]
 
 
@@ -87,6 +93,17 @@ def _add_terminal_call(con, command, result="ok: done", ts=None):
     con.commit()
 
 
+def _add_raw_tool_calls(con, calls, ts=None):
+    """Insert an assistant row with caller-controlled tool-call payloads."""
+    ts = ts if ts is not None else time.time()
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) "
+        "VALUES ('s1', 'assistant', '', ?, ?)",
+        (json.dumps(calls), ts),
+    )
+    con.commit()
+
+
 @pytest.fixture
 def db_path(tmp_path):
     path = tmp_path / "state.db"
@@ -98,12 +115,12 @@ def db_path(tmp_path):
 @pytest.fixture
 def isolated_allowlist(monkeypatch):
     """Fake config-backed allowlist store so no real config.yaml is touched."""
-    store = {"patterns": set(), "saves": 0}
+    store: _AllowlistStore = {"patterns": set(), "saves": 0}
 
-    def fake_load():
+    def fake_load() -> set[str]:
         return set(store["patterns"])
 
-    def fake_save(patterns):
+    def fake_save(patterns: set[str]) -> None:
         store["patterns"] = set(patterns)
         store["saves"] += 1
 
@@ -157,6 +174,67 @@ class TestScan:
         _add_terminal_call(con, "git push --force origin main")
         assert len(scan_approval_history(path, days=90)) == 1
         assert len(scan_approval_history(path, days=0)) == 2
+
+    def test_non_dict_decoded_arguments_are_skipped(self, db_path):
+        path, con = db_path
+        malformed_arguments = [
+            json.dumps(json.dumps({"command": "git push --force origin bad"})),
+            json.dumps(["git push --force origin bad"]),
+            json.dumps(42),
+            json.dumps(None),
+        ]
+        calls = [
+            {
+                "id": f"bad_args_{index}",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": arguments},
+            }
+            for index, arguments in enumerate(malformed_arguments)
+        ]
+        calls.append(
+            {
+                "id": "valid_after_bad_args",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps(
+                        {"command": "git push --force origin main"}
+                    ),
+                },
+            }
+        )
+        _add_raw_tool_calls(con, calls)
+
+        records = scan_approval_history(path, days=0)
+
+        assert [command for command, _description in records] == [
+            "git push --force origin main"
+        ]
+
+    def test_non_dict_function_payload_is_skipped(self, db_path):
+        path, con = db_path
+        _add_raw_tool_calls(
+            con,
+            [
+                {"id": "bad_function", "type": "function", "function": "terminal"},
+                {
+                    "id": "valid_after_bad_function",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps(
+                            {"command": "git push --force origin main"}
+                        ),
+                    },
+                },
+            ],
+        )
+
+        records = scan_approval_history(path, days=0)
+
+        assert [command for command, _description in records] == [
+            "git push --force origin main"
+        ]
 
     def test_missing_db_returns_empty(self, tmp_path):
         assert scan_approval_history(tmp_path / "nope.db", days=0) == []
