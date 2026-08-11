@@ -526,11 +526,14 @@ def test_dashboard_direct_running_to_ready_preserves_review_origin(
         assert closed.outcome == "reclaimed"
         assert closed.ended_at is not None
         assert closed.dispatch_origin == "review"
-        assert closed.summary == "status changed to review (dashboard/direct)"
+        assert closed.summary == "status changed to review (direct)"
         assert open_runs is not None and int(open_runs["n"]) == 0
         assert status_event is not None
         assert status_event["run_id"] == review_run.id
-        assert json.loads(status_event["payload"]) == {"status": "review"}
+        assert json.loads(status_event["payload"]) == {
+            "status": "review",
+            "requested_status": "ready",
+        }
 
         assert kb.claim_task(conn, task_id, claimer="test-host:author") is None
         review_retry = kb.claim_review_task(
