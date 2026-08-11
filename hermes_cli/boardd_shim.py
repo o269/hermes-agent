@@ -14,7 +14,8 @@ kanban_db's own import, before any dependent module finishes `from … import �
 Coverage (delegated to boardd, exactly-once via op_id):
   connect / connect_closing (→ BrokerConnection) and the core op functions
   create_task, add_comment, claim_task, heartbeat_worker, set_workspace_path,
-  set_branch_name. Lifecycle hooks fire CLIENT-SIDE (off the broker DB thread).
+  set_branch_name, set_status. Lifecycle hooks fire CLIENT-SIDE (off the broker
+  DB thread).
 
 Anything NOT yet covered fails LOUDLY (NotImplementedError) instead of silently
 corrupting: a raw multi-statement write_txn on a BrokerConnection, create_task
@@ -107,7 +108,7 @@ def _cov(op):
         site = f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}"
         break
     try:
-        with open(_COV_PATH, "a") as fh:
+        with open(_COV_PATH, "a", encoding="utf-8") as fh:
             fh.write(f"{op}\t{site}\n")
     except Exception:
         pass
@@ -165,6 +166,7 @@ def _c():
 _KDB = None
 _ORIG_CONNECT = None
 _ORIG_CONNECT_CLOSING = None
+_ORIG_SET_STATUS = None
 
 _route_log = logging.getLogger("boardd_shim")
 
@@ -173,7 +175,7 @@ def _capture_original(kdb):
     """Record the resolver module + its REAL connect/connect_closing before the
     rebind repoints them at this shim, without poisoning a genuine prior capture
     when invoked after an existing rebind."""
-    global _KDB, _ORIG_CONNECT, _ORIG_CONNECT_CLOSING
+    global _KDB, _ORIG_CONNECT, _ORIG_CONNECT_CLOSING, _ORIG_SET_STATUS
     _KDB = kdb
     if kdb.connect is connect or kdb.connect_closing is connect_closing:
         # kdb is already rebound to this shim (sitecustomize at
@@ -185,6 +187,7 @@ def _capture_original(kdb):
         return
     _ORIG_CONNECT = kdb.connect
     _ORIG_CONNECT_CLOSING = kdb.connect_closing
+    _ORIG_SET_STATUS = getattr(kdb, "set_status", None)
 
 
 def _resolver():
@@ -284,8 +287,12 @@ class BrokerConnection:
     one unsupported form (unused by write_txn) and raises loudly."""
     row_factory = None
 
-    def __init__(self):
+    def __init__(self, client=None):
         self._txn = None  # open broker txn token, or None (autocommit)
+        self._bound_client = client
+
+    def _client(self):
+        return self._bound_client or _c()
 
     def execute(self, sql, params=()):
         s = (sql or "").strip()
@@ -295,31 +302,31 @@ class BrokerConnection:
             if self._txn is not None:
                 raise sqlite3.OperationalError(
                     "cannot start a transaction within a transaction")
-            self._txn = _x(_c().txn_begin)
+            self._txn = _x(self._client().txn_begin)
             return _Cursor()
         if first in ("commit", "end"):
             if self._txn is not None:
                 tok, self._txn = self._txn, None
-                _x(_c().txn_commit, tok)
+                _x(self._client().txn_commit, tok)
             return _Cursor()
         if first == "rollback":
             if self._txn is not None:
                 tok, self._txn = self._txn, None
-                _x(_c().txn_rollback, tok)
+                _x(self._client().txn_rollback, tok)
             return _Cursor()
         if first in ("savepoint", "release"):
             raise NotImplementedError(
                 "BrokerConnection: SAVEPOINT/RELEASE unsupported (unused by "
                 "write_txn). Route this call site through an op function.")
         if self._txn is not None:            # statement inside an open txn
-            r = _x(_c().txn_exec, self._txn, sql, list(params))
+            r = _x(self._client().txn_exec, self._txn, sql, list(params))
             return _Cursor(rows=r.get("rows") or [], rowcount=r.get("rowcount", -1),
                            lastrowid=r.get("lastrowid"))
         # autocommit
         if first in ("select", "with", "explain", "values", "pragma"):
-            return _Cursor(rows=_x(_c().query, sql, list(params)))
+            return _Cursor(rows=_x(self._client().query, sql, list(params)))
         if first in ("update", "insert", "delete"):
-            r = _x(_c().exec_write, sql, list(params))
+            r = _x(self._client().exec_write, sql, list(params))
             return _Cursor(rowcount=r.get("rowcount", -1),
                            lastrowid=r.get("lastrowid"))
         raise NotImplementedError(f"BrokerConnection: unsupported SQL {first!r}")
@@ -336,18 +343,18 @@ class BrokerConnection:
     def commit(self):
         if self._txn is not None:
             tok, self._txn = self._txn, None
-            _x(_c().txn_commit, tok)
+            _x(self._client().txn_commit, tok)
 
     def rollback(self):
         if self._txn is not None:
             tok, self._txn = self._txn, None
-            _x(_c().txn_rollback, tok)
+            _x(self._client().txn_rollback, tok)
 
     def close(self):
         # a dangling open txn (caller leaked the connection) — roll back.
         if self._txn is not None:
             try:
-                _c().txn_rollback(self._txn)
+                self._client().txn_rollback(self._txn)
             except Exception:
                 pass
             self._txn = None
@@ -361,10 +368,10 @@ class BrokerConnection:
         if self._txn is not None:
             tok, self._txn = self._txn, None
             if exc_type is None:
-                _x(_c().txn_commit, tok)
+                _x(self._client().txn_commit, tok)
             else:
                 try:
-                    _x(_c().txn_rollback, tok)
+                    _x(self._client().txn_rollback, tok)
                 except Exception:
                     pass
         return False
@@ -427,9 +434,29 @@ def set_branch_name(conn, task_id, branch_name):
     return None
 
 
+def set_status(conn, task_id, status):
+    """Route status writes through the captured lifecycle authority.
+
+    The boardd-native operation only changed ``tasks.status`` and leaked manual
+    claim/run custody. Broker connections execute the canonical implementation
+    over interactive transactions; pass-through SQLite connections retain that
+    same original implementation without touching boardd.
+    """
+    if _ORIG_SET_STATUS is None:
+        raise RuntimeError(
+            "boardd_shim.set_status: original kanban_db.set_status was not "
+            "captured"
+        )
+    if not isinstance(conn, BrokerConnection):
+        return _ORIG_SET_STATUS(conn, task_id, status)
+    _cov("set_status")
+    return _ORIG_SET_STATUS(conn, task_id, status)
+
+
 def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
     _cov("heartbeat_worker")
-    return bool(_c().heartbeat(task_id, note=note).get("ok", False))
+    client = conn._client() if isinstance(conn, BrokerConnection) else _c()
+    return bool(client.heartbeat(task_id, note=note).get("ok", False))
 
 
 # NOTE: create_task is deliberately NOT rebound. The REAL create_task (with its
@@ -444,10 +471,11 @@ def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
 def claim_task(conn, task_id, *, ttl_seconds=None, claimer=None):
     _cov("claim_task")
     import hermes_cli.kanban_db as kdb  # for Task type + hook (client-side)
-    r = _c().claim(task_id, claimer=claimer, ttl_seconds=ttl_seconds or 7200)
+    client = conn._client() if isinstance(conn, BrokerConnection) else _c()
+    r = client.claim(task_id, claimer=claimer, ttl_seconds=ttl_seconds or 7200)
     if not r.get("won"):
         return None
-    task = _row_to_task(kdb, _c().get_task(task_id))
+    task = _row_to_task(kdb, client.get_task(task_id))
     # Fire the lifecycle hook CLIENT-SIDE (off the broker DB thread), preserving
     # the original post-commit side effect (notifications) while keeping the
     # broker's DB path free of external calls (HARD RULE).
@@ -483,7 +511,7 @@ def _row_to_task(kdb, row):
 # also runs as the real function via the interactive txn on the BrokerConnection.
 REBIND_NAMES = (
     "connect", "connect_closing", "add_comment", "claim_task",
-    "heartbeat_worker", "set_workspace_path", "set_branch_name",
+    "heartbeat_worker", "set_workspace_path", "set_branch_name", "set_status",
 )
 
 
@@ -506,4 +534,5 @@ def install_rebind(kdb):
     kdb.heartbeat_worker = heartbeat_worker
     kdb.set_workspace_path = set_workspace_path
     kdb.set_branch_name = set_branch_name
+    kdb.set_status = set_status
     kdb._check_file_length_invariant = noop_flen
