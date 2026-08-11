@@ -10397,6 +10397,7 @@ _DISPOSITION_EVENT_DETAIL_KEYS = (
     "source_status",
     "window_seconds",
 )
+_NONSPAWNABLE_DISPOSITION_EVENT_INTERVAL_SECONDS = 300
 
 
 def _compact_dispatch_disposition_detail(
@@ -10421,9 +10422,15 @@ def _record_ready_disposition(
     *,
     reason: Optional[str] = None,
     detail: Optional[Mapping[str, Any]] = None,
+    event_interval_seconds: Optional[int] = None,
     dry_run: bool,
 ) -> None:
-    """Record one Ready-card result and persist a compact real-tick event."""
+    """Record one Ready-card result and persist a compact real-tick event.
+
+    ``event_interval_seconds`` only rate-limits repeated, byte-equivalent audit
+    payloads. The in-memory disposition remains present on every tick so callers
+    always receive an exact explanation for each Ready candidate.
+    """
     diagnostic = dict(detail or {})
     result.add_disposition(
         task_id,
@@ -10439,6 +10446,26 @@ def _record_ready_disposition(
     compact_detail = _compact_dispatch_disposition_detail(diagnostic)
     if compact_detail:
         payload["detail"] = compact_detail
+    if event_interval_seconds and event_interval_seconds > 0:
+        latest = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'dispatch_disposition' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest is not None:
+            try:
+                latest_payload = (
+                    json.loads(latest["payload"]) if latest["payload"] else None
+                )
+            except (json.JSONDecodeError, TypeError):
+                latest_payload = None
+            if (
+                latest_payload == payload
+                and int(time.time()) - int(latest["created_at"])
+                < event_interval_seconds
+            ):
+                return
     with write_txn(conn):
         _append_event(conn, task_id, "dispatch_disposition", payload)
 
@@ -14090,6 +14117,9 @@ def _dispatch_once_locked(
                 "skipped",
                 reason="nonspawnable_assignee",
                 detail={"assignee": row_assignee},
+                event_interval_seconds=(
+                    _NONSPAWNABLE_DISPOSITION_EVENT_INTERVAL_SECONDS
+                ),
                 dry_run=dry_run,
             )
             continue

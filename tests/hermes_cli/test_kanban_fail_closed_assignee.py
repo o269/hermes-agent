@@ -103,7 +103,12 @@ def test_resolvable_named_assignee_still_spawns(kanban_home):
         return 424242
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="real lane", assignee="worker")
+        task_id = kb.create_task(
+            conn,
+            title="real lane",
+            assignee="worker",
+            body="Resource-Class: light\nFail-closed assignee regression.",
+        )
         result = kb.dispatch_once(conn, spawn_fn=spawn)
         events = _dispositions(conn, task_id)
         row = conn.execute(
@@ -150,7 +155,12 @@ def test_kanban_default_assignee_named_profile_still_auto_assigns(kanban_home):
         return 99
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="unassigned", assignee=None)
+        task_id = kb.create_task(
+            conn,
+            title="unassigned",
+            assignee=None,
+            body="Resource-Class: light\nFail-closed assignee regression.",
+        )
         result = kb.dispatch_once(
             conn,
             spawn_fn=spawn,
@@ -189,12 +199,25 @@ def test_has_spawnable_ready_false_for_default_only_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
-def test_disposition_payload_is_compact_json_serializable(kanban_home):
+def test_disposition_payload_is_compact_json_serializable_and_rate_limited(
+    kanban_home,
+    monkeypatch,
+):
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="audit", assignee="default")
-        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+        first = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+        second = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
         events = _dispositions(conn, task_id)
 
+    assert [entry.reason for entry in first.dispositions] == [
+        "nonspawnable_assignee"
+    ]
+    assert [entry.reason for entry in second.dispositions] == [
+        "nonspawnable_assignee"
+    ]
+    assert len(events) == 1
     payload = events[0].payload
     encoded = json.dumps(payload)
     assert "default" in encoded
@@ -202,3 +225,17 @@ def test_disposition_payload_is_compact_json_serializable(kanban_home):
     # No secret-bearing keys.
     assert "OPENROUTER" not in encoded
     assert "api_key" not in encoded.lower()
+
+    monkeypatch.setattr(
+        kb.time,
+        "time",
+        lambda: now + kb._NONSPAWNABLE_DISPOSITION_EVENT_INTERVAL_SECONDS,
+    )
+    with kb.connect() as conn:
+        third = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+        events = _dispositions(conn, task_id)
+
+    assert [entry.reason for entry in third.dispositions] == [
+        "nonspawnable_assignee"
+    ]
+    assert len(events) == 2

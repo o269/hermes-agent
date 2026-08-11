@@ -608,12 +608,13 @@ def test_default_spawn_passes_lease_fd_to_local_worker(
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(kb, "_read_worker_process_identity", lambda _pid: (None, None, None))
     monkeypatch.setattr(kb, "worker_log_rotation_config", lambda: (1024, 1))
+    (kanban_home / "profiles" / "worker").mkdir(parents=True)
 
     task = kb.Task(
         id="t_heavy_fd",
         title="heavy fd",
         body=None,
-        assignee="default",
+        assignee="worker",
         status="running",
         priority=0,
         created_by="test",
