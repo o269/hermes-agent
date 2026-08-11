@@ -45,6 +45,58 @@ def test_set_status_running_sets_sticky_claim(conn):
     assert t_running.claim_expires is not None
     assert t_running.claim_expires > 1000000000
     assert t_running.last_heartbeat_at is not None
+    assert t_running.current_run_id is not None
+    run = kb.get_run(conn, t_running.current_run_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.claim_lock == "seat-sticky"
+
+
+def test_set_status_running_to_ready_releases_dispatch_candidate(conn):
+    """The exact p174 regression: ready must never retain seat-sticky custody."""
+    task_id = kb.create_task(conn, title="manual then queued", assignee="worker1")
+    assert kb.set_status(conn, task_id, "running") is True
+    active = kb.get_task(conn, task_id)
+    assert active is not None and active.current_run_id is not None
+    run_id = active.current_run_id
+
+    assert kb.set_status(conn, task_id, "ready") is True
+
+    queued = kb.get_task(conn, task_id)
+    closed = kb.get_run(conn, run_id)
+    assert queued is not None
+    assert queued.status == "ready"
+    assert queued.claim_lock is None
+    assert queued.claim_expires is None
+    assert queued.current_run_id is None
+    assert closed is not None
+    assert closed.outcome == "reclaimed"
+    assert closed.ended_at is not None
+
+    # claim_task is the dispatcher's final ready->running CAS.  Winning here
+    # proves the row is no longer absent behind ``claim_lock IS NULL``.
+    claimed = kb.claim_task(conn, task_id, claimer="test-dispatcher")
+    assert claimed is not None
+    assert claimed.status == "running"
+
+
+def test_set_status_repairs_already_ready_stale_claim(conn):
+    """Re-applying ready repairs rows corrupted by the retired native op."""
+    task_id = kb.create_task(conn, title="stale ready", assignee="worker1")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = 'seat-sticky', claim_expires = ? "
+            "WHERE id = ? AND status = 'ready'",
+            (2_101_406_907, task_id),
+        )
+
+    assert kb.set_status(conn, task_id, "ready") is True
+    repaired = kb.get_task(conn, task_id)
+    assert repaired is not None
+    assert repaired.status == "ready"
+    assert repaired.claim_lock is None
+    assert repaired.claim_expires is None
+    assert kb.claim_task(conn, task_id, claimer="test-dispatcher") is not None
 
 
 def test_set_status_review(conn):

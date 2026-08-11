@@ -7504,31 +7504,201 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
-    """Set a task's status directly or via broker.
+    """Policy-complete direct status transition for every UI/client surface.
 
-    For status='running', sets claim_lock='seat-sticky', claim_expires=now+315360000,
-    and last_heartbeat_at=now so manual sessions don't lapse or get flagged.
+    ``running`` is entered through the normal claim authority so a manual run has
+    the same task/run bookkeeping and dependency/continuation guards as a
+    dispatcher run.  A long-lived ``seat-sticky`` lease identifies the manual
+    owner, while the ordinary stale-heartbeat reconciler still reclaims abandoned
+    work.
+
+    Every transition *off* ``running`` closes all open runs and clears the task's
+    denormalized claim fields.  The cleanup also repairs non-running rows left
+    with a stale claim by the retired boardd-native ``set_status`` operation.  A
+    queue row is therefore either claimable or rejected by a visible policy gate;
+    it can no longer disappear from dispatch solely because ``claim_lock`` leaked.
     """
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-    now = int(time.time())
-    with write_txn(conn):
-        if status == "running":
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', started_at = COALESCE(started_at, ?), "
-                "last_heartbeat_at = ?, claim_lock = 'seat-sticky', claim_expires = ? "
-                "WHERE id = ?",
-                (now, now, now + 315360000, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-                (status, now, task_id),
-            )
-        if cur.rowcount > 0:
-            _append_event(conn, task_id, "status_changed", {"status": status})
-            return True
+
+    current = get_task(conn, task_id)
+    if current is None:
         return False
+
+    if status == "running":
+        if current.status == "running":
+            # Never steal or rewrite a dispatcher-owned lease.  Repeating the
+            # manual transition is an idempotent heartbeat only for its own
+            # explicit seat-sticky claim.
+            if current.claim_lock != "seat-sticky":
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual status refresh",
+                expected_run_id=current.current_run_id,
+            )
+        if current.status == "ready":
+            claimed = claim_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+            if claimed is None:
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual status claim",
+                expected_run_id=claimed.current_run_id,
+            )
+        if current.status == "review":
+            claimed = claim_review_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+            if claimed is None:
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual review status claim",
+                expected_run_id=claimed.current_run_id,
+            )
+        raise ValueError(
+            "status 'running' requires a ready or review task; "
+            "use the structured transition into a queue first"
+        )
+
+    recompute_after = False
+    with write_txn(conn):
+        prev = conn.execute(
+            "SELECT status, dispatch_origin, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        open_run = conn.execute(
+            "SELECT id, dispatch_origin FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        was_running = prev["status"] == "running"
+        effective_status = status
+        if was_running and status == "ready":
+            origin = (
+                open_run["dispatch_origin"]
+                if open_run is not None and open_run["dispatch_origin"] is not None
+                else prev["dispatch_origin"]
+            )
+            effective_status = _dispatch_retry_status(origin)
+
+        # A non-running row must never retain lease/run custody, even when the
+        # requested transition later fails a policy check.  This repairs the
+        # exact ready+seat-sticky corruption that made cards invisible to the
+        # dispatch candidate query.
+        stale_nonrunning_custody = prev["status"] != "running" and (
+            prev["current_run_id"] is not None
+            or prev["claim_lock"] is not None
+            or prev["claim_expires"] is not None
+            or prev["worker_pid"] is not None
+            or open_run is not None
+        )
+        run_id: Optional[int] = None
+        if stale_nonrunning_custody:
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="repaired stale custody before direct status transition",
+            )
+
+        # Ready is a real queue, not a visual label: refuse a new ready
+        # transition until every dependency is terminal.  Archived parents count
+        # as satisfied everywhere else in the state machine, so include them.
+        if effective_status == "ready":
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone_parent is not None:
+                return False
+
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and effective_status not in {"done", "archived"}
+        )
+
+        if was_running:
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary=f"status changed to {effective_status} (direct)",
+            )
+
+        clean_noop = (
+            prev["status"] == effective_status
+            and not stale_nonrunning_custody
+            and not was_running
+        )
+        if clean_noop:
+            return True
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ?",
+            (effective_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        payload: dict[str, Any] = {"status": effective_status}
+        if effective_status != status:
+            payload["requested_status"] = status
+        if stale_nonrunning_custody:
+            payload["repaired_stale_custody"] = True
+        _append_event(conn, task_id, "status", payload, run_id=run_id)
+
+        if reopening_satisfied_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {
+                            "status": "todo",
+                            "reason": "parent_reopened",
+                            "parent": task_id,
+                        },
+                    )
+        recompute_after = effective_status in {"done", "archived", "ready"}
+
+    if recompute_after:
+        recompute_ready(conn)
+    return True
 
 
 def specify_triage_task(

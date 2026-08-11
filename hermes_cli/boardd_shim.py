@@ -499,13 +499,21 @@ def set_branch_name(conn, task_id, branch_name):
 
 
 def set_status(conn, task_id, status):
+    """Route every brokered status transition through kanban_db authority.
+
+    The boardd-native operation updates only ``tasks.status`` and historically
+    leaked ``claim_lock`` when a running/manual card was returned to ``ready``.
+    Execute the captured policy-complete implementation over BrokerConnection
+    instead, just as the canonical claim path does.
+    """
     if not isinstance(conn, BrokerConnection):
         return _require_original(
             "set_status", _ORIG_SET_STATUS
         )(conn, task_id, status)
     _cov("set_status")
-    _c().set_status(task_id, status)
-    return True
+    return _require_original(
+        "set_status", _ORIG_SET_STATUS
+    )(conn, task_id, status)
 
 
 def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
