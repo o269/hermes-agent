@@ -861,14 +861,16 @@ def test_unreadable_authority_config_fails_closed_after_trigger_install(
         assignee="fable",
         status="scheduled",
     )
-    original_read_text = Path.read_text
+    from hermes_cli import config as config_module
 
-    def deny_config_read(path: Path, *args, **kwargs):
+    original_read = config_module.read_user_config_raw
+
+    def deny_config_read(path: Path | None = None):
         if path == config_path:
             raise PermissionError("test unreadable config")
-        return original_read_text(path, *args, **kwargs)
+        return original_read(path)
 
-    monkeypatch.setattr(Path, "read_text", deny_config_read)
+    monkeypatch.setattr(config_module, "read_user_config_raw", deny_config_read)
     with pytest.raises(sqlite3.OperationalError, match="user-defined function"):
         conn.execute(
             "UPDATE tasks SET status = 'ready' WHERE id = 't_unreadable_config'"

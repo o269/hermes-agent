@@ -90,8 +90,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-import yaml
-
 from hermes_cli.kanban_assignment_policy import (
     assignment_guard_reason as _pure_assignment_guard_reason,
 )
@@ -1585,10 +1583,12 @@ def _configured_board_profiles(
         raise AssignmentPolicyConfigError("assignment authority root is unresolved")
     config_path = authority_root / "config.yaml"
     try:
-        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        payload = {}
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        from hermes_cli.config import read_user_config_raw
+
+        payload = read_user_config_raw(config_path)
+    except Exception as exc:
+        # The canonical raw reader preserves parser and I/O failures. Collapse
+        # every such failure into this boundary's stable fail-closed error.
         raise AssignmentPolicyConfigError(
             f"cannot read assignment authority config at {config_path}"
         ) from exc
