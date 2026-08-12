@@ -310,6 +310,35 @@ def test_closed_pr_does_not_consume_resume_marker(
     assert consumed == []
 
 
+def test_claim_rechecks_pr_state_after_writer_lock(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A PR reopened while claim waits must retain custody and stay ready."""
+    pr_url = "https://github.com/o269/hermes-agent/pull/67"
+    states = iter(("CLOSED", "OPEN"))
+    calls: list[str] = []
+
+    def github_state(url):
+        calls.append(url)
+        return next(states)
+
+    monkeypatch.setattr(kb, "_github_pull_state", github_state)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reopened PR card", assignee="alpha")
+        kb.add_comment(conn, task_id, "alpha", f"AUTHOR COMPLETE: {pr_url}")
+
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        rejected = [
+            event.payload
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "claim_rejected"
+        ]
+
+    assert calls == [pr_url, pr_url]
+    assert rejected[-1] == {"reason": "active_pr_resume_marker_unavailable"}
+
+
 @pytest.mark.parametrize(
     ("title", "matching_numbers"),
     [

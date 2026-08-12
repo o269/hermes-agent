@@ -4591,24 +4591,29 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     # Active-PR custody blocks ordinary claims. A valid owner-bound Fable marker
     # opens exactly one claim and is consumed atomically with the new run.
-    pr_states: dict[str, Optional[str]] = {}
+    prelock_pr_states: dict[str, Optional[str]] = {}
     active_prs = _active_pr_custody(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
-        pr_states=pr_states,
+        pr_states=prelock_pr_states,
     )
     resume_marker = _next_resume_marker(conn, task_id) if active_prs else None
     if active_prs and resume_marker is None:
         _append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
         return None
     with write_txn(conn):
+        # Do not reuse the pre-lock GitHub result. A PR can be reopened between
+        # the first check and BEGIN IMMEDIATE; carrying the CLOSED/MERGED cache
+        # into this transaction would then claim a card whose live PR has
+        # regained custody. Re-query under the single-writer lock immediately
+        # before the ready -> running CAS. Lookup errors remain fail-closed.
+        claim_pr_states: dict[str, Optional[str]] = {}
         fresh_active_prs = _active_pr_custody(
             conn,
             task_id,
             cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
-            pr_states=pr_states,
-            allow_state_lookup=False,
+            pr_states=claim_pr_states,
         )
         if fresh_active_prs:
             fresh_marker = _next_resume_marker(conn, task_id)
