@@ -3207,6 +3207,126 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_task_title(title: str) -> str:
+    """Return the conservative identity form used by create de-duplication.
+
+    NFKC folds compatibility-equivalent Unicode, whitespace runs collapse, and
+    case differences disappear. Punctuation and control tags stay significant,
+    so ``[REVIEW] Fix X`` and ``[LAND] Fix X`` remain different work.
+    """
+    normalized = unicodedata.normalize("NFKC", str(title or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+def _normalize_task_scope(
+    *,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return the board-local scope paired with a normalized title.
+
+    Tenant + dependency-parent set identify the workflow namespace. A
+    first-class project is the location scope; otherwise workspace kind/path
+    are. Creator, assignee, body, status, priority, session, and idempotency key
+    are deliberately excluded so cross-creator retries cannot re-mint work.
+    """
+    tenant_scope = str(tenant).strip() if tenant is not None else ""
+    parent_scope = tuple(sorted({str(parent).strip() for parent in parents if parent}))
+    if project_id:
+        location_scope = ("project", str(project_id).strip())
+    else:
+        normalized_path = ""
+        if workspace_path:
+            normalized_path = os.path.normpath(str(workspace_path).strip())
+        location_scope = (
+            "workspace",
+            str(workspace_kind or "scratch").strip().casefold(),
+            normalized_path,
+        )
+    return tenant_scope, parent_scope, location_scope
+
+
+def _find_open_title_scope_duplicate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[Optional[str], tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Return the oldest open task with the same normalized title + scope."""
+    normalized_title = _normalize_task_title(title)
+    target_scope = _normalize_task_scope(
+        tenant=tenant,
+        parents=parents,
+        project_id=project_id,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    rows = conn.execute(
+        "SELECT id, title, tenant, project_id, workspace_kind, workspace_path "
+        "FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        if _normalize_task_title(row["title"] or "") != normalized_title:
+            continue
+        parent_rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (row["id"],),
+        ).fetchall()
+        candidate_scope = _normalize_task_scope(
+            tenant=row["tenant"],
+            parents=(parent["parent_id"] for parent in parent_rows),
+            project_id=row["project_id"],
+            workspace_kind=row["workspace_kind"] or "scratch",
+            workspace_path=row["workspace_path"],
+        )
+        if candidate_scope == target_scope:
+            return str(row["id"]), target_scope
+    return None, target_scope
+
+
+def _record_create_dedup(
+    conn: sqlite3.Connection,
+    *,
+    existing_task_id: str,
+    reason: str,
+    title: str,
+    scope: tuple[str, tuple[str, ...], tuple[str, ...]],
+    attempted_by: Optional[str],
+    idempotency_key_supplied: bool,
+) -> None:
+    """Durably expose every suppressed create re-mint on the existing card."""
+    tenant_scope, parent_scope, location_scope = scope
+    payload = {
+        "existing_task_id": existing_task_id,
+        "reason": reason,
+        "normalized_title": _normalize_task_title(title),
+        "scope": {
+            "tenant": tenant_scope,
+            "parents": list(parent_scope),
+            "location": list(location_scope),
+        },
+        "attempted_by": attempted_by,
+        "idempotency_key_supplied": idempotency_key_supplied,
+    }
+    _append_event(conn, existing_task_id, "create_deduplicated", payload)
+    _log.warning(
+        "kanban create re-mint suppressed existing_task_id=%s reason=%s "
+        "normalized_title=%r scope=%r",
+        existing_task_id,
+        reason,
+        payload["normalized_title"],
+        payload["scope"],
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3246,8 +3366,10 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate. Independently, an open task with the same
+    conservative normalized title + scope (board, tenant, parent set, and
+    project/workspace identity) wins even when the retry supplies a fresh key.
+    Both paths append ``create_deduplicated`` to the existing task timeline.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3445,21 +3567,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3487,6 +3594,59 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Both idempotency-key and title+scope checks live under the
+                # same BEGIN IMMEDIATE as the insert. Concurrent creators can
+                # no longer both observe absence and mint two open cards.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        existing_id = str(row["id"])
+                        _, scope = _find_open_title_scope_duplicate(
+                            conn,
+                            title=title,
+                            tenant=tenant,
+                            parents=parents,
+                            project_id=project_id,
+                            workspace_kind=workspace_kind,
+                            workspace_path=workspace_path,
+                        )
+                        _record_create_dedup(
+                            conn,
+                            existing_task_id=existing_id,
+                            reason="idempotency_key",
+                            title=title,
+                            scope=scope,
+                            attempted_by=created_by,
+                            idempotency_key_supplied=True,
+                        )
+                        return existing_id
+
+                duplicate_id, scope = _find_open_title_scope_duplicate(
+                    conn,
+                    title=title,
+                    tenant=tenant,
+                    parents=parents,
+                    project_id=project_id,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                )
+                if duplicate_id is not None:
+                    _record_create_dedup(
+                        conn,
+                        existing_task_id=duplicate_id,
+                        reason="normalized_title_scope",
+                        title=title,
+                        scope=scope,
+                        attempted_by=created_by,
+                        idempotency_key_supplied=bool(idempotency_key),
+                    )
+                    return duplicate_id
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
