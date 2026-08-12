@@ -200,7 +200,7 @@ _RO_PRAGMA_WHITELIST = {
     "integrity_check", "quick_check", "table_info", "index_list",
     "index_info", "database_list", "page_count", "freelist_count",
     "page_size", "wal_autocheckpoint", "foreign_key_check", "table_list",
-    "schema_version", "user_version",
+    "schema_version", "user_version", "journal_mode",
 }
 _RO_FIRST_TOKEN = {"select", "with", "explain", "values"}
 # Statements permitted inside an interactive transaction (txn_exec). Reads +

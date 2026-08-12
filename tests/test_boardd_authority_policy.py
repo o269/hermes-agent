@@ -93,10 +93,7 @@ def test_boardd_authority_fence_covers_native_and_raw_writers(tmp_path: Path):
         encoding="utf-8",
     )
     with running_boardd(tmp_path) as client:
-        health = client.ping()
-        assert health["assignment_policy_ready"] is True
-        assert health["assignment_authority_profiles"] == ["fable"]
-
+        # Must-fire first: the pre-fence daemon accepts this native write.
         with pytest.raises(BoarddError, match="authority_executor_not_parked"):
             native_create(
                 client,
@@ -104,6 +101,10 @@ def test_boardd_authority_fence_covers_native_and_raw_writers(tmp_path: Path):
                 assignee="Fable",
                 status="ready",
             )
+
+        health = client.ping()
+        assert health["assignment_policy_ready"] is True
+        assert health["assignment_authority_profiles"] == ["fable"]
 
         created = native_create(
             client,

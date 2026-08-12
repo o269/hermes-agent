@@ -222,6 +222,7 @@ def _native_create(client: Client, **args) -> dict:
     return client._request("create_task", args, mutation=True)["result"]
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_restart_preserves_broker_reasoning_effort_create_list_show(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (
         client,
@@ -507,6 +508,7 @@ def test_native_create_idempotency_selects_newest_active_duplicate(tmp_path: Pat
         ) == [{"n": 2}]
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_import_schema_adds_reasoning_effort_to_legacy_board(tmp_path: Path):
     legacy_schema = _repo_schema_sql().replace(
         "    reasoning_effort     TEXT,\n",
@@ -581,6 +583,7 @@ def test_schema_drift_check_names_missing_expected_column(
     assert '"missing_columns": ["reasoning_effort"]' in caplog.text
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_boardd_startup_invokes_schema_drift_check(tmp_path: Path):
     legacy_schema = _repo_schema_sql().replace(
         "    reasoning_effort     TEXT,\n",
@@ -1255,6 +1258,7 @@ def test_write_canary_rejects_non_finite_durations(
         )
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_write_canary_once_uses_real_broker_create_and_archive_path(tmp_path: Path):
     with running_boardd(
         tmp_path,
@@ -1307,6 +1311,7 @@ with kb.connect() as conn:
         assert near_row["body"] == "not a canary"
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_write_canary_detects_title_only_reserved_marker_collision(tmp_path: Path):
     # Periodic short-interval mode (not once+wall-clock delay): insert the
     # collision first, then wait for a post-insertion canary run. Avoids the
@@ -1365,6 +1370,7 @@ with kb.connect() as conn:
         assert client.get_task(collision["id"])["status"] == "blocked"
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_guarded_archive_rejects_identity_changed_by_prior_broker_write(tmp_path: Path):
     with running_boardd(tmp_path, import_schema=True) as (_, db_path, socket_path):
         result = _run_kanban_db_script(
@@ -1439,6 +1445,7 @@ with kb.connect() as conn:
     }
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_write_canary_total_deadline_bounds_slow_transaction_holder(tmp_path: Path):
     with running_boardd(
         tmp_path,
@@ -1529,6 +1536,8 @@ def test_signal_shutdown_uses_coordinator_thread_not_serve_thread(tmp_path: Path
     assert broker._shutdown_coord_thread is first_coord
 
 
+@pytest.mark.live_system_guard_bypass  # signals only this test's boardd child
+@pytest.mark.requires_wal
 def test_sigterm_subprocess_completes_ordered_teardown_without_sigkill(
     tmp_path: Path,
 ):
