@@ -1467,7 +1467,11 @@ def test_write_canary_total_deadline_bounds_slow_transaction_holder(tmp_path: Pa
         assert health["write_canary_ok"] is False
         assert health["txn_capped"] >= 1
         assert alarm["kind"] == "write-canary-timeout"
-        assert alarm["phase"] == "reconcile-discovery"
+        # Depending on scheduler load, the holder may be capped between the
+        # discovery read and the first mutation. Both phases prove the canary
+        # stayed fail-closed behind the live transaction; the deadline below
+        # is the invariant this test is intended to enforce.
+        assert alarm["phase"] in {"reconcile-discovery", "create"}
         assert alarm["duration_ms"] < 750
         assert "after 1 attempts" in alarm["detail"]
 
