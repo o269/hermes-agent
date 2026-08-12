@@ -20,6 +20,19 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _github_prs_default_open(monkeypatch):
+    """Keep tests hermetic while preserving existing active-PR expectations."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "_github_pull_state",
+        lambda _pr_url: "OPEN",
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 
