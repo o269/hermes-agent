@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -1718,6 +1719,40 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     )
 
 
+# A single daemon keeps long-lived SessionDB readers bounded. The weak set does
+# not extend DB lifetime; closed/collected instances disappear automatically.
+_READ_CONN_SWEEP_INTERVAL_S = 60.0
+_READ_CONN_IDLE_TIMEOUT_S = 300.0
+_read_conn_sweeper_lock = threading.Lock()
+_read_conn_sweeper: Optional[threading.Thread] = None
+_live_session_dbs: "weakref.WeakSet[SessionDB]" = weakref.WeakSet()
+
+
+def _read_conn_sweep_loop() -> None:
+    while True:
+        time.sleep(_READ_CONN_SWEEP_INTERVAL_S)
+        for db in list(_live_session_dbs):
+            try:
+                db._sweep_idle_read_conns()
+            except Exception:
+                logger.debug("read-connection sweep failed", exc_info=True)
+
+
+def _ensure_read_conn_sweeper() -> None:
+    global _read_conn_sweeper
+    if _read_conn_sweeper is not None and _read_conn_sweeper.is_alive():
+        return
+    with _read_conn_sweeper_lock:
+        if _read_conn_sweeper is not None and _read_conn_sweeper.is_alive():
+            return
+        _read_conn_sweeper = threading.Thread(
+            target=_read_conn_sweep_loop,
+            name="hermes-read-conn-sweeper",
+            daemon=True,
+        )
+        _read_conn_sweeper.start()
+
+
 def is_zeroed_state_db(
     path: Path, *, probe_bytes: int = 100, force: bool = False
 ) -> bool:
@@ -2008,6 +2043,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # ~6 days (Errno 24) and took the fleet with it (p87 / 2026-08-07).
         self._read_conns: "set[sqlite3.Connection]" = set()
         self._read_conn_owners: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
+        self._read_conn_last_used: "dict[sqlite3.Connection, float]" = {}
+        self._read_conn_doomed: "set[sqlite3.Connection]" = set()
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2265,6 +2302,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except Exception:
                 pass
             self._read_conns.discard(conn)
+            self._read_conn_last_used.pop(conn, None)
+            self._read_conn_doomed.discard(conn)
             closed += 1
         if closed:
             self._read_conn_owners = survivors
@@ -2275,6 +2314,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 len(survivors),
             )
         return closed
+
+    def _sweep_idle_read_conns(self) -> int:
+        """Close dead readers and mark idle live-thread readers for owner close."""
+        if not self._wal_active or self.read_only:
+            return 0
+        now = time.monotonic()
+        affected = 0
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                return 0
+            affected += self._prune_dead_read_conns_unlocked()
+            for _owner, conn in self._read_conn_owners:
+                if now - self._read_conn_last_used.get(conn, now) < _READ_CONN_IDLE_TIMEOUT_S:
+                    continue
+                if conn not in self._read_conn_doomed:
+                    self._read_conn_doomed.add(conn)
+                    affected += 1
+        return affected
 
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
@@ -2298,15 +2355,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         conn = getattr(self._read_local, "conn", None)
         if conn is not None:
-            # Opportunistic prune on the hot path, rate-limited so a busy
-            # reader does not walk the owner list on every SELECT.
-            n = getattr(self._read_local, "prune_ticks", 0) + 1
-            self._read_local.prune_ticks = n
-            if n % 64 == 0:
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        self._prune_dead_read_conns_unlocked()
-            return conn
+            with self._read_conns_lock:
+                doomed = conn in self._read_conn_doomed
+                if doomed:
+                    self._read_conns.discard(conn)
+                    self._read_conn_last_used.pop(conn, None)
+                    self._read_conn_doomed.discard(conn)
+                    try:
+                        self._read_conn_owners.remove((threading.current_thread(), conn))
+                    except ValueError:
+                        pass
+                else:
+                    self._read_conn_last_used[conn] = time.monotonic()
+            if doomed:
+                try:
+                    conn.close()
+                finally:
+                    self._read_local.conn = None
+                conn = None
+            else:
+                # Opportunistic prune on the hot path, rate-limited so a busy
+                # reader does not walk the owner list on every SELECT.
+                n = getattr(self._read_local, "prune_ticks", 0) + 1
+                self._read_local.prune_ticks = n
+                if n % 64 == 0:
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            self._prune_dead_read_conns_unlocked()
+                return conn
         if getattr(self._read_local, "failed", False):
             return None
         try:
@@ -2343,6 +2419,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._prune_dead_read_conns_unlocked()
                 self._read_conns.add(conn)
                 self._read_conn_owners.append((threading.current_thread(), conn))
+                self._read_conn_last_used[conn] = time.monotonic()
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -2351,6 +2428,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         self._read_local.conn = conn
         self._read_local.prune_ticks = 0
+        _live_session_dbs.add(self)
+        _ensure_read_conn_sweeper()
         return conn
 
     @contextmanager
@@ -2365,6 +2444,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         conn = self._get_read_conn()
         if conn is not None:
+            self._read_conn_last_used[conn] = time.monotonic()
             yield conn
             return
         with self._lock:
@@ -2889,6 +2969,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             read_conns = list(self._read_conns)
             self._read_conns.clear()
             self._read_conn_owners.clear()
+            self._read_conn_last_used.clear()
+            self._read_conn_doomed.clear()
         for conn in read_conns:
             try:
                 conn.close()
