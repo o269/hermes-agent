@@ -115,6 +115,42 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_dashboard_create_and_reassign_share_authority_fence(
+    client,
+    kanban_home,
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  authority_profiles: fable\n",
+        encoding="utf-8",
+    )
+
+    rejected_create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "[AUTHOR] dashboard source-code patch",
+            "body": "Implement the change and open a PR.",
+            "assignee": "fable",
+        },
+    )
+    assert rejected_create.status_code == 400
+    assert "kanban assignment policy" in rejected_create.json()["detail"]
+
+    ordinary = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "[AUTHOR] dashboard source-code patch",
+            "body": "Implement the change and open a PR.",
+            "assignee": "engineer",
+        },
+    ).json()["task"]
+    rejected_reassign = client.patch(
+        f"/api/plugins/kanban/tasks/{ordinary['id']}",
+        json={"assignee": "fable"},
+    )
+    assert rejected_reassign.status_code == 409
+    assert "kanban assignment policy" in rejected_reassign.json()["detail"]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

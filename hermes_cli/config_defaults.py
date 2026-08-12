@@ -2248,6 +2248,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Comma-separated profile names reserved for non-spawnable authority,
+        # live-action, and operator-custody cards. Empty preserves legacy
+        # assignment behavior. When configured, executor-shaped work may wait
+        # on these lanes only in a dependency-held/explicitly parked state.
+        "authority_profiles": "",
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
