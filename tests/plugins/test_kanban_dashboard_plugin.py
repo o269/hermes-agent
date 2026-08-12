@@ -50,6 +50,11 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        kb,
+        "_heavy_workspace_slots_root",
+        lambda: tmp_path / "heavy-workspace-slots",
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -1560,8 +1565,8 @@ def test_patch_status_archive_closes_running_run(client):
         conn.close()
 
 
-def test_patch_status_ready_closes_orphaned_running_run(client):
-    """A direct running -> ready move must reconcile an open orphaned run."""
+def test_patch_status_ready_rejects_dispatcher_owned_orphaned_run(client):
+    """Generic status writes preserve dispatcher custody until explicit reclaim."""
     plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
     conn = kb.connect()
     try:
@@ -1581,12 +1586,27 @@ def test_patch_status_ready_closes_orphaned_running_run(client):
                 (tid,),
             )
 
-        assert plugin._set_status_direct(conn, tid, "ready")
+        assert not plugin._set_status_direct(conn, tid, "ready")
+        preserved = kb.get_task(conn, tid)
+        preserved_run = kb.latest_run(conn, tid)
+        assert preserved is not None
+        assert preserved.status == "running"
+        assert preserved.claim_lock == claimed.claim_lock
+        assert preserved.current_run_id is None
+        assert preserved_run is not None
+        assert preserved_run.id == run_id
+        assert preserved_run.ended_at is None
+
+        assert kb.reclaim_task(
+            conn,
+            tid,
+            reason="test structured dashboard recovery",
+        )
         task = kb.get_task(conn, tid)
         run = kb.latest_run(conn, tid)
-        status_event = conn.execute(
+        reclaim_event = conn.execute(
             "SELECT run_id FROM task_events "
-            "WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+            "WHERE task_id = ? AND kind = 'reclaimed' ORDER BY id DESC LIMIT 1",
             (tid,),
         ).fetchone()
         assert task is not None
@@ -1597,14 +1617,14 @@ def test_patch_status_ready_closes_orphaned_running_run(client):
         assert run.id == run_id
         assert run.outcome == "reclaimed"
         assert run.ended_at is not None
-        assert status_event is not None
-        assert status_event["run_id"] == run_id
+        assert reclaim_event is not None
+        assert reclaim_event["run_id"] == run_id
     finally:
         conn.close()
 
 
-def test_patch_status_ready_preserves_review_origin_queue(client):
-    """Review-origin dashboard recovery must land in review, not author ready."""
+def test_patch_status_ready_requires_reclaim_for_review_origin_queue(client):
+    """Review-origin dispatcher custody needs the structured reclaim path."""
     plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
     conn = kb.connect()
     try:
@@ -1629,12 +1649,27 @@ def test_patch_status_ready_preserves_review_origin_queue(client):
                 (tid,),
             )
 
-        assert plugin._set_status_direct(conn, tid, "ready")
+        assert not plugin._set_status_direct(conn, tid, "ready")
+        preserved = kb.get_task(conn, tid)
+        preserved_run = kb.latest_run(conn, tid)
+        assert preserved is not None
+        assert preserved.status == "running"
+        assert preserved.claim_lock == claimed.claim_lock
+        assert preserved.current_run_id is None
+        assert preserved_run is not None
+        assert preserved_run.id == run_id
+        assert preserved_run.ended_at is None
+
+        assert kb.reclaim_task(
+            conn,
+            tid,
+            reason="test structured review recovery",
+        )
         task = kb.get_task(conn, tid)
         run = kb.latest_run(conn, tid)
-        status_event = conn.execute(
+        reclaim_event = conn.execute(
             "SELECT run_id, payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+            "WHERE task_id = ? AND kind = 'reclaimed' ORDER BY id DESC LIMIT 1",
             (tid,),
         ).fetchone()
         open_count = conn.execute(
@@ -1652,11 +1687,10 @@ def test_patch_status_ready_preserves_review_origin_queue(client):
         assert run.id == run_id
         assert run.outcome == "reclaimed"
         assert run.ended_at is not None
-        assert run.summary == "status changed to review (dashboard/direct)"
         assert open_count is not None and int(open_count["n"]) == 0
-        assert status_event is not None
-        assert status_event["run_id"] == run_id
-        assert json.loads(status_event["payload"]) == {"status": "review"}
+        assert reclaim_event is not None
+        assert reclaim_event["run_id"] == run_id
+        assert json.loads(reclaim_event["payload"])["prev_lock"] == claimed.claim_lock
         assert kb.claim_task(conn, tid, claimer="test-host:author") is None
         review_retry = kb.claim_review_task(
             conn, tid, claimer="test-host:reviewer-retry"

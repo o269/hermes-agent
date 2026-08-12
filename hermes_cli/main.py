@@ -14894,11 +14894,12 @@ def main():
         help="Stage a lineage-safe offline cold archive manifest/export pass",
         description=(
             "Purpose-built state.db cold archival. Refuses the active profile "
-            "database, writes a Gate-B manifest, exports restricted redacted QMD, "
-            "creates a rollback bundle, optionally publishes via fail-closed rclone "
-            "readback, and only deletes from the offline candidate when "
-            "--apply-retention is supplied. It never runs VACUUM, optimize, "
-            "checkpoint, auto-prune, or live maintenance actions."
+            "database and every named-profile inode alias. Producer mode requires "
+            "a new stage and creates encrypted rollback/restricted packets with "
+            "offsite readback. Apply mode loads externally frozen manifest and "
+            "producer-receipt bytes, re-verifies custody, and checks every invariant before "
+            "COMMIT. It never runs VACUUM, optimize, checkpoint, auto-prune, or "
+            "live maintenance actions."
         ),
     )
     sessions_cold_archive.add_argument(
@@ -14912,8 +14913,7 @@ def main():
         type=Path,
         required=True,
         help=(
-            "Existing or new restricted staging root "
-            "(directories forced to 0700; files 0600)"
+            "Producer: a nonexistent restricted stage; apply: the existing approved stage"
         ),
     )
     sessions_cold_archive.add_argument(
@@ -14924,59 +14924,45 @@ def main():
     sessions_cold_archive.add_argument(
         "--apply-retention",
         action="store_true",
-        help=(
-            "After export, external Gate-B approval, and verified offsite "
-            "permanence, delete the reviewed set from the offline candidate"
-        ),
+        help="Load an existing externally approved stage and retain only its reviewed set",
     )
     sessions_cold_archive.add_argument(
-        "--approved-gate-b-sha256",
-        help=(
-            "Externally approved Gate-B manifest sha256 (64 hex). Required with "
-            "--apply-retention; the tool must not self-approve."
-        ),
-    )
-    sessions_cold_archive.add_argument(
-        "--requestor-identity",
-        help=(
-            "Identity of the actor requesting destructive retention "
-            "(required with --apply-retention)"
-        ),
-    )
-    sessions_cold_archive.add_argument(
-        "--approver-identity",
-        help=(
-            "Distinct identity that approved the Gate-B hash "
-            "(required with --apply-retention; must differ from requestor)"
-        ),
-    )
-    sessions_cold_archive.add_argument(
-        "--verified-offsite-receipt",
+        "--approved-manifest",
         type=Path,
-        help=(
-            "JSON file with a prior rclone publish+readback receipt "
-            "(Gate-B + .age). Alternative to running publish in this invocation; "
-            "required form of offsite proof when --rclone-remote is omitted "
-            "with --apply-retention"
-        ),
+        help="Externally frozen copy of GATE-B-MANIFEST.json for apply",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-manifest-sha256",
+        help="Exact SHA-256 of the approved manifest file bytes (required for apply)",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt",
+        type=Path,
+        help="Externally frozen copy of COLD-ARCHIVE-PRODUCER-RECEIPT.json",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt-sha256",
+        help="Exact SHA-256 of the externally approved producer receipt bytes",
     )
     sessions_cold_archive.add_argument(
         "--hot-days",
         type=float,
         default=30.0,
-        help="Hot searchable window in days (default: 30)",
+        help=(
+            "Hot searchable window in days (default: 30); hot + archive grace "
+            "must be at least 37"
+        ),
     )
     sessions_cold_archive.add_argument(
         "--archive-grace-days",
         type=float,
         default=7.0,
-        help="Archived reversible grace window in days (default: 7)",
+        help=(
+            "Archived reversible grace window in days (default: 7); hot + archive "
+            "grace must be at least 37"
+        ),
     )
-    sessions_cold_archive.add_argument(
-        "--now-epoch",
-        type=float,
-        help="Deterministic clock override for tests/receipts (epoch seconds)",
-    )
+
     sessions_cold_archive.add_argument(
         "--no-default-holds",
         action="store_true",
@@ -15007,7 +14993,7 @@ def main():
     sessions_cold_archive.add_argument(
         "--rclone-config",
         type=Path,
-        help="Dedicated root-owned/minimal rclone config for the gdrive remote",
+        help="Dedicated current-user mode-0600 unaliased rclone config",
     )
     sessions_cold_archive.add_argument(
         "--remote-namespace",
@@ -15016,7 +15002,7 @@ def main():
     sessions_cold_archive.add_argument(
         "--age-recipient-file",
         type=Path,
-        help="Public age recipient used before publishing the lossless rollback bundle",
+        help="Public age recipient for opaque rollback and restricted/QMD packets",
     )
     sessions_cold_archive.add_argument(
         "--age-exe",
@@ -15028,6 +15014,35 @@ def main():
         default="rclone",
         help="rclone executable name/path (default: rclone)",
     )
+
+    sessions_cold_cutover = sessions_subparsers.add_parser(
+        "cold-archive-mark-cutover",
+        help="Record the successful candidate cutover clock for 14-day source retention",
+    )
+    sessions_cold_cutover.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_cutover.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate is healthy before starting the 14-day clock",
+    )
+    sessions_cold_cutover.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_cutover.add_argument("--rclone-exe", default="rclone")
+
+    sessions_cold_prune = sessions_subparsers.add_parser(
+        "cold-archive-prune-bundle",
+        help="Prune local plaintext source bundle only after cutover plus 14 days",
+    )
+    sessions_cold_prune.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_prune.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate remains healthy before local plaintext prune",
+    )
+    sessions_cold_prune.add_argument(
+        "--approved-cutover-marker-sha256", required=True
+    )
+    sessions_cold_prune.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_prune.add_argument("--rclone-exe", default="rclone")
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
@@ -15105,6 +15120,41 @@ def main():
                 print("  Keep state.db and the backup; do not delete them.")
             return
 
+        if action in {"cold-archive-mark-cutover", "cold-archive-prune-bundle"}:
+            from hermes_cli.session_cold_archive import (
+                ColdArchiveError,
+                prune_source_bundle_after_retention,
+                record_candidate_cutover,
+            )
+
+            try:
+                if action == "cold-archive-mark-cutover":
+                    result = record_candidate_cutover(
+                        args.stage_root,
+                        candidate_health_confirmed=getattr(
+                            args, "candidate_health_confirmed", False
+                        ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
+                    )
+                else:
+                    result = prune_source_bundle_after_retention(
+                        args.stage_root,
+                        candidate_health_confirmed=getattr(
+                            args, "candidate_health_confirmed", False
+                        ),
+                        approved_cutover_marker_sha256=(
+                            args.approved_cutover_marker_sha256
+                        ),
+                        rclone_config=args.rclone_config,
+                        rclone_exe=args.rclone_exe,
+                    )
+            except ColdArchiveError as exc:
+                print(f"Error: cold archive lifecycle failed closed: {exc}")
+                raise SystemExit(1) from exc
+            print(_json.dumps(result, indent=2, sort_keys=True))
+            return 0
+
         if action == "cold-archive":
             from hermes_cli.session_cold_archive import (
                 ColdArchiveError,
@@ -15118,49 +15168,56 @@ def main():
                 else list(DEFAULT_PERMANENT_HOLD_SOURCES)
             )
             hold_sources.extend(getattr(args, "hold_source", None) or [])
-            verified_receipt = None
-            receipt_path = getattr(args, "verified_offsite_receipt", None)
-            if receipt_path is not None:
-                try:
-                    import json as _json_receipt
-
-                    verified_receipt = _json_receipt.loads(
-                        Path(receipt_path).read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError) as exc:
-                    print(f"Error: cold archive failed closed: invalid offsite receipt: {exc}")
-                    return 1
-                if isinstance(verified_receipt, dict) and "remote_publish" in verified_receipt:
-                    verified_receipt = verified_receipt["remote_publish"]
             try:
                 receipt = run_cold_archive_pass(
                     source_db=args.source,
                     stage_root=args.stage_root,
                     hot_days=getattr(args, "hot_days", 30.0),
                     archive_grace_days=getattr(args, "archive_grace_days", 7.0),
-                    now=getattr(args, "now_epoch", None),
                     hold_sources=hold_sources,
                     hold_title_regexes=getattr(args, "hold_title_regex", None) or [],
                     hold_cwd_prefixes=getattr(args, "hold_cwd_prefix", None) or [],
                     manifest_only=getattr(args, "manifest_only", False),
                     apply_retention=getattr(args, "apply_retention", False),
+                    approved_manifest_path=getattr(args, "approved_manifest", None),
+                    approved_manifest_sha256=getattr(
+                        args, "approved_manifest_sha256", None
+                    ),
+                    approved_producer_receipt_path=getattr(
+                        args, "approved_producer_receipt", None
+                    ),
+                    approved_producer_receipt_sha256=getattr(
+                        args, "approved_producer_receipt_sha256", None
+                    ),
                     rclone_remote=getattr(args, "rclone_remote", None),
                     rclone_config=getattr(args, "rclone_config", None),
                     remote_namespace=getattr(args, "remote_namespace", None),
                     age_recipient_file=getattr(args, "age_recipient_file", None),
                     age_exe=getattr(args, "age_exe", "age"),
                     rclone_exe=getattr(args, "rclone_exe", "rclone"),
-                    approved_gate_b_manifest_sha256=getattr(
-                        args, "approved_gate_b_sha256", None
-                    ),
-                    requestor_identity=getattr(args, "requestor_identity", None),
-                    approver_identity=getattr(args, "approver_identity", None),
-                    verified_offsite_receipt=verified_receipt,
                 )
             except ColdArchiveError as exc:
                 print(f"Error: cold archive failed closed: {exc}")
-                return 1
-            print(_json.dumps(receipt, indent=2, sort_keys=True))
+                raise SystemExit(1) from exc
+            public_receipt = dict(receipt)
+            public_receipt.pop("source_db", None)
+            public_receipt.pop("stage_root", None)
+            qmd = public_receipt.get("qmd_export")
+            if isinstance(qmd, dict):
+                public_receipt["qmd_export"] = {
+                    "exported_file_count": len(qmd.get("exported_files") or []),
+                    "message_count": qmd.get("message_count"),
+                    "verified": qmd.get("verified"),
+                }
+            remote = public_receipt.get("remote_publish")
+            if isinstance(remote, list):
+                public_receipt["remote_publish"] = [
+                    {key: value for key, value in item.items() if key != "local_path"}
+                    if isinstance(item, dict)
+                    else item
+                    for item in remote
+                ]
+            print(_json.dumps(public_receipt, indent=2, sort_keys=True))
             return 0
 
         try:

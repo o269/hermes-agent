@@ -762,6 +762,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    p_review = sub.add_parser(
+        "review",
+        help="Move one or more tasks to review status",
+    )
+    p_review.add_argument("task_ids", nargs="+", help="One or more task ids")
+    p_review.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note — recorded as a comment before moving to review.",
+    )
+
+    p_set_status = sub.add_parser(
+        "set-status",
+        aliases=["setstatus"],
+        help="Set task status directly (e.g. running, review, ready, blocked)",
+    )
+    p_set_status.add_argument("task_id", help="Task id")
+    p_set_status.add_argument("status", help=f"Target status ({', '.join(sorted(kb.VALID_STATUSES))})")
+    p_set_status.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note recorded as a comment before status change.",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1108,6 +1132,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "review":   _cmd_review,
+            "set-status": _cmd_set_status,
+            "setstatus":  _cmd_set_status,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -2485,6 +2512,61 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author() if reason else None
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if reason:
+                kb.add_comment(conn, tid, author, f"REVIEW: {reason}")
+            try:
+                ok = kb.set_status(conn, tid, "review")
+            except Exception as exc:
+                print(f"cannot move {tid} to review: {exc}", file=sys.stderr)
+                ok = False
+            if not ok:
+                failed.append(tid)
+                print(f"cannot set status of {tid} to review", file=sys.stderr)
+            else:
+                print(f"Moved {tid} -> review" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_set_status(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    st = args.status
+    if st not in kb.VALID_STATUSES:
+        print(
+            f"kanban set-status: status must be one of {sorted(kb.VALID_STATUSES)}",
+            file=sys.stderr,
+        )
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author() if reason else None
+    with kb.connect_closing() as conn:
+        if reason:
+            kb.add_comment(conn, tid, author, f"SET STATUS ({st}): {reason}")
+        try:
+            ok = kb.set_status(conn, tid, st)
+        except ValueError as exc:
+            print(f"kanban set-status: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"cannot set status of {tid} to {st}", file=sys.stderr)
+            return 1
+        print(f"Moved {tid} -> {st}" + (f": {reason}" if reason else ""))
+    return 0
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -2563,6 +2645,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        max_heavy_workspaces = _coerce_positive_int(
+            _kanban_cfg.get("max_heavy_workspaces")
+        )
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2573,6 +2658,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        max_heavy_workspaces = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2580,6 +2666,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
+            max_heavy_workspaces=max_heavy_workspaces,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -2602,11 +2689,24 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_heavy_workspace_capped": [
+                {"task_id": tid, "limit": limit, "reason": reason,
+                 "state": (
+                     "queue_wait"
+                     if reason in {"capacity", "fairness", "phase_fairness"}
+                     else "lock_error"
+                 )}
+                for (tid, limit, reason) in res.skipped_heavy_workspace_capped
+            ],
             "respawn_guarded": _respawn_guard_details(res),
             "dispositions": res.normalized_dispositions(),
             "auto_assigned_default": res.auto_assigned_default,
+            "write_failures": res.write_failures,
         }, indent=2))
-        return 0
+        # A rolled-back write (boardd TXN_MAX_S cap / TxnStale) is data loss.
+        # Exit non-zero so the tick is never reported as success — the
+        # acceptance criterion is "CLI must not return 0 on rollback".
+        return 1 if res.write_failures else 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2641,12 +2741,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.skipped_heavy_workspace_capped:
+        for tid, limit, reason in res.skipped_heavy_workspace_capped:
+            print(
+                f"Deferred (host heavy-workspace queue wait, limit={limit}, "
+                f"reason={reason}): {tid}"
+            )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    return 0
+    if res.write_failures:
+        # Surface rolled-back writes prominently in text mode too. The
+        # non-zero exit below is what prevents systemd / monitoring from
+        # treating a data-loss tick as healthy.
+        print(
+            f"Write failures (broker rolled back — data NOT persisted): "
+            f"{', '.join(res.write_failures)}"
+        )
+    # A rolled-back write (boardd TXN_MAX_S cap / TxnStale) is data loss.
+    # Exit non-zero so the tick is never reported as success.
+    return 1 if res.write_failures else 0
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -2690,6 +2806,17 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # Make sure the DB exists before printing "started" so the user sees the
     # correct DB path and any init error surfaces immediately.
     kb.init_db()
+    try:
+        from hermes_cli.config import load_config
+
+        _raw_heavy = (load_config().get("kanban") or {}).get(
+            "max_heavy_workspaces"
+        )
+        max_heavy_workspaces = int(_raw_heavy) if _raw_heavy is not None else None
+        if max_heavy_workspaces is not None and max_heavy_workspaces < 1:
+            max_heavy_workspaces = None
+    except Exception:
+        max_heavy_workspaces = None
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
@@ -2725,7 +2852,24 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             )
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        capacity_deferred = any(
+            reason in {"capacity", "fairness", "phase_fairness"}
+            for _tid, _limit, reason in res.skipped_heavy_workspace_capped
+        )
+        for tid, limit, reason in res.skipped_heavy_workspace_capped:
+            print(
+                f"[{_fmt_ts(int(time.time()))}] "
+                f"heavy_workspace_deferred task={tid} limit={limit} "
+                f"reason={reason} state="
+                f"{'queue_wait' if reason in {'capacity', 'fairness', 'phase_fairness'} else 'lock_error'}",
+                file=(
+                    sys.stdout
+                    if reason in {"capacity", "fairness", "phase_fairness"}
+                    else sys.stderr
+                ),
+                flush=True,
+            )
+        if ready_pending and not spawned_any and not capacity_deferred:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -2782,6 +2926,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
+            max_heavy_workspaces=max_heavy_workspaces,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )
@@ -2858,6 +3003,13 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         for who, counts in sorted(stats["by_assignee"].items()):
             parts = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             print(f"  {who:20s}  {parts}")
+    heavy = stats["heavy_workspace"]
+    print(
+        "\nHeavy workspace capacity: "
+        f"{heavy['in_use_host']}/{heavy['limit']} in use, "
+        f"{heavy['available']} available, {heavy['waiter_count']} waiting "
+        f"(state={heavy['state']})"
+    )
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")

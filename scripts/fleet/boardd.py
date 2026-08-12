@@ -2097,24 +2097,19 @@ def _h_set_body(broker, conn, a):
 
 
 def _h_set_status(broker, conn, a):
-    """Mirror of the `kb` CLI setstatus (per-seat direct-opener reroute)."""
-    task_id, st = a["task_id"], a["status"]
-    now = _now()
-    if st == "running":
-        cur = conn.execute(
-            "UPDATE tasks SET status='running', started_at=COALESCE(started_at,?), "
-            "last_heartbeat_at=?, claim_lock='seat-sticky', claim_expires=? "
-            "WHERE id=?",
-            (now, now, now + 315360000, task_id),
-        )
-    else:
-        cur = conn.execute(
-            "UPDATE tasks SET status=?, started_at=COALESCE(started_at,?) WHERE id=?",
-            (st, now, task_id),
-        )
-    if cur.rowcount == 0:
-        raise ValueError(f"card {task_id} not found (status NOT changed to {st})")
-    return {"rowcount": cur.rowcount, "status": st}
+    """Reject the obsolete lifecycle-bypassing native status mutation.
+
+    Official clients execute ``kanban_db.set_status`` through interactive broker
+    transactions.  Keeping a second implementation here previously allowed a
+    ready row to retain ``claim_lock='seat-sticky'`` and disappear from every
+    dispatcher disposition.  Fail closed so stale/custom clients cannot recreate
+    that split authority.
+    """
+    del broker, conn, a
+    raise ValueError(
+        "native set_status is disabled; use kb_client.Client.set_status or "
+        "hermes kanban set-status so kanban_db lifecycle invariants run"
+    )
 
 
 def _h_heartbeat(broker, conn, a):

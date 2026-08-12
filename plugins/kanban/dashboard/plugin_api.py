@@ -982,143 +982,13 @@ def _parents_blocking_ready(
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
+    """Compatibility wrapper around the single lifecycle status authority.
 
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
-
-    Review-origin recoveries must not spill into the author queue: when the
-    caller requests ``running -> ready``, derive the effective queue from the
-    open run / task ``dispatch_origin`` (same rule as reclaim/stale recovery)
-    and write ``review`` for review-origin work. Recovery is not a
-    reviewer-to-author handoff.
+    Dashboard drag/drop, ``hermes kanban set-status``, and ``kb_client`` must
+    not maintain independent task/run/claim cleanup rules.  Keeping this name
+    avoids an API churn while all mutations converge on ``kanban_db.set_status``.
     """
-    with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run and which
-        # queue a running->ready recovery must return to.
-        prev = conn.execute(
-            "SELECT status, dispatch_origin, current_run_id "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if prev is None:
-            return False
-
-        was_running = prev["status"] == "running"
-        effective_status = new_status
-        if was_running and new_status == "ready":
-            # Prefer the open run's origin (covers orphaned pointer clears),
-            # then fall back to the task row — matching reclaim/stale recovery.
-            open_run = conn.execute(
-                "SELECT dispatch_origin FROM task_runs "
-                "WHERE task_id = ? AND ended_at IS NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            origin = None
-            if open_run is not None and open_run["dispatch_origin"] is not None:
-                origin = open_run["dispatch_origin"]
-            elif prev["dispatch_origin"] is not None:
-                origin = prev["dispatch_origin"]
-            effective_status = kanban_db._dispatch_retry_status(origin)
-
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        # Review-lane recovery is not an author ready promotion — skip this
-        # gate when the effective queue is review.
-        if effective_status == "ready":
-            parent_statuses = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
-            ):
-                return False
-
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and effective_status not in {"done", "archived"}
-        )
-
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (
-                effective_status,
-                effective_status,
-                effective_status,
-                effective_status,
-                task_id,
-            ),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = None
-        if was_running and effective_status != "running":
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=(
-                    f"status changed to {effective_status} (dashboard/direct)"
-                ),
-            )
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
-            (
-                task_id,
-                run_id,
-                json.dumps({"status": effective_status}),
-                int(time.time()),
-            ),
-        )
-        if reopening_satisfied_parent:
-            # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
-            # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
-            for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
-            ).fetchall():
-                child_id = row["child_id"]
-                demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
-                if demoted.rowcount == 1:
-                    conn.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                        "VALUES (?, 'status', ?, ?)",
-                        (
-                            child_id,
-                            json.dumps(
-                                {
-                                    "status": "todo",
-                                    "reason": "parent_reopened",
-                                    "parent": task_id,
-                                }
-                            ),
-                            int(time.time()),
-                        ),
-                    )
-    # If we re-opened something, children may have gone stale.
-    if new_status in {"done", "ready"}:
-        kanban_db.recompute_ready(conn)
-    return True
+    return kanban_db.set_status(conn, task_id, new_status)
 
 
 # ---------------------------------------------------------------------------
@@ -1400,8 +1270,10 @@ def list_active_workers(
     A worker is a ``task_runs`` row whose ``ended_at`` is NULL and whose
     ``worker_pid`` is non-NULL, belonging to a task with ``status='running'``.
 
-    Returns ``{workers: [...], count: N, checked_at: <epoch>}``.  Each
-    worker entry carries enough context for the dashboard to link back to
+    Returns ``{workers: [...], count: N, checked_at: <epoch>,
+    heavy_workspace: {...}}``.  The host-wide capacity snapshot makes current
+    usage, availability, and FIFO waiters visible without triggering dispatch.
+    Each worker entry carries enough context for the dashboard to link back to
     its task without a second round-trip.
     """
     board = _resolve_board(board)
@@ -1447,7 +1319,14 @@ def list_active_workers(
             }
             for row in rows
         ]
-        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+        return {
+            "workers": workers,
+            "count": len(workers),
+            "checked_at": int(time.time()),
+            "heavy_workspace": kanban_db.heavy_workspace_capacity_snapshot(
+                kanban_db.configured_heavy_workspace_limit()
+            ),
+        }
     finally:
         conn.close()
 
@@ -2002,8 +1881,22 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        try:
+            from hermes_cli.config import load_config
+
+            configured_heavy_limit = (
+                (load_config().get("kanban") or {}).get("max_heavy_workspaces")
+            )
+        except Exception:
+            configured_heavy_limit = None
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_heavy_workspaces=kanban_db.resolve_heavy_workspace_limit(
+                configured_heavy_limit
+            ),
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:

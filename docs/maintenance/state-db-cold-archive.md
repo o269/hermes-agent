@@ -1,114 +1,210 @@
 # Hermes state.db cold archival pass
 
-This runbook documents the staged 30-day hot / 7-day archived-grace / cold-QMD pass implemented by `hermes sessions cold-archive`.
+This runbook documents the fail-closed 30-day hot / 7-day archived-grace / cold-QMD workflow implemented by `hermes sessions cold-archive`.
+
+The workflow has separate custody phases:
+
+1. a producer creates a new restricted stage, rollback source bundle, encrypted offsite packets, and producer receipt;
+2. Fable/operator freezes and approves exact external copies of both
+   `GATE-B-MANIFEST.json` and `COLD-ARCHIVE-PRODUCER-RECEIPT.json`, including
+   their SHA-256 values;
+3. apply loads that existing stage without regenerating or overwriting anything, re-verifies encrypted remote custody, and mutates only the offline candidate;
+4. after cutover, an explicit marker starts the 14-day source-bundle retention clock.
 
 ## Non-goals and hard fences
 
-- Do not run this command against the active profile database at `~/.hermes/state.db`; the command refuses that path, any symlink to it, and any hardlink/alias that shares its inode.
+- Do not run this command against any active default, current, or named-profile `state.db`, sidecar, symlink, or hardlink alias. The command compares device/inode identity across all profiles.
 - Do not enable `sessions.auto_prune`.
 - Do not run `hermes sessions optimize`, `VACUUM`, FTS optimize, WAL checkpoint, live `DELETE`, config changes, service changes, rclone sync/delete/purge/dedupe, or a production upload as part of author verification.
-- The command only mutates an offline recovered candidate when `--apply-retention` is explicitly supplied **and** custody gates below are satisfied.
-- Never remotely publish restricted session IDs, the lineage parent map, or QMD plaintext. Ever.
-- Never delete `system_prompts` rows (including orphans); they are out of declared scope.
-- Do not overwrite an existing `GATE-B-MANIFEST.json` with different bytes; use a fresh `--stage-root`.
-- **Gate-B must not self-approve.** Destructive retention requires an externally supplied `--approved-gate-b-sha256` and a distinct `--approver-identity` that is not the `--requestor-identity`.
-- **No delete without verified offsite permanence.** `--apply-retention` refuses unless encrypted offsite publish + readback succeeded for public Gate-B + the `.age` rollback bundle (live in this invocation via rclone, or via `--verified-offsite-receipt` covering those objects).
+- The command never installs a candidate over an active database. Fable is the sole cutover/landing operator.
+- A producer stage must not exist. Existing paths, modes, files, symlinks, and sentinels are refused rather than chmodded, repaired, resumed, or overwritten.
+- Apply accepts only an existing mode-0700 stage with mode-0600 regular artifacts
+  and current-user-owned, single-link, mode-0400 approval copies outside the stage,
+  each accompanied by its exact-byte SHA-256.
 
-## Schema prerequisites (fail closed)
+## Required candidate schema and policy
 
-Selection and deletion require durable `sessions.pinned` and `sessions.last_activity_at` columns. If either is missing, the pass refuses. Missing columns are never treated as an empty invariant set.
+Cold retention is intentionally unavailable when durable policy state cannot be proven. The candidate `sessions` table must carry canonical `pinned` and `last_activity_at` columns. Missing columns fail the whole command closed; `NULL` values make that lineage ineligible.
+Both canonical FTS5 roots and all six message-sync triggers are mandatory; missing
+search roots/triggers fail closed before selection or deletion.
 
-## Policy encoded by default
+The current selection rules are:
 
 - Hot: sessions active within 30 days stay live.
 - Warm: already archived sessions get a 7-day reversible grace window.
-- **Hard floor:** cold eligibility cannot drop below inactive age **>= 37 days** (3_196_800 seconds), even if `--hot-days` / `--archive-grace-days` are set to 0.
-- Exact 37-day boundary is eligible (`last_active > cold_cutoff` is the skip rule).
-- A cold candidate must be ended, already archived, unpinned, and outside the effective cold window.
-- Selection is parent/child lineage-component safe: if any row in the component is open, pinned, unarchived, recent, held, or referenced by async/gateway state, the whole group is skipped.
+- Cold eligibility begins at inactive age **>= 37 days**. Exactly on the 37-day boundary is eligible.
+- `--hot-days` plus `--archive-grace-days` may lengthen that window, but their combined value may never be below 37 days. Producer and apply both reject a shorter policy before stage creation or candidate mutation; they never silently clamp it.
+- Effective activity is the freshest of durable `sessions.last_activity_at`, actual `messages.timestamp`, and `sessions.started_at`.
+- A candidate must be ended, archived, unpinned, canonically activity-proven, and outside the hot+grace window.
+- Selection is parent/child lineage-component safe. If any row in a component is open, pinned, unarchived, recent, held, or referenced by async/gateway/compression state, the whole component is skipped.
 - Candidate sizing uses actual `messages` rows, never `sessions.message_count`.
 - Built-in permanent holds preserve customer/ops platform-source history (`telegram`, `discord`, `whatsapp`, `slack`, `signal`, `matrix`, `sms`, `imessage`, `photon`, `wecom`) unless the operator explicitly disables them.
-- Rollback/stage bundles have an explicit **14-day** retention floor (1_209_600 seconds) via `classify_bundle_retention`.
 
-## Gate-B manifest only
+## Gate-B manifest-only sizing
 
-After Fable/operator has quiesced Hermes and produced a recovered offline candidate:
+After Fable/operator has quiesced Hermes and produced an offline candidate, a manifest-only sizing run may be created:
 
 ```bash
 umask 077
 hermes sessions cold-archive \
   --source /secure/offline-candidate/state.db \
-  --stage-root /secure/hermes-state-archive/$(date -u +%Y%m%dT%H%M%SZ) \
+  --stage-root /secure/hermes-state-archive/manifest-$(date -u +%Y%m%dT%H%M%SZ) \
   --manifest-only
 ```
 
 Review:
 
-- `GATE-B-MANIFEST.json` — redacted counts/hashes/reason summary (integrity-gated; not self-overwritten).
-- `restricted/selected-session-ids.txt` — exact IDs; keep mode 0600 and do not attach to public bus/card; **never remote-publish**.
-- `restricted/lineage-parent-map.json` — restricted parent map receipt; **never remote-publish**.
+- `GATE-B-MANIFEST.json` — redacted counts, policy, source byte/device/inode hash,
+  a deterministic type-preserving logical hash over schema and every application table,
+  lineage hashes, and reason summary;
+- `restricted/selected-session-ids.json` — exact selected IDs, JSON-encoded to preserve hostile/control characters safely;
+- `restricted/lineage-parent-map.json` — restricted full parent map receipt.
 
-Record `gate_b_manifest_sha256` from the receipt. **A distinct approver (Fable)** must approve that exact hash before destructive retention. The same actor who requests deletion cannot approve it.
+A manifest-only stage intentionally cannot authorize deletion: it has no rollback/QMD/encrypted-offsite producer proof. To proceed, create a full producer stage below and approve that stage's manifest bytes.
 
-## Export, rollback bundle, and required offsite publish
+## Full producer: rollback, QMD, encryption, and offsite proof
 
-The reviewed run creates a lossless rollback bundle before any deletion and local redacted QMD exports for the cold set (QMD stays on the stage; it is not remotely published). Encrypted offsite permanence is required before delete:
+The full producer also never deletes. It requires age and rclone custody up front:
+
+```bash
+umask 077
+hermes sessions cold-archive \
+  --source /secure/offline-candidate/state.db \
+  --stage-root /secure/hermes-state-archive/producer-$(date -u +%Y%m%dT%H%M%SZ) \
+  --age-recipient-file /etc/hermes-state-archive.age.pub \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
+  --rclone-remote gdrive:vps-offload/hermes-state-archives
+```
+
+The producer creates and verifies, in order:
+
+1. an exact local rollback source bundle using bounded member names `state.db`,
+   `state.db-wal`, `state.db-shm`, and `state.db-journal` for the database and every
+   present sidecar, plus a per-member hash manifest;
+2. restricted, redacted QMD under safe collision-resistant basenames that cannot escape `cold-qmd/`;
+3. `ROLLBACK-SOURCE-BUNDLE.tar.gz.age`, an opaque encrypted rollback packet;
+4. `RESTRICTED-COLD-QMD.tar.gz.age`, one opaque encrypted packet containing exact IDs, the parent map, QMD, and a file/hash index;
+5. both encrypted packets uploaded, checksum-checked, and exactly read back;
+6. the clear redacted `GATE-B-MANIFEST.json` uploaded last as the sole clear commit marker.
+
+No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Uploads use directory-targeted `rclone copy --immutable`
+(not `copyto`, which can replace a destination on supported backends), followed by
+`rclone check --checksum --one-way` and exact `copyto` readback. There is no remote
+delete, sync, purge, dedupe, move, cleanup, or retention verb. The age recipient is
+read once into `restricted/AGE-RECIPIENTS.txt`; rclone config bytes are copied once
+into a private per-operation temporary snapshot. Every subprocess uses only those
+frozen bytes, and their hashes are rechecked around use.
+
+The private age identity must never be stored in the repository, bus, board, stage, or runtime path.
+
+## External approval and destructive apply
+
+Fable/operator must freeze exact copies of the manifest and final producer receipt
+outside the mutable stage and record both hashes:
+
+```bash
+install -m 0400 /secure/hermes-state-archive/<producer>/GATE-B-MANIFEST.json \
+  /secure/hermes-state-approvals/GATE-B-MANIFEST.json
+install -m 0400 /secure/hermes-state-archive/<producer>/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
+  /secure/hermes-state-approvals/COLD-ARCHIVE-PRODUCER-RECEIPT.json
+sha256sum /secure/hermes-state-approvals/{GATE-B-MANIFEST,COLD-ARCHIVE-PRODUCER-RECEIPT}.json
+```
+
+Apply requires that exact file and exact SHA-256. It does not regenerate the manifest, rewrite exports, chmod the stage, or upload replacement objects:
 
 ```bash
 hermes sessions cold-archive \
   --source /secure/offline-candidate/state.db \
-  --stage-root /secure/hermes-state-archive/<same-or-new-run> \
-  --age-recipient-file /etc/hermes-state-archive.age.pub \
-  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
-  --rclone-remote gdrive:vps-offload/hermes-state-archives \
-  --remote-namespace hermes-state/<approved-manifest-sha>
+  --stage-root /secure/hermes-state-archive/<producer> \
+  --apply-retention \
+  --approved-manifest /secure/hermes-state-approvals/GATE-B-MANIFEST.json \
+  --approved-manifest-sha256 <exact-64-hex-file-sha256> \
+  --approved-producer-receipt /secure/hermes-state-approvals/COLD-ARCHIVE-PRODUCER-RECEIPT.json \
+  --approved-producer-receipt-sha256 <exact-64-hex-producer-receipt-sha256> \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf
 ```
 
-Remote publish is copy-only and limited to:
+Before opening a write transaction, apply proves candidate device/inode/bytes/SHA and
+complete logical state match the approved source snapshot and performs fresh
+checksum/readback verification of both encrypted packets and the final manifest.
 
-- public `GATE-B-MANIFEST.json`
-- age-encrypted rollback bundle (`.tar.gz.age`)
+Then it acquires `BEGIN IMMEDIATE` and, while holding that lock:
 
-It performs `rclone copyto`, `rclone check --checksum --one-way`, and an exact byte readback for every object. It does not run remote deletion, sync, purge, dedupe, move, cleanup, or retention. Only integrity token `rclone-checksum-and-readback-ok` counts as a verified offsite receipt entry.
+- repeats active-DB inode custody fencing and approved source device/inode/logical-state checks;
+- revalidates ended, archived, unpinned, canonical activity, exact cold boundary, permanent holds, whole-lineage selection, async/gateway/compression references, and selected message count;
+- captures complete type-preserving survivor rows plus parent/open/pinned/hot/message/FTS invariants;
+- deletes only selected sessions and their documented dependent rows;
+- deletes only prompt hashes formerly referenced by selected sessions and now unreferenced; unrelated pre-existing prompt orphans remain untouched;
+- verifies all session/message deltas, complete survivor row payloads, survivor parent map,
+  open/pinned/hot sets, `PRAGMA integrity_check == ['ok']`, zero foreign-key violations,
+  total-message parity in both FTS tables, deleted FTS rowid absence, and type-preserving
+  survivor FTS content digests;
+- fsyncs `COLD-ARCHIVE-APPLY-PREPARED.json`, including the verified post-state logical
+  digest, and commits only after every invariant passes. Any failure rolls back all
+  selected/dependent deletion and trigger side effects.
 
-The private age identity must never be stored in the repository, bus, board, or on the VPS runtime path.
+`COLD-ARCHIVE-RETENTION-RECEIPT.json` is exclusively created only after the checked
+transaction commits. If the process stops after commit but before that final receipt
+write, replay verifies the prepared post-state digest and reconstructs the final receipt
+without deleting again. Existing receipts are never clobbered.
 
-## Applying retention to the offline candidate
+## Rollback proof and restore
 
-Only after:
+`rollback/rollback-source-bundle.tar.gz` is the exact pre-retention local source bundle. Before any restore:
 
-1. Gate-B export is complete,
-2. A **distinct** approver has approved the exact `gate_b_manifest_sha256`,
-3. Encrypted offsite publish + readback has produced a positive permanence receipt,
+1. verify the tar SHA-256 from `COLD-ARCHIVE-PRODUCER-RECEIPT.json`;
+2. read `ROLLBACK-BUNDLE-MANIFEST.json` from the tar without unsafe `extractall`;
+3. verify every member basename, byte count, SHA-256, and private mode;
+4. restore `state.db` as the main database and append each copied fixed suffix
+   (`-wal`, `-shm`, `-journal`) to the chosen restore basename;
+5. open the restored database and require `PRAGMA integrity_check` exactly `ok`, zero foreign-key rows, and logical selected/dependent row parity.
+
+If a candidate has already served new sessions, preserve both the failed candidate and rollback bundle, then stop for an operator decision on delta recovery instead of blindly discarding new rows.
+
+## Cutover-clocked 14-day source-bundle retention
+
+Bundle creation writes immutable `rollback/SOURCE-BUNDLE-RETENTION-POLICY.json` in state `awaiting-cutover`. Creation time does **not** start deletion eligibility.
+
+After a successful healthy cutover, record the real wall clock (the CLI exposes no arbitrary/backdated timestamp):
 
 ```bash
-hermes sessions cold-archive \
-  --source /secure/offline-candidate/state.db \
-  --stage-root /secure/hermes-state-archive/<approved-run> \
-  --age-recipient-file /etc/hermes-state-archive.age.pub \
+hermes sessions cold-archive-mark-cutover \
+  --stage-root /secure/hermes-state-archive/<producer> \
   --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
-  --rclone-remote gdrive:vps-offload/hermes-state-archives \
-  --remote-namespace hermes-state/<approved-manifest-sha> \
-  --approved-gate-b-sha256 <approved-manifest-sha> \
-  --requestor-identity "ops@example" \
-  --approver-identity "fable" \
-  --apply-retention
+  --candidate-health-confirmed
 ```
 
-Alternatively, pass `--verified-offsite-receipt /path/to/prior-receipt.json` (full prior cold-archive receipt or its `remote_publish` list) instead of re-running rclone in the delete invocation. The receipt is re-verified (existence of Gate-B + `.age` entries, integrity token, sha256==readback_sha256, and local Gate-B bytes bind) — prior-step success is never assumed.
+This requires the committed retention receipt, freshly re-reads remote custody, and
+exclusively creates `rollback/CANDIDATE-CUTOVER.json` bound to rollback, producer,
+and retention-receipt hashes. Freeze its exact hash externally before pruning:
 
-Single-shot self-build + self-hash + delete **without** external approval identities and offsite proof **fails closed**.
+```bash
+sha256sum /secure/hermes-state-archive/<producer>/rollback/CANDIDATE-CUTOVER.json
+```
 
-The deletion transaction removes only selected sessions and their dependent `messages`, `session_model_usage`, `compression_locks`, and topic-binding rows. It never reparents surviving sessions. **Invariant checks run inside the same transaction as the deletes** — any failure rolls the deletion back.
+Only after the candidate has remained healthy for at least 1,209,600 seconds (14 days), run:
 
-Post-delete verification requires:
+```bash
+hermes sessions cold-archive-prune-bundle \
+  --stage-root /secure/hermes-state-archive/<producer> \
+  --approved-cutover-marker-sha256 <exact-64-hex-cutover-marker-sha256> \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
+  --candidate-health-confirmed
+```
 
-- `PRAGMA integrity_check` exactly `ok`;
-- `PRAGMA foreign_key_check` zero rows;
-- actual session/message deltas equal the approved manifest;
-- open, pinned, and hot session ID sets unchanged;
-- surviving `parent_session_id` map byte-equivalent to the pre-delete map;
-- FTS document counts match `messages` and non-tool messages.
+Before the exact boundary, or forever without a cutover marker, it deletes nothing. At `cutover_epoch + 1_209_600` or later it removes only:
+
+- local plaintext `rollback/source-bundle/`;
+- local plaintext `rollback/rollback-source-bundle.tar.gz`.
+
+It first fsyncs `SOURCE-BUNDLE-PRUNE-PREPARED.json` with exact member hashes, then
+removes the plaintext members and exclusively creates `SOURCE-BUNDLE-PRUNED.json`.
+Replay recovers from any already-deleted prepared member, so a final-receipt crash is
+idempotent. Replay also revalidates the complete cutover/retention/prepare binding and
+fails closed if either plaintext bundle artifact reappears. It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD,
+producer/retention receipts, and every remote object. Marker/hash tampering, missing
+freshly verified remote custody, non-finite/rolled-back clocks, or missing
+candidate-health confirmation fails closed.
 
 ## Rebuild / cutover custody
 
@@ -123,9 +219,3 @@ hermes sessions recover \
 ```
 
 This command also never installs the candidate over the active database automatically. Fable is the sole lander/cutover operator.
-
-## Rollback
-
-Before candidate cutover, rollback is a direct restoration of the exact source bundle captured before retention while Hermes is fully stopped. Verify the rollback bundle manifest hashes before restore. Bundles younger than 14 days (1_209_600s) must be retained.
-
-If a candidate has already served new sessions, preserve both the failed candidate and rollback bundle, then stop for an operator decision on delta recovery instead of blindly discarding new rows.

@@ -188,6 +188,7 @@ _ORIG_ADD_COMMENT = None
 _ORIG_HEARTBEAT_WORKER = None
 _ORIG_SET_WORKSPACE_PATH = None
 _ORIG_SET_BRANCH_NAME = None
+_ORIG_SET_STATUS = None
 _ORIG_CHECK_FILE_LENGTH_INVARIANT = None
 
 _route_log = logging.getLogger("boardd_shim")
@@ -204,7 +205,7 @@ def _capture_original(kdb):
     global _KDB, _ORIG_CONNECT, _ORIG_CONNECT_CLOSING
     global _ORIG_ADD_COMMENT, _ORIG_HEARTBEAT_WORKER
     global _ORIG_SET_WORKSPACE_PATH, _ORIG_SET_BRANCH_NAME
-    global _ORIG_CHECK_FILE_LENGTH_INVARIANT
+    global _ORIG_SET_STATUS, _ORIG_CHECK_FILE_LENGTH_INVARIANT
     if _KDB is kdb:
         return
     if _KDB is not None:
@@ -222,6 +223,7 @@ def _capture_original(kdb):
         kdb.heartbeat_worker,
         kdb.set_workspace_path,
         kdb.set_branch_name,
+        getattr(kdb, "set_status", None),
         kdb._check_file_length_invariant,
     )
     (
@@ -231,6 +233,7 @@ def _capture_original(kdb):
         _ORIG_HEARTBEAT_WORKER,
         _ORIG_SET_WORKSPACE_PATH,
         _ORIG_SET_BRANCH_NAME,
+        _ORIG_SET_STATUS,
         _ORIG_CHECK_FILE_LENGTH_INVARIANT,
     ) = originals
     _KDB = kdb
@@ -495,6 +498,24 @@ def set_branch_name(conn, task_id, branch_name):
     return None
 
 
+def set_status(conn, task_id, status):
+    """Route every brokered status transition through kanban_db authority.
+
+    The boardd-native operation updates only ``tasks.status`` and historically
+    leaked ``claim_lock`` when a running/manual card was returned to ``ready``.
+    Execute the captured policy-complete implementation over BrokerConnection
+    instead, just as the canonical claim path does.
+    """
+    if not isinstance(conn, BrokerConnection):
+        return _require_original(
+            "set_status", _ORIG_SET_STATUS
+        )(conn, task_id, status)
+    _cov("set_status")
+    return _require_original(
+        "set_status", _ORIG_SET_STATUS
+    )(conn, task_id, status)
+
+
 def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
     if not isinstance(conn, BrokerConnection):
         return _require_original(
@@ -568,7 +589,7 @@ def _row_to_task(kdb, row):
 # on the BrokerConnection.
 REBIND_NAMES = (
     "connect", "connect_closing", "add_comment",
-    "heartbeat_worker", "set_workspace_path", "set_branch_name",
+    "heartbeat_worker", "set_workspace_path", "set_branch_name", "set_status",
 )
 
 
@@ -588,4 +609,5 @@ def install_rebind(kdb):
     kdb.heartbeat_worker = heartbeat_worker
     kdb.set_workspace_path = set_workspace_path
     kdb.set_branch_name = set_branch_name
+    kdb.set_status = set_status
     kdb._check_file_length_invariant = noop_flen

@@ -114,6 +114,7 @@ def _dispatch_lock_holder(home: str, entered, release, output) -> None:
     from hermes_cli import kanban_db as child_kb
 
     def blocking_spawn(*_args, **_kwargs):
+        assert _kwargs.get("heavy_workspace_lease") is None
         entered.set()
         assert release.wait(10)
         return 99101
@@ -141,7 +142,12 @@ def test_two_concurrent_dispatcher_processes_allow_only_lock_holder(
     conn, kanban_home
 ):
     """The losing invocation must perform no claim, run creation, or spawn."""
-    task_id = kb.create_task(conn, title="one", assignee="w")
+    task_id = kb.create_task(
+        conn,
+        title="one",
+        body="Resource-Class: light\nDispatch-lock unit test.",
+        assignee="w",
+    )
     ctx = multiprocessing.get_context("spawn")
     entered = ctx.Event()
     release = ctx.Event()
