@@ -72,6 +72,19 @@ class StaticBoardClient:
         raise AssertionError("malformed summaries must stop before row discovery")
 
 
+class InconsistentBoardClient:
+    def query(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        max_rows: int | None = None,
+    ) -> list[dict[str, Any]]:
+        del params, max_rows
+        if "COUNT(*)" in sql:
+            return [{"total_tasks": 1, "running_tasks": 1, "live_workspaces": 1}]
+        return []
+
+
 class SnapshotBoardClient(FakeBoardClient):
     """Return one authoritative snapshot, then a changed recheck snapshot."""
 
@@ -224,6 +237,7 @@ def test_dry_run_is_default_and_retention_remains_a_gate(tmp_path: Path) -> None
             ),
             "board_empty",
         ),
+        (InconsistentBoardClient(), "board_snapshot_inconsistent"),
     ],
 )
 def test_bad_authoritative_board_source_deletes_nothing(
