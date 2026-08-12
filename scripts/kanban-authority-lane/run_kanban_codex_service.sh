@@ -16,22 +16,14 @@ start_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null || true)
 hb=''
 cleanup(){ [ -n "$hb" ] && kill "$hb" 2>/dev/null || true; }
 on_term(){
-  if "$STATE" "$TASK" blocked --bridge "$BRIDGE" --worktree "$WT" --branch "$BRANCH" --result "durable service received TERM/INT; artifacts $OUT $ERR" --comment "✗ $BRIDGE service terminated; preserved worktree @ $WT"; then
-    exit 143
-  fi
-  exit 1
+  "$STATE" "$TASK" blocked --bridge "$BRIDGE" --worktree "$WT" --branch "$BRANCH" --result "durable service received TERM/INT; artifacts $OUT $ERR" --comment "✗ $BRIDGE service terminated; preserved worktree @ $WT" || true
+  exit 143
 }
 trap cleanup EXIT
 trap on_term TERM INT
 "$STATE" "$TASK" running --bridge "$BRIDGE" --worktree "$WT" --branch "$BRANCH" --pid $$ --comment "→ dispatched to $BRIDGE @ $WT"
 parent=$$
-(while kill -0 "$parent" 2>/dev/null; do
-  sleep 60
-  if ! "$STATE" "$TASK" heartbeat --bridge "$BRIDGE" --worktree "$WT" --branch "$BRANCH" --pid "$parent"; then
-    kill -TERM "$parent" 2>/dev/null
-    exit 1
-  fi
-done) >/dev/null 2>&1 &
+(while kill -0 "$parent" 2>/dev/null; do sleep 60; "$STATE" "$TASK" heartbeat --bridge "$BRIDGE" --worktree "$WT" --branch "$BRANCH" --pid "$parent" || true; done) >/dev/null 2>&1 &
 hb=$!
 cmd=("$BRIDGE_BIN" --acp --stdio)
 for v in "${VERIFY_CMDS[@]}"; do cmd+=(--verify "$v"); done

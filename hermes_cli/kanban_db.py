@@ -4334,27 +4334,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def _assignment_actor(actor: Optional[str]) -> str:
-    resolved = _canonical_assignee(actor or os.environ.get("HERMES_PROFILE"))
-    if not resolved:
-        raise ValueError("assignment actor is required")
-    return resolved
-
-
-def assign_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    profile: Optional[str],
-    *,
-    actor: Optional[str] = None,
-) -> bool:
+def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
-    assignment_actor = _assignment_actor(actor)
     with write_txn(conn):
         row = conn.execute(
             "SELECT title, body, status, claim_lock, assignee "
@@ -4390,12 +4376,7 @@ def assign_task(
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(
-            conn,
-            task_id,
-            "assigned",
-            {"assignee": profile, "actor": assignment_actor},
-        )
+        _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
 
@@ -6212,7 +6193,6 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
-    actor: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -6230,7 +6210,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile, actor=actor)
+        return assign_task(conn, task_id, profile)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.

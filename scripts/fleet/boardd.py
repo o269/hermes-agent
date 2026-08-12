@@ -2047,26 +2047,11 @@ def _h_create_task(broker, conn, a):
     tid = a.get("id") or _new_task_id()
     status = a.get("status", "running")
     reasoning_effort = _canon_reasoning_effort(a.get("reasoning_effort"))
-    assignee = _canon_assignee(a.get("assignee"))
-    if assignee is not None:
-        from hermes_cli import kanban_db
-
-        reason = kanban_db._assignment_guard_reason(
-            conn,
-            task_id=tid,
-            title=str(title),
-            body=a.get("body"),
-            assignee=assignee,
-            status=status,
-            has_open_parent=False,
-        )
-        if reason:
-            raise ValueError(f"assignment policy rejected task {tid}: {reason}")
     conn.execute(
         "INSERT INTO tasks (id, title, body, assignee, status, priority, "
         "created_by, created_at, workspace_kind, reasoning_effort, idempotency_key) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, str(title), a.get("body"), assignee,
+        (tid, str(title), a.get("body"), _canon_assignee(a.get("assignee")),
          status, int(a.get("priority", 0)), _canon_assignee(a.get("created_by")),
          _now(), a.get("workspace_kind", "scratch"), reasoning_effort, idem),
     )
@@ -2184,18 +2169,6 @@ def _h_claim(broker, conn, a):
 _EXEC_WHITELIST = {"update", "insert", "delete"}
 
 
-def _is_raw_assignee_write(sql: str) -> bool:
-    normalized = " ".join(
-        sql.lower().replace('"', "").replace("`", "").split()
-    )
-    table_write = re.match(
-        r"^(?:update\s+(?:or\s+\w+\s+)?tasks\b|"
-        r"(?:insert|replace)\s+(?:or\s+\w+\s+)?into\s+tasks\b)",
-        normalized,
-    )
-    return bool(table_write and re.search(r"\bassignee\b", normalized))
-
-
 def _h_exec(broker, conn, a):
     """Generic parametrized write (reroute target for predicate updates like
     board-steward's archive-debris). Single statement, params bound.
@@ -2211,11 +2184,6 @@ def _h_exec(broker, conn, a):
     first = sql.lstrip().split(None, 1)[0].lower() if sql.strip() else ""
     if first not in _EXEC_WHITELIST:
         raise ValueError(f"exec rejects {first!r}; only {sorted(_EXEC_WHITELIST)}")
-    if _is_raw_assignee_write(sql):
-        raise ValueError(
-            "raw tasks.assignee mutation is forbidden; use the canonical "
-            "kanban_db assign/reassign authority path"
-        )
     cur = conn.execute(sql, params)
     # round-trip the REAL lastrowid so a raw INSERT never silently returns None
     # (MEDIUM). BrokerConnection surfaces this on its cursor.

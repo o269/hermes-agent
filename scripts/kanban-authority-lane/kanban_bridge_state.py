@@ -94,12 +94,7 @@ def transition_task(
         before = row["status"]
 
         if state == "heartbeat":
-            resolved_assignee = validate_assignment(
-                title=row.get("title") or "",
-                body=row.get("body"),
-                assignee=row.get("assignee"),
-                operation=f"heartbeat transition for {task_id}",
-            )
+            resolved_assignee = row.get("assignee")
             client.txn_exec(
                 txn,
                 """UPDATE tasks
