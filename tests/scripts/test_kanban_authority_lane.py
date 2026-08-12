@@ -817,6 +817,22 @@ def test_transition_reports_broker_readback_mismatch():
         _transition(broker)
 
 
+def test_heartbeat_validates_existing_assignment_before_writing():
+    broker = MemoryBroker()
+    broker.seed(
+        task_id="t_executor",
+        title="[AUTHOR] executor patch",
+        assignee="fable",
+        status="running",
+    )
+
+    with pytest.raises(policy.AuthorityLaneError, match="executor-shaped work"):
+        _transition(broker, state="heartbeat")
+
+    row = broker.get_task("t_executor")
+    assert row["last_heartbeat_at"] is None
+
+
 WRAPPERS = (
     "kanban_codex_service.sh",
     "kanban_subscription_acp_service.sh",
@@ -1062,6 +1078,23 @@ def test_wrapper_stops_before_executor_when_running_transition_is_rejected(
     assert not marker.exists()
     calls = [json.loads(line) for line in state_log.read_text().splitlines()]
     assert [call[1] for call in calls] == ["running"]
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    (
+        "kanban_codex_service.sh",
+        "kanban_subscription_acp_service.sh",
+        "run_kanban_codex_service.sh",
+    ),
+)
+def test_generic_wrappers_do_not_swallow_state_failures(wrapper: str):
+    script = (ASSET_DIR / wrapper).read_text(encoding="utf-8")
+    state_lines = [line for line in script.splitlines() if '"$STATE"' in line]
+
+    assert state_lines
+    assert all("|| true" not in line for line in state_lines)
+    assert "kill -TERM \"$parent\"" in script
 
 
 @pytest.mark.parametrize("wrapper", HISTORICAL_ONE_OFF_WRAPPERS)

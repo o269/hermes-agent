@@ -34,12 +34,20 @@ if [ -z "$start_head" ]; then printf 'not a git worktree: %s\n' "$WT" >&2; exit 
 
 "$STATE" "$TASK" running --bridge "$BRIDGE_LABEL" --worktree "$WT" --branch "$BRANCH" --pid $$ --comment "→ dispatched to $BRIDGE_LABEL @ $WT"
 parent=$$
-(while kill -0 "$parent" 2>/dev/null; do sleep 60; "$STATE" "$TASK" heartbeat --bridge "$BRIDGE_LABEL" --worktree "$WT" --branch "$BRANCH" --pid "$parent" || true; done) >/dev/null 2>&1 &
+(while kill -0 "$parent" 2>/dev/null; do
+  sleep 60
+  if ! "$STATE" "$TASK" heartbeat --bridge "$BRIDGE_LABEL" --worktree "$WT" --branch "$BRANCH" --pid "$parent"; then
+    kill -TERM "$parent" 2>/dev/null
+    exit 1
+  fi
+done) >/dev/null 2>&1 &
 hb=$!
 cleanup() { kill "$hb" 2>/dev/null || true; }
 on_term() {
-  "$STATE" "$TASK" blocked --bridge "$BRIDGE_LABEL" --worktree "$WT" --branch "$BRANCH" --result "durable ACP service received termination signal; inspect $ERR" --comment "✗ $BRIDGE_LABEL service terminated; preserved worktree @ $WT; see $ERR" || true
-  exit 143
+  if "$STATE" "$TASK" blocked --bridge "$BRIDGE_LABEL" --worktree "$WT" --branch "$BRANCH" --result "durable ACP service received termination signal; inspect $ERR" --comment "✗ $BRIDGE_LABEL service terminated; preserved worktree @ $WT; see $ERR"; then
+    exit 143
+  fi
+  exit 1
 }
 trap cleanup EXIT
 trap on_term TERM INT

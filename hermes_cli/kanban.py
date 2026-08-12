@@ -1799,7 +1799,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+        ok = kb.assign_task(conn, args.task_id, profile, actor="kanban-cli")
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -1830,6 +1830,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
+            actor="kanban-cli",
         )
     if not ok:
         print(

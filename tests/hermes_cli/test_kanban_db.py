@@ -1615,8 +1615,25 @@ def test_assign_refuses_while_running(kanban_home):
 def test_assign_reassigns_when_not_running(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
-        assert kb.assign_task(conn, t, "b")
+        assert kb.assign_task(conn, t, "b", actor="operator")
         assert kb.get_task(conn, t).assignee == "b"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='assigned' "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert json.loads(event["payload"]) == {"actor": "operator", "assignee": "b"}
+
+
+def test_assign_requires_actor_without_profile_context(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        with pytest.raises(ValueError, match="assignment actor is required"):
+            kb.assign_task(conn, t, "b")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.assignee == "a"
 
 
 def test_assignee_normalized_to_lowercase_on_create_and_assign(kanban_home):
