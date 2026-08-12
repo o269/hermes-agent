@@ -230,6 +230,11 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     import os as _os
     from datetime import datetime, timezone
 
+    # Lane-health receipts are fleet control-plane state, not a portable
+    # prerequisite for every Hermes board.  Keep the production fleet gate,
+    # while ordinary/local boards route against their configured profiles.
+    fleet_health_gate = kb.get_current_board() == "fleet"
+
     _LANE_HEALTH_DIR = _os.environ.get(
         "LANE_HEALTH_DIR", "/home/odai/godmode-bus/lane-health",
     )
@@ -250,7 +255,7 @@ def _build_roster() -> tuple[list[dict], set[str]]:
                 return False
             ok = False
             probed = None
-            with open(rp, "r", errors="replace") as fh:
+            with open(rp, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     line = line.strip()
                     if line.startswith("status="):
@@ -285,24 +290,25 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     # directory names into the candidate set so the health-gated roster
     # spans BOTH boxes (operator D3 directive 2026-08-04).
     receipt_names = set()
-    try:
-        for fn in _os.listdir(_LANE_HEALTH_DIR):
-            if fn.endswith(".env"):
-                receipt_names.add(fn[:-4])
-    except Exception:
-        pass
+    if fleet_health_gate:
+        try:
+            for fn in _os.listdir(_LANE_HEALTH_DIR):
+                if fn.endswith(".env"):
+                    receipt_names.add(fn[:-4])
+        except Exception:
+            pass
 
     local_names = {getattr(p, "name", "") for p in all_profiles}
     for rn in sorted(receipt_names - local_names):
         all_profiles.append(type("RP", (), {"name": rn, "description": ""})())
 
     for p in all_profiles:
-        if p.name.startswith(_DE_ROSTER_PREFIXES):
+        if fleet_health_gate and p.name.startswith(_DE_ROSTER_PREFIXES):
             logger.info(
                 "decompose: %s de-rostered (operator denylist until LANE_OK probe)", p.name,
             )
             continue
-        if not _has_fresh_receipt(p.name):
+        if fleet_health_gate and not _has_fresh_receipt(p.name):
             logger.info(
                 "decompose: %s excluded — no lane-health LANE_OK receipt newer than 24h", p.name,
             )

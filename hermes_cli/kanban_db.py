@@ -6342,6 +6342,266 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _close_open_status_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+) -> Optional[int]:
+    """Close every open run owned by ``task_id`` during a status transition.
+
+    ``_end_run`` owns the ordinary current-run path.  The second update is a
+    narrow invariant repair for a leaked open run whose task pointer was already
+    cleared by an older writer.  Returning the newest affected run id lets the
+    caller associate the status/custody event with the attempt being released.
+    Called only inside an existing ``write_txn``.
+    """
+    open_rows = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    open_ids = [int(row["id"]) for row in open_rows]
+    current_run_id = _end_run(
+        conn,
+        task_id,
+        outcome="reclaimed",
+        status="reclaimed",
+        summary=summary,
+    )
+    now = int(time.time())
+    conn.execute(
+        "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+        "summary = COALESCE(summary, ?), ended_at = ?, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+        "WHERE task_id = ? AND ended_at IS NULL",
+        (summary, now, task_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+        (task_id,),
+    )
+    if current_run_id is not None and current_run_id in open_ids:
+        return current_run_id
+    return open_ids[0] if open_ids else None
+
+
+def set_status(conn: sqlite3.Connection, task_id: str, status: str) -> bool:
+    """Canonical direct status authority for clients and the dashboard.
+
+    Entering ``running`` uses the ordinary claim machinery with a distinctive
+    ``seat-sticky`` manual lease.  Every transition away from ``running`` closes
+    open run ownership and clears denormalized claim/PID fields.  Re-applying a
+    non-running status also repairs custody leaked by the retired boardd-native
+    status writer.
+
+    This live compatibility line intentionally retains its existing queue
+    semantics: ``running -> ready`` means ``ready``.  It has no
+    ``dispatch_origin``/review-origin carry-forward schema.
+    """
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+
+    current = get_task(conn, task_id)
+    if current is None:
+        return False
+
+    if status == "running":
+        if current.status == "running":
+            # Idempotent refresh for the same manual owner; never steal a live
+            # dispatcher claim merely because a status command was repeated.
+            if current.claim_lock != "seat-sticky":
+                return False
+            return heartbeat_worker(
+                conn,
+                task_id,
+                note="manual status refresh",
+                expected_run_id=current.current_run_id,
+            )
+        if current.status == "ready":
+            claimed = claim_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+        elif current.status == "review":
+            claimed = claim_review_task(
+                conn,
+                task_id,
+                claimer="seat-sticky",
+                ttl_seconds=315360000,
+            )
+        else:
+            raise ValueError(
+                "status 'running' requires a ready or review task; "
+                "use a structured transition into a queue first"
+            )
+        if claimed is None:
+            return False
+        return heartbeat_worker(
+            conn,
+            task_id,
+            note="manual status claim",
+            expected_run_id=claimed.current_run_id,
+        )
+
+    recompute_after = False
+    with write_txn(conn):
+        prev = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        open_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        was_running = prev["status"] == "running"
+        stale_nonrunning_custody = prev["status"] != "running" and (
+            prev["current_run_id"] is not None
+            or prev["claim_lock"] is not None
+            or prev["claim_expires"] is not None
+            or prev["worker_pid"] is not None
+            or open_run is not None
+        )
+        run_id: Optional[int] = None
+        if stale_nonrunning_custody:
+            run_id = _close_open_status_runs(
+                conn,
+                task_id,
+                summary="repaired stale custody before direct status transition",
+            )
+
+        # Ready is a queue, not a visual label.  Preserve the branch's parent
+        # gate and count archived parents as terminal, matching claim_task.
+        if status == "ready":
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone_parent is not None:
+                return False
+
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and status not in {"done", "archived"}
+        )
+        if was_running:
+            run_id = _close_open_status_runs(
+                conn,
+                task_id,
+                summary=f"status changed to {status} (direct)",
+            )
+
+        clean_noop = (
+            prev["status"] == status
+            and not stale_nonrunning_custody
+            and not was_running
+        )
+        if clean_noop:
+            return True
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ?",
+            (status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        payload: dict[str, Any] = {"status": status}
+        if stale_nonrunning_custody:
+            payload["repaired_stale_custody"] = True
+        _append_event(conn, task_id, "status", payload, run_id=run_id)
+
+        if reopening_satisfied_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {
+                            "status": "todo",
+                            "reason": "parent_reopened",
+                            "parent": task_id,
+                        },
+                    )
+        recompute_after = status in {"done", "archived", "ready"}
+
+    if recompute_after:
+        recompute_ready(conn)
+    return True
+
+
+def repair_stale_manual_queue_custody(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """Repair only legacy queue rows with abandoned manual custody.
+
+    The retired native status writer could leave ``ready``/``review`` rows with
+    a ``seat-sticky`` lease after their manual process had gone away.  Such rows
+    are absent from both dispatch candidate queries.  This reconciler is
+    intentionally not a general sweeper: status, lease marker, and NULL worker
+    PID must all match, so a legitimately claimed running task is untouched.
+    """
+    repaired: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status IN ('ready', 'review') "
+            "AND claim_lock = 'seat-sticky' "
+            "AND worker_pid IS NULL "
+            "ORDER BY created_at, id"
+        ).fetchall()
+        for row in rows:
+            task_id = str(row["id"])
+            run_id = _close_open_status_runs(
+                conn,
+                task_id,
+                summary="repaired stale manual custody before dispatch",
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "current_run_id = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('ready', 'review') "
+                "AND claim_lock = 'seat-sticky' AND worker_pid IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                task_id,
+                "custody_repaired",
+                {
+                    "source": "legacy_native_set_status",
+                    "claim_lock": "seat-sticky",
+                },
+                run_id=run_id,
+            )
+            repaired.append(task_id)
+    return repaired
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9034,7 +9294,7 @@ def _operator_gateway_lock_owned(authority_root: Path) -> bool:
 
 def _continuation_operator_profiles(authority_root: Path) -> tuple[str, ...]:
     """Read the operator allowlist from the board's real Hermes root."""
-    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG, read_user_config_raw
 
     default = DEFAULT_CONFIG.get("kanban", {}).get(
         "continuation_operator_profiles", "default"
@@ -9043,9 +9303,7 @@ def _continuation_operator_profiles(authority_root: Path) -> tuple[str, ...]:
     config_path = authority_root / "config.yaml"
     if config_path.is_file():
         try:
-            import yaml
-
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data = read_user_config_raw(config_path)
             raw = (data.get("kanban") or {}).get(
                 "continuation_operator_profiles", default
             )
@@ -9696,6 +9954,11 @@ def _dispatch_once_locked(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
             ).fetchone()[0]
         )
+
+    # Heal exactly the legacy manual-custody shape before taking the candidate
+    # snapshot so a repaired row can be claimed and spawned on this same tick.
+    if not dry_run:
+        result.reclaimed += len(repair_stale_manual_queue_custody(conn))
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
@@ -11871,6 +12134,7 @@ if os.environ.get("HERMES_KANBAN_BROKER") == "1":
         heartbeat_worker = _boardd_shim.heartbeat_worker
         set_workspace_path = _boardd_shim.set_workspace_path
         set_branch_name = _boardd_shim.set_branch_name
+        set_status = _boardd_shim.set_status
         _check_file_length_invariant = _boardd_shim.noop_flen
     except Exception as _boardd_shim_err:  # never break the module on shim import
         import logging as _logging
