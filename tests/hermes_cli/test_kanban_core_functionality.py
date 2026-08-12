@@ -56,6 +56,123 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_normalized_title_scope_dedup_beats_fresh_idempotency_key(
+    kanban_home,
+    caplog,
+):
+    """Must-fire fixture: an equivalent open card cannot be re-minted."""
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="  Fix  ＡPI   retry ",
+            body="first body wins",
+            created_by="drain-steward",
+            tenant="tenant-a",
+            idempotency_key="attempt-1",
+        )
+        repeated = kb.create_task(
+            conn,
+            title="fix api retry",
+            body="must not overwrite",
+            created_by="flame-drain",
+            tenant="tenant-a",
+            idempotency_key="fresh-attempt-2",
+        )
+        task = kb.get_task(conn, first)
+        events = kb.list_events(conn, first)
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert repeated == first
+    assert count == 1
+    assert task is not None and task.body == "first body wins"
+    event = next(event for event in events if event.kind == "create_deduplicated")
+    assert event.payload is not None
+    assert event.payload["existing_task_id"] == first
+    assert event.payload["reason"] == "normalized_title_scope"
+    assert event.payload["normalized_title"] == "fix api retry"
+    assert "existing_task_id=" + first in caplog.text
+
+
+def test_title_scope_dedup_does_not_collapse_legitimately_distinct_work(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent_a = kb.create_task(conn, title="parent A")
+        parent_b = kb.create_task(conn, title="parent B")
+        base = kb.create_task(conn, title="Run release", tenant="tenant-a")
+        distinct_title = kb.create_task(conn, title="Run release verification", tenant="tenant-a")
+        distinct_tenant = kb.create_task(conn, title="run release", tenant="tenant-b")
+        distinct_parent_a = kb.create_task(
+            conn,
+            title="run release",
+            tenant="tenant-a",
+            parents=[parent_a],
+        )
+        distinct_parent_b = kb.create_task(
+            conn,
+            title="run release",
+            tenant="tenant-a",
+            parents=[parent_b],
+        )
+        distinct_workspace = kb.create_task(
+            conn,
+            title="run release",
+            tenant="tenant-a",
+            workspace_kind="dir",
+            workspace_path="/srv/other-project",
+        )
+
+    assert len({
+        base,
+        distinct_title,
+        distinct_tenant,
+        distinct_parent_a,
+        distinct_parent_b,
+        distinct_workspace,
+    }) == 6
+
+
+def test_title_scope_dedup_only_blocks_open_tasks(kanban_home):
+    with kb.connect() as conn:
+        completed = kb.create_task(conn, title="rerunnable closure")
+        assert kb.complete_task(conn, completed)
+        replacement = kb.create_task(conn, title="  RERUNNABLE   CLOSURE ")
+
+    assert replacement != completed
+
+
+def test_title_scope_dedup_is_atomic_across_concurrent_creators(kanban_home):
+    barrier = threading.Barrier(2)
+    ids: list[str] = []
+    errors: list[BaseException] = []
+
+    def create_once(attempt: int) -> None:
+        try:
+            with kb.connect() as conn:
+                barrier.wait(timeout=5)
+                ids.append(
+                    kb.create_task(
+                        conn,
+                        title="Atomic re-mint",
+                        created_by=f"creator-{attempt}",
+                        idempotency_key=f"fresh-{attempt}",
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    workers = [threading.Thread(target=create_once, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert errors == []
+    assert len(ids) == 2
+    assert len(set(ids)) == 1
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
 
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
