@@ -4690,6 +4690,7 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   worker_session_id = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
@@ -4787,6 +4788,7 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   worker_session_id = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
@@ -4878,28 +4880,22 @@ def set_worker_session(
     the worker itself once its session row exists (first turn), so it is
     per-attempt by construction.
 
-    When ``claim_lock`` is provided (the worker echoes back
-    ``HERMES_KANBAN_CLAIM_LOCK`` from its spawn env) the write is CAS-guarded
-    on it: a stale worker from a reclaimed attempt can never overwrite the
-    current attempt's session id. Without a lock the write still requires the
-    task to be ``running``. Returns True when a row was updated.
+    ``claim_lock`` is mandatory (the worker echoes back
+    ``HERMES_KANBAN_CLAIM_LOCK`` from its spawn env) and the write is
+    CAS-guarded on it: a stale worker from a reclaimed attempt can never
+    overwrite the current attempt's session id. Missing authority fails
+    closed. Returns True when a row was updated.
     """
     sid = str(worker_session_id or "").strip()
-    if not sid:
+    lock = str(claim_lock or "").strip()
+    if not sid or not lock:
         return False
     with write_txn(conn):
-        if claim_lock:
-            cur = conn.execute(
-                "UPDATE tasks SET worker_session_id = ? "
-                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-                (sid, task_id, claim_lock),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET worker_session_id = ? "
-                "WHERE id = ? AND status = 'running'",
-                (sid, task_id),
-            )
+        cur = conn.execute(
+            "UPDATE tasks SET worker_session_id = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            (sid, task_id, lock),
+        )
         if cur.rowcount != 1:
             return False
         _append_event(
@@ -4924,7 +4920,8 @@ def backfill_worker_session_from_env(session_id: str) -> bool:
     must not be breakable by board unavailability.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id or not session_id:
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not task_id or not session_id or not claim_lock:
         return False
     try:
         conn = connect()
@@ -4933,7 +4930,7 @@ def backfill_worker_session_from_env(session_id: str) -> bool:
                 conn,
                 task_id,
                 session_id,
-                claim_lock=(os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None),
+                claim_lock=claim_lock,
             )
         finally:
             conn.close()
@@ -5123,7 +5120,7 @@ def reclaim_task(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, worker_session_id = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
