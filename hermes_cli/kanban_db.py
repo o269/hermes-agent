@@ -9764,14 +9764,38 @@ def record_respawn_guard_decision(
 
 
 def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
-    """Preserve the local-lineage profile predicate behind one dispatch hook."""
+    """Return whether an assignee may receive a dispatcher-spawned worker.
+
+    Fail-closed contract:
+
+    * Unknown / missing named profiles never spawn.
+    * The special name ``default`` is the base HERMES_HOME control plane.
+      ``profile_exists("default")`` is always True by design, which previously
+      let parking-lane ``assignee=default`` cards spawn a metered worker on
+      base config. ``default`` is therefore never a kanban worker spawn
+      target — operators must route to a real named profile.
+    * Partial installs fail closed (no spawn) rather than falling through
+      to base-config defaults.
+    """
     if not assignee:
         return False
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import normalize_profile_name
+
+        canon = normalize_profile_name(assignee)
     except Exception:
-        return True
-    return bool(profile_exists(assignee))
+        canon = str(assignee).strip().lower()
+        if not canon:
+            return False
+
+    if canon == "default":
+        return False
+
+    try:
+        from hermes_cli.profiles import profile_exists
+        return bool(profile_exists(assignee))
+    except Exception:
+        return False
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10035,18 +10059,12 @@ def _dispatch_once_locked(
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    # Same fail-closed spawn-target predicate used for explicit assignees —
+    # never treat bare ``default`` / missing profiles as a resolvable
+    # fallback that would mint a metered base-config worker.
+    _default_assignee_resolved = bool(
+        _default_assignee and _assignee_has_spawn_target(_default_assignee)
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
@@ -10827,6 +10845,11 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    if profile_arg == "default":
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no spawn target "
+            f"(fail-closed; default never spawns a kanban worker)"
+        )
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -10849,12 +10872,11 @@ def _default_spawn(
     from hermes_cli.profiles import resolve_profile_env
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Kanban spawn refused: assignee profile {profile_arg!r} "
+            f"is unresolvable"
+        ) from exc
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
