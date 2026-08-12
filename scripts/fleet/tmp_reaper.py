@@ -192,6 +192,20 @@ def paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def process_cwd_blocks_candidate(candidate: Path, cwd: Path) -> bool:
+    """Return whether a process whose cwd is ``cwd`` endangers ``candidate``.
+
+    A process is endangered by deleting ``candidate`` only when its cwd is the
+    candidate itself or is located beneath it.  A process whose cwd is merely
+    an ancestor of the candidate (for example ``/`` or ``/tmp``) is not inside
+    the candidate and must never pin it — otherwise every workspace under
+    ``/tmp`` would be kept forever.  The running-workspace overlap check is
+    intentionally symmetric; this process-cwd check is intentionally one-way.
+    """
+
+    return cwd == candidate or candidate in cwd.parents
+
+
 def _default_pid_uid_lookup(pid_dir: Path) -> int:
     """Return the owning UID of a stable pid directory via lstat."""
     try:
@@ -270,7 +284,13 @@ def discover_process_cwds(
     if max_processes < 1:
         raise ValueError("max_processes must be positive")
     lookup = pid_uid_lookup or _default_pid_uid_lookup
-    current_uid = os.geteuid()
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        # The proc scan is Linux/POSIX-specific.  Failing here keeps the script
+        # importable and type-checkable on unsupported platforms without ever
+        # silently running in a mode that cannot attribute process ownership.
+        raise SafetyError("proc_unsupported_platform")
+    current_uid = geteuid()
     try:
         if not proc_root.is_absolute() or proc_root.is_symlink() or not proc_root.is_dir():
             raise SafetyError("proc_root_invalid")
@@ -468,7 +488,7 @@ def evaluate_candidate(
         reason_codes.append("retention_elapsed")
     if any(paths_overlap(canonical, workspace) for workspace in snapshot.running_workspaces):
         reason_codes.append("running_workspace_overlap")
-    if any(paths_overlap(canonical, cwd) for cwd in snapshot.process_cwds):
+    if any(process_cwd_blocks_candidate(canonical, cwd) for cwd in snapshot.process_cwds):
         reason_codes.append("process_cwd_overlap")
 
     blocked = any(code != "retention_elapsed" for code in reason_codes)

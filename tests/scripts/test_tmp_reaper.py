@@ -608,3 +608,91 @@ def test_path_overlap_is_component_safe() -> None:
     assert reaper.paths_overlap(Path("/tmp/job"), Path("/tmp/job/checkout"))
     assert reaper.paths_overlap(Path("/tmp/job/checkout"), Path("/tmp/job"))
     assert not reaper.paths_overlap(Path("/tmp/job"), Path("/tmp/job-other"))
+
+
+def test_process_cwd_blocks_candidate_is_directional() -> None:
+    candidate = Path("/tmp/root/job")
+    # A cwd inside the candidate (the candidate itself or a subtree) must block.
+    assert reaper.process_cwd_blocks_candidate(candidate, Path("/tmp/root/job"))
+    assert reaper.process_cwd_blocks_candidate(candidate, Path("/tmp/root/job/checkout"))
+    # An ancestor cwd such as / or /tmp must NOT block any candidate beneath it.
+    assert not reaper.process_cwd_blocks_candidate(candidate, Path("/"))
+    assert not reaper.process_cwd_blocks_candidate(candidate, Path("/tmp"))
+    assert not reaper.process_cwd_blocks_candidate(candidate, Path("/tmp/root"))
+    # A sibling with a shared prefix must not block.
+    assert not reaper.process_cwd_blocks_candidate(candidate, Path("/tmp/root/job-other"))
+
+
+def test_ancestor_process_cwd_does_not_pin_candidate(tmp_path: Path) -> None:
+    """A process cwd that is only an ancestor of a candidate must not pin it."""
+    root = tmp_path / "workspaces"
+    old = root / "old"
+    old.mkdir(parents=True)
+    mark_old(old)
+    # Two cwds, both strict ancestors of the candidate path (/ and /tmp).
+    proc_root = make_proc_root(tmp_path, [(100, Path("/")), (101, Path("/tmp"))])
+    client = FakeBoardClient([])
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=client,
+        proc_root=proc_root,
+    )
+
+    row = candidate(receipt, "old")
+    assert exit_code == 0
+    assert receipt["status"] == "ok"
+    assert not old.exists(), "ancestor-only cwd overlap must not pin or retain the candidate"
+    assert row["decision"] == "deleted"
+    assert row["reason_codes"] == ["retention_elapsed", "deleted"]
+
+
+def test_process_cwd_inside_candidate_blocks_in_dry_run(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    live = root / "live"
+    live_cwd = live / "checkout"
+    live_cwd.mkdir(parents=True)
+    mark_old(live)
+    proc_root = make_proc_root(tmp_path, [(200, live_cwd)])
+    client = FakeBoardClient([])
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        retention_seconds=0,
+        board_client=client,
+        proc_root=proc_root,
+    )
+
+    row = candidate(receipt, "live")
+    assert exit_code == 0
+    assert live.is_dir()
+    assert row["decision"] == "kept"
+    assert row["reason_codes"] == ["retention_elapsed", "process_cwd_overlap"]
+
+
+def test_unsupported_platform_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "workspaces"
+    doomed = root / "doomed"
+    doomed.mkdir(parents=True)
+    mark_old(doomed)
+    proc_root = make_proc_root(tmp_path, [(123, tmp_path / "unrelated")])
+
+    # Simulate a platform without os.geteuid (e.g. Windows): getattr returns
+    # None and the proc scan must fail closed, never delete, and report a
+    # portability-specific code rather than raising AttributeError.
+    monkeypatch.setattr(reaper.os, "geteuid", None, raising=False)
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+    )
+
+    assert exit_code == reaper.EXIT_SAFETY_FAILURE
+    assert receipt["status"] == "safety_failure"
+    assert receipt["error"] == {"code": "proc_unsupported_platform"}
+    assert doomed.is_dir()
