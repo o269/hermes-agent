@@ -230,7 +230,11 @@ class TestCmdUpdateBranchFallback:
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(
+            expected_git_cmd,
+            PROJECT_ROOT,
+            update_remote="origin",
+        )
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -536,6 +540,14 @@ class TestCmdUpdateCheckBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+
+            if "remote get-url upstream" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="https://github.com/NousResearch/Hermes-Agent.git\n",
+                    stderr="",
+                )
 
             if "fetch" in joined and "upstream" in joined:
                 rc = 0 if upstream_fetch_ok else 128

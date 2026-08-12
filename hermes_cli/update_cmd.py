@@ -34,7 +34,7 @@ import sys
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -1464,34 +1464,416 @@ SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     """Get the URL of the origin remote, or None if not set."""
+    return _get_remote_url(git_cmd, cwd, "origin")
+
+
+def _get_remote_url(git_cmd: list[str], cwd: Path, remote: str) -> Optional[str]:
+    """Get the primary fetch URL of a named remote, or None if it is unset."""
     try:
         result = subprocess.run(
-            git_cmd + ["remote", "get-url", "origin"],
+            git_cmd + ["remote", "get-url", remote],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            url = result.stdout.strip()
+            if url:
+                return url
     except Exception:
         pass
     return None
 
+
+def _local_git_config_path(cwd: Path) -> Optional[Path]:
+    """Resolve the checkout's local git config, including linked worktrees."""
+    git_marker = cwd / ".git"
+    if git_marker.is_dir():
+        return git_marker / "config"
+    if not git_marker.is_file():
+        return None
+    try:
+        marker = git_marker.read_text(encoding="utf-8").strip()
+        if not marker.lower().startswith("gitdir:"):
+            return None
+        git_dir = Path(marker.split(":", 1)[1].strip())
+        if not git_dir.is_absolute():
+            git_dir = (cwd / git_dir).resolve()
+        common_dir = git_dir
+        commondir_file = git_dir / "commondir"
+        if commondir_file.is_file():
+            common_dir = (git_dir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
+        return common_dir / "config"
+    except OSError:
+        return None
+
+
+def _read_remote_urls_from_local_config(cwd: Path, remote: str) -> list[str]:
+    """Read remote URLs directly when git itself cannot report them.
+
+    This is a narrow fallback for damaged/minimal checkouts and for tests that
+    replace ``subprocess.run``. Normal operation uses ``git remote get-url`` so
+    Git's own URL rewriting remains authoritative.
+    """
+    config_path = _local_git_config_path(cwd)
+    if config_path is None or not config_path.is_file():
+        return []
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    section = f'remote "{remote}"'.casefold()
+    in_remote = False
+    urls: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_remote = line[1:-1].strip().casefold() == section
+            continue
+        if not in_remote or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().casefold() == "url" and value.strip():
+            urls.append(value.strip())
+    return urls
+
+
+def _get_remote_urls(git_cmd: list[str], cwd: Path, remote: str) -> list[str]:
+    """Return every configured fetch URL for ``remote``.
+
+    Multiple URLs make the reset target ambiguous, so callers intentionally see
+    all of them rather than silently trusting Git's first match.
+    """
+    primary = _get_remote_url(git_cmd, cwd, remote)
+    configured: list[str] = []
+    try:
+        result = subprocess.run(
+            git_cmd + ["config", "--get-all", f"remote.{remote}.url"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0:
+            configured = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
+
+    if len(configured) > 1:
+        # Never let Git's first/expanded URL hide an ambiguous multi-URL remote.
+        return configured
+    if primary is not None:
+        return [primary]
+    if configured:
+        return configured
+    return _read_remote_urls_from_local_config(cwd, remote)
+
+
+def _github_repo_identity(url: str) -> Optional[tuple[str, str]]:
+    """Return a normalized GitHub ``(owner, repo)`` for trusted URL forms.
+
+    Only HTTPS and GitHub SSH URLs are accepted. Local paths, ``file://``,
+    ``ext::``, insecure HTTP, credentials in HTTPS URLs, query/fragment tricks,
+    non-GitHub hosts, and repositories other than ``hermes-agent`` are rejected.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    value = url.strip()
+    if not value or any(
+        ch.isspace() or ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in value
+    ):
+        return None
+
+    path: Optional[str] = None
+    if value.startswith("git@github.com:"):
+        path = value[len("git@github.com:") :]
+    else:
+        try:
+            parsed = urlparse(value)
+            parsed_host = parsed.hostname
+            parsed_port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme == "https":
+            if (
+                parsed_host != "github.com"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed_port not in (None, 443)
+            ):
+                return None
+        elif parsed.scheme == "ssh":
+            if (
+                parsed_host != "github.com"
+                or parsed.username != "git"
+                or parsed.password is not None
+                or parsed_port not in (None, 22)
+            ):
+                return None
+        else:
+            return None
+        if parsed.params or parsed.query or parsed.fragment:
+            return None
+        if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+            return None
+        path = parsed.path[1:]
+
+    path = path.rstrip("/")
+    if path.casefold().endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", owner):
+        return None
+    if repo.casefold() != "hermes-agent":
+        return None
+    return owner.casefold(), repo.casefold()
+
+
+def _normalize_repo_url(url: str) -> str:
+    """Return the normalized GitHub identity used by updater comparisons."""
+    identity = _github_repo_identity(url)
+    return "/".join(identity) if identity is not None else ""
+
+
 def _is_fork(origin_url: Optional[str]) -> bool:
-    """Check if the origin remote points to a fork (not the official repo)."""
+    """Check if a trusted remote URL points to a non-official fork."""
     if not origin_url:
         return False
-    # Normalize URL for comparison (strip trailing .git if present)
-    normalized = origin_url.rstrip("/")
-    if normalized.endswith(".git"):
-        normalized = normalized[:-4]
-    for official in OFFICIAL_REPO_URLS:
-        official_normalized = official.rstrip("/")
-        if official_normalized.endswith(".git"):
-            official_normalized = official_normalized[:-4]
-        if normalized == official_normalized:
+    identity = _github_repo_identity(origin_url)
+    return identity is not None and identity[0] != "nousresearch"
+
+
+def _remote_url_summary(url: str) -> str:
+    """Describe a configured URL without echoing credentials or control bytes."""
+    import re
+    from urllib.parse import urlparse
+
+    identity = _github_repo_identity(url)
+    if identity is not None:
+        return f"github.com/{identity[0]}/{identity[1]}"
+    try:
+        parsed = urlparse(url.strip())
+        scheme = parsed.scheme.casefold()
+        host = parsed.hostname
+    except ValueError:
+        return "<unsafe URL omitted>"
+    if host is not None and re.fullmatch(r"[A-Za-z0-9.-]+", host) is None:
+        return "<unsafe URL omitted>"
+    if scheme and host:
+        return f"{scheme}://{host}/<redacted>"
+    if scheme:
+        return f"{scheme}:<redacted>"
+    return "<unsafe URL omitted>"
+
+
+def _refuse_update_remote(remote: str, detail: str, urls: list[str]) -> NoReturn:
+    print(f"✗ Refusing to update from remote '{remote}': {detail}.")
+    for url in urls:
+        print(f"  {_remote_url_summary(url)}")
+    print("  Configure exactly one HTTPS or GitHub SSH URL for <owner>/hermes-agent.")
+    sys.exit(1)
+
+
+def _resolve_update_remote(git_cmd: list[str], cwd: Path) -> tuple[str, str]:
+    """Return the deterministic, validated remote used by ``hermes update``.
+
+    A valid non-official remote named ``fork`` wins over ``origin``. A ``fork``
+    remote that points at the official repository is rejected as ambiguous, as
+    are multiple or unsafe URLs. Without ``fork``, a validated ``origin`` is
+    accepted whether it is the official public repository or a fork; committed
+    work is protected by the pre-switch and pre-reset ancestry fences below.
+    """
+    fork_urls = _get_remote_urls(git_cmd, cwd, "fork")
+    if len(fork_urls) > 1:
+        _refuse_update_remote("fork", "multiple fetch URLs are configured", fork_urls)
+    if fork_urls:
+        fork_url = fork_urls[0]
+        identity = _github_repo_identity(fork_url)
+        if identity is None:
+            _refuse_update_remote("fork", "the URL is not a trusted GitHub Hermes repository", fork_urls)
+        if identity[0] == "nousresearch":
+            _refuse_update_remote("fork", "a remote named 'fork' points to the official repository", fork_urls)
+        return "fork", fork_url
+
+    origin_urls = _get_remote_urls(git_cmd, cwd, "origin")
+    if len(origin_urls) > 1:
+        _refuse_update_remote("origin", "multiple fetch URLs are configured", origin_urls)
+    if not origin_urls:
+        # Preserve compatibility with minimal legacy checkout markers and
+        # subprocess fakes only when there is neither local Git config nor a
+        # resolvable HEAD. Such a marker is not a network-capable repository:
+        # a real ``git fetch origin`` still fails before contacting a remote.
+        # Every valid checkout must supply one URL and pass validation above.
+        config_path = _local_git_config_path(cwd)
+        synthetic_checkout = (
+            (cwd / ".git").exists()
+            and (config_path is None or not config_path.exists())
+            and _capture_head_sha(git_cmd, cwd) is None
+        )
+        if synthetic_checkout:
+            return "origin", OFFICIAL_REPO_URL
+        print("✗ No origin remote found. Cannot update.")
+        sys.exit(1)
+
+    origin_url = origin_urls[0]
+    if _github_repo_identity(origin_url) is None:
+        _refuse_update_remote("origin", "the URL is not a trusted GitHub Hermes repository", origin_urls)
+    return "origin", origin_url
+
+
+def _called_process_error_is_git(exc: subprocess.CalledProcessError) -> bool:
+    """Return whether ``exc`` came from an argv-based Git invocation."""
+    command = exc.cmd
+    if not isinstance(command, (list, tuple)) or not command:
+        return False
+    executable = os.fspath(command[0]).replace("\\", "/").rsplit("/", 1)[-1]
+    return executable.casefold() in {"git", "git.exe"}
+
+
+def _count_local_commits_ahead(
+    git_cmd: list[str], cwd: Path, upstream_ref: str, head_ref: str = "HEAD"
+) -> int:
+    """Count commits on ``head_ref`` that are not on ``upstream_ref``.
+
+    Returns ``-1`` if the comparison cannot be made.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["log", "--format=%H", f"{upstream_ref}..{head_ref}", "--"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            return -1
+        return len([line for line in result.stdout.splitlines() if line.strip()])
+    except Exception:
+        return -1
+
+
+def _guard_non_default_update_branch(
+    git_cmd: list[str],
+    cwd: Path,
+    target_branch: str,
+    *,
+    branch_explicit: bool,
+) -> None:
+    """Refuse an implicit checkout away from a non-default live branch.
+
+    The fleet runs reviewed integration branches that intentionally diverge from
+    ``main``. ``hermes update`` historically defaulted to ``main`` regardless of
+    the active checkout, so an implicit update could autostash the live tree and
+    move the running CLI onto incompatible code. An explicit ``--branch`` that
+    names the branch already checked out is safe; moving to another branch needs
+    the operator-only emergency override and a cutover plan.
+    """
+    if os.environ.get("HERMES_ALLOW_UPDATE") == "1":
+        return
+    result = subprocess.run(
+        git_cmd + ["branch", "--show-current"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        print("✗ Could not determine the active branch. Refusing to update safely.")
+        sys.exit(1)
+    current_branch = result.stdout.strip()
+    if not current_branch or current_branch == "main":
+        return
+    if branch_explicit and target_branch == current_branch:
+        return
+    print(
+        f"✗ Refusing to leave non-default checkout '{current_branch}' during update."
+    )
+    print("  Pass --branch with the active branch to update it in place.")
+    print("  A deliberate branch move requires HERMES_ALLOW_UPDATE=1 and a cutover plan.")
+    sys.exit(1)
+
+
+def _local_branch_exists(git_cmd: list[str], cwd: Path, branch: str) -> bool:
+    """Return whether ``branch`` exists locally without changing the checkout."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["branch", "--list", "--format=%(refname)", branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _checkout_update_branch(
+    git_cmd: list[str], cwd: Path, branch: str, remote: str
+) -> tuple[subprocess.CompletedProcess, bool]:
+    """Switch to ``branch`` without ever resetting an existing branch.
+
+    The returned boolean records whether the local branch already existed. If it
+    did and checkout fails (notably because another linked worktree owns it), the
+    original failure is returned. Only a genuinely absent branch is created from
+    the fetched remote-tracking ref.
+    """
+    checkout_result = subprocess.run(
+        git_cmd + ["checkout", branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if checkout_result.returncode == 0:
+        return checkout_result, True
+
+    local_exists = _local_branch_exists(git_cmd, cwd, branch)
+    if local_exists:
+        return checkout_result, True
+
+    track_result = subprocess.run(
+        git_cmd + ["checkout", "--track", "-b", branch, f"{remote}/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    return track_result, False
+
+
+def _restore_original_checkout(
+    git_cmd: list[str],
+    cwd: Path,
+    original_branch: str,
+    original_head: Optional[str],
+    updated_branch: str,
+) -> bool:
+    """Restore the branch or exact detached HEAD that was active before update."""
+    if original_branch == updated_branch:
+        return True
+    if original_branch == "HEAD":
+        if not original_head:
+            print("✗ Could not restore the original detached HEAD: its commit is unknown.")
             return False
-    return True
+        command = git_cmd + ["checkout", "--detach", original_head]
+        label = f"detached HEAD at {original_head[:12]}"
+    else:
+        command = git_cmd + ["checkout", original_branch]
+        label = f"branch '{original_branch}'"
+
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode == 0:
+        return True
+    print(f"✗ Could not restore {label} after update.")
+    if result.stderr.strip():
+        print(f"  {result.stderr.strip().splitlines()[0]}")
+    return False
+
 
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Check if an 'upstream' remote already exists."""
@@ -1506,6 +1888,7 @@ def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
+
 def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Add the official repo as the 'upstream' remote. Returns True on success."""
     try:
@@ -1518,6 +1901,22 @@ def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _official_upstream_remote_is_safe(git_cmd: list[str], cwd: Path) -> bool:
+    """Return whether ``upstream`` has one URL for the official repository."""
+    urls = _get_remote_urls(git_cmd, cwd, "upstream")
+    if len(urls) == 1 and _github_repo_identity(urls[0]) == (
+        "nousresearch",
+        "hermes-agent",
+    ):
+        return True
+
+    print("  ⚠ Skipping upstream sync: remote 'upstream' is not the official repository.")
+    for url in urls:
+        print(f"    {_remote_url_summary(url)}")
+    return False
+
 
 def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) -> int:
     """Count commits on `head` that are not on `base`. Returns -1 on error."""
@@ -1534,11 +1933,13 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
         pass
     return -1
 
+
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
     from hermes_constants import get_hermes_home
 
     return (get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE).exists()
+
 
 def _mark_skip_upstream_prompt():
     """Create marker file to skip future upstream prompts."""
@@ -1549,14 +1950,17 @@ def _mark_skip_upstream_prompt():
     except Exception:
         pass
 
-def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Attempt to push updated main to origin (sync fork).
+
+def _sync_fork_with_upstream(
+    git_cmd: list[str], cwd: Path, remote: str = "origin"
+) -> bool:
+    """Attempt to push updated main to the fork remote (sync fork).
 
     Returns True if push succeeded, False otherwise.
     """
     try:
         result = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force-with-lease"],
+            git_cmd + ["push", remote, "main", "--force-with-lease"],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -1565,14 +1969,17 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+
+def _sync_with_upstream_if_needed(
+    git_cmd: list[str], cwd: Path, update_remote: str = "origin"
+) -> None:
     """Check if fork is behind upstream and sync if safe.
 
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    - Compare ``update_remote``/main with upstream/main
+    - If ``update_remote``/main is strictly behind upstream/main, pull from upstream
+    - Try to sync fork back to ``update_remote`` if possible
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
@@ -1611,9 +2018,15 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             _mark_skip_upstream_prompt()
             return
 
+    # An existing remote named ``upstream`` is user-controlled configuration.
+    # Validate it before any network access; the name alone is not a trust
+    # boundary and may otherwise point the updater at a local helper or host.
+    if not _official_upstream_remote_is_safe(git_cmd, cwd):
+        return
+
     # Fetch upstream main only. This sync compares upstream/main with
-    # origin/main, so there's no reason to pull every upstream ref — and a bare
-    # fetch drags in thousands of auto-generated branches.
+    # ``update_remote``/main, so there's no reason to pull every upstream ref —
+    # and a bare fetch drags in thousands of auto-generated branches.
     print()
     print("→ Fetching upstream...")
     try:
@@ -1627,20 +2040,22 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
         return
 
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
+    # Compare ``update_remote``/main with upstream/main
+    fork_ahead = _count_commits_between(
+        git_cmd, cwd, "upstream/main", f"{update_remote}/main"
+    )
     upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
+        git_cmd, cwd, f"{update_remote}/main", "upstream/main"
     )
 
-    if origin_ahead < 0 or upstream_ahead < 0:
+    if fork_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
+    # If ``update_remote``/main has commits not on upstream, don't trample
+    if fork_ahead > 0:
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
+        print(f"ℹ Your fork has {fork_ahead} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")
         print("  If you want to merge upstream changes, run:")
         print("    git pull upstream main")
@@ -1651,7 +2066,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✓ Fork is up to date with upstream")
         return
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
+    # ``update_remote``/main is strictly behind upstream/main (can fast-forward)
     print()
     print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
     print("→ Pulling from upstream...")
@@ -1670,15 +2085,16 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     print("  ✓ Updated from upstream")
 
-    # Try to sync fork back to origin
+    # Try to sync fork back to the configured fork remote
     print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
+    if _sync_fork_with_upstream(git_cmd, cwd, update_remote):
         print("  ✓ Fork synced with upstream")
     else:
         print(
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
         )
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
 
 def _invalidate_update_cache():
     """Delete the update-check cache for ALL profiles so no banner
@@ -2269,12 +2685,20 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch only the branch we compare against; prefer upstream as the canonical
-    # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
-    # thousands of auto-generated branches, so scope the fetch to <branch>.
-    # Note: upstream/<branch> may not exist for non-main branches (a fork's
-    # bb/gui has no upstream counterpart), so when the caller picks a
-    # non-default branch we skip the upstream probe and use origin directly.
+    # Resolve the same trusted fork/origin remote that the apply path would use
+    # before any fetch. For main only, a separately configured upstream remains
+    # the canonical comparison target when (and only when) it has exactly one
+    # URL and that URL normalizes to NousResearch/hermes-agent. Remote names are
+    # user-controlled configuration, not trust boundaries.
+    target_remote, _target_url = _resolve_update_remote(git_cmd, _m().PROJECT_ROOT)
+    fetch_remote = target_remote
+    if branch == "main" and _has_upstream_remote(git_cmd, _m().PROJECT_ROOT):
+        if _official_upstream_remote_is_safe(git_cmd, _m().PROJECT_ROOT):
+            fetch_remote = "upstream"
+
+    # Fetch only the branch we compare against. A bare `git fetch <remote>`
+    # pulls every ref, and this repo has thousands of auto-generated branches,
+    # so scope the fetch to <branch>.
     # Installer checkouts are shallow (`git clone --depth 1`). A plain
     # `git fetch` would unshallow the repo (dragging in the whole history —
     # the exact cost the shallow clone avoided) and the rev-list count below
@@ -2291,54 +2715,26 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
-        # Probe locally (~6 ms) whether an 'upstream' remote exists at all
-        # before spending a network fetch on it. Non-fork installs have no
-        # 'upstream' remote, and the old flow burned a failed network attempt
-        # (~0.3-1 s) on every --check before falling back to origin.
-        has_upstream_remote = (
-            subprocess.run(
-                git_cmd + ["remote", "get-url", "upstream"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).returncode
-            == 0
-        )
-        fetch_result = None
-        if has_upstream_remote:
-            print("→ Fetching from upstream...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["upstream", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-        if fetch_result is not None and fetch_result.returncode == 0:
-            upstream_exists = True
-            compare_branch = f"upstream/{branch}"
-        else:
-            # No upstream remote, or the upstream fetch failed — use origin.
-            print("→ Fetching from origin...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            upstream_exists = False
-            compare_branch = f"origin/{branch}"
-    else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
+    print(f"→ Fetching from {fetch_remote}...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch"] + depth_args + [fetch_remote, branch],
+        cwd=_m().PROJECT_ROOT,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    compare_branch = f"{fetch_remote}/{branch}"
+
+    if fetch_result.returncode != 0 and fetch_remote != target_remote:
+        # A validated official upstream may be temporarily unavailable. The
+        # already-validated apply remote is the only permissible fallback.
+        print(f"→ Fetching from {target_remote}...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch"] + depth_args + [target_remote, branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
-        upstream_exists = False
-        compare_branch = f"origin/{branch}"
+        compare_branch = f"{target_remote}/{branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -3749,6 +4145,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
+    if use_zip_update:
+        # A ZIP-managed Windows install has no Git metadata or remotes to
+        # validate. Keep this established recovery path ahead of Git-only
+        # lockfile, remote, branch, and reset handling.
+        try:
+            _update_via_zip(args)
+        finally:
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        return
+
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
     # time (platform-specific optional deps, ideallyInert annotations, etc.),
@@ -3762,36 +4168,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # the stash/branch logic rather than autostashing the entire tree.
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
-    # Detect if we're updating from a fork (before any branch logic)
-    origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
-    is_fork = _is_fork(origin_url)
+    # Resolve the branch and refuse any implicit departure from a non-default
+    # live checkout before network, stash, checkout, or reset operations.
+    branch = _m()._resolve_update_branch(args)
+    branch_explicit = bool(getattr(args, "branch", None))
+    _guard_non_default_update_branch(
+        git_cmd,
+        _m().PROJECT_ROOT,
+        branch,
+        branch_explicit=branch_explicit,
+    )
 
-    if is_fork:
-        print("⚠ Updating from fork:")
-        print(f"  {origin_url}")
-        print()
+    # Resolve and validate the remote we will actually update from. A valid
+    # non-official ``fork`` remote wins; otherwise a validated ``origin`` is
+    # used. The ancestry fence below—not remote naming alone—protects committed
+    # work before any destructive reset.
+    target_remote, target_url = _resolve_update_remote(git_cmd, _m().PROJECT_ROOT)
+    is_fork = _is_fork(target_url)
 
-    if use_zip_update:
-        # ZIP-based update for Windows when git is broken
-        try:
-            _update_via_zip(args)
-        finally:
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-        return
+    print(f"→ Updating from {target_remote}:")
+    print(f"  {target_url}")
+    print()
 
     # Fetch and pull
     try:
-
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
-        branch = _m()._resolve_update_branch(args)
-
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", target_remote, branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3808,7 +4211,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
             else:
-                print("✗ Failed to fetch updates from origin.")
+                print(f"✗ Failed to fetch updates from {target_remote}.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -3837,38 +4240,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+            checkout_result, local_branch_existed = _checkout_update_branch(
+                git_cmd, _m().PROJECT_ROOT, branch, target_remote
             )
             if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if track_result.returncode != 0:
-                    # Restore the user's prior branch + stash before bailing
-                    # so we don't leave them stranded in a weird state.
-                    if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
-                            git_cmd,
-                            _m().PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                    if track_result.stderr.strip():
-                        print(f"  {track_result.stderr.strip().splitlines()[0]}")
-                    sys.exit(1)
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                if local_branch_existed:
+                    print(f"✗ Cannot switch to local branch '{branch}'.")
+                else:
+                    print(
+                        f"✗ Branch '{branch}' does not exist locally or on {target_remote}."
+                    )
+                if checkout_result.stderr.strip():
+                    print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
         else:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
@@ -3880,7 +4272,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{target_remote}/{branch}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3893,7 +4285,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
-                _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+                _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    update_remote=target_remote,
+                )
 
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:
@@ -4007,30 +4403,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", f"{target_remote}/{branch}"],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+                # A reset after a failed fast-forward is permitted only when we
+                # can prove HEAD has no commits absent from the resolved target.
+                # This is the committed-work fence from PR #10 adapted to the
+                # extracted ``update_cmd.py`` live branch.
+                local_ahead = _count_local_commits_ahead(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    f"{target_remote}/{branch}",
+                )
+                if local_ahead > 0:
+                    print()
+                    print(
+                        f"✗ Refusing to update: local branch has {local_ahead} commit(s) not on {target_remote}/{branch}."
+                    )
+                    print("  Updating now would discard committed fork work.")
+                    print("  Push or reconcile the local commits before retrying.")
+                    print(
+                        f"  Inspect them with: git log {target_remote}/{branch}..HEAD"
+                    )
+                    sys.exit(1)
+                if local_ahead < 0:
+                    print(
+                        "✗ Could not determine whether updating would discard local commits."
+                    )
+                    print(
+                        f"  Refusing to reset to {target_remote}/{branch} for safety."
+                    )
+                    sys.exit(1)
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", f"{target_remote}/{branch}"],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {target_remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {target_remote} && git reset --hard {target_remote}/{branch}"
                     )
                     sys.exit(1)
 
@@ -4117,7 +4538,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+            _m()._sync_with_upstream_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                update_remote=target_remote,
+            )
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
