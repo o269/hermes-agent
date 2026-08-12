@@ -28,6 +28,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router'
 
 import {
   $boardSlug,
@@ -46,6 +47,7 @@ import {
   uploadAttachment
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { openKanbanWorkerSession } from './open-task-worker'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -57,6 +59,7 @@ import {
 } from './types'
 import {
   ago,
+  arcState,
   Avatar,
   Callout,
   columnLabel,
@@ -550,6 +553,7 @@ export function TaskDrawer({
 }) {
   const k = useKanban()
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const slug = useValue($boardSlug)
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
@@ -563,6 +567,21 @@ export function TaskDrawer({
   const task = detail?.task
   const running = task?.status === 'running'
   const defaultAssignee = useDefaultAssignee()
+  const arc = task ? arcState(task, defaultAssignee) : null
+  const canWatchWorker = arc === 'running' || arc === 'stale'
+
+  const watchWorker = () => {
+    if (!task) {
+      return
+    }
+
+    void openKanbanWorkerSession({
+      boardSlug: slug || undefined,
+      navigate,
+      request: host.request,
+      taskId: task.id
+    })
+  }
 
   const { data: log } = useQuery({
     enabled: !!id,
@@ -744,6 +763,12 @@ export function TaskDrawer({
           <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
             {task.title || task.id}
           </h2>
+        )}
+        {canWatchWorker && (
+          <Button className="w-full" onClick={watchWorker} size="sm">
+            <Codicon name="eye" size="0.8rem" />
+            {k.watchWorker}
+          </Button>
         )}
       </header>
 

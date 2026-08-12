@@ -58,6 +58,7 @@ import {
   useRef,
   useState
 } from 'react'
+import { useNavigate } from 'react-router'
 
 import {
   $boardSlug,
@@ -79,6 +80,7 @@ import {
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
+import { openKanbanWorkerSession } from './open-task-worker'
 import { OrchestrationPanel } from './orchestration'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
@@ -242,6 +244,7 @@ function Card({
   onMove,
   onOpen,
   onToggleSelect,
+  onWatchWorker,
   selected,
   task
 }: {
@@ -250,6 +253,7 @@ function Card({
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
   onToggleSelect: (id: string) => void
+  onWatchWorker: (id: string) => void
   selected: boolean
   task: KanbanTask
 }) {
@@ -273,7 +277,19 @@ function Card({
             dragging && 'opacity-40'
           )}
           draggable
-          onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
+          onClick={event => {
+            if (event.metaKey || event.ctrlKey) {
+              onToggleSelect(task.id)
+
+              return
+            }
+
+            if (arc === 'running' || arc === 'stale') {
+              onWatchWorker(task.id)
+            } else {
+              onOpen(task.id)
+            }
+          }}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
@@ -303,6 +319,12 @@ function Card({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
+        {(arc === 'running' || arc === 'stale') && (
+          <ContextMenuItem onSelect={() => onWatchWorker(task.id)}>
+            <Codicon name="eye" size="0.85rem" />
+            {k.watchWorker}
+          </ContextMenuItem>
+        )}
         <ContextMenuItem onSelect={() => onOpen(task.id)}>
           <Codicon name="link-external" size="0.85rem" />
           {k.open}
@@ -343,6 +365,7 @@ function Column({
   onOpen,
   onToggle,
   onToggleSelect,
+  onWatchWorker,
   selected
 }: {
   collapsed: boolean
@@ -355,6 +378,7 @@ function Column({
   onOpen: (id: string) => void
   onToggle: () => void
   onToggleSelect: (id: string) => void
+  onWatchWorker: (id: string) => void
   selected: ReadonlySet<string>
 }) {
   const k = useKanban()
@@ -477,6 +501,7 @@ function Column({
                     onMove={onMove}
                     onOpen={onOpen}
                     onToggleSelect={onToggleSelect}
+                    onWatchWorker={onWatchWorker}
                     selected={selected.has(task.id)}
                     task={task}
                   />
@@ -491,6 +516,7 @@ function Column({
                 onMove={onMove}
                 onOpen={onOpen}
                 onToggleSelect={onToggleSelect}
+                onWatchWorker={onWatchWorker}
                 selected={selected.has(task.id)}
                 task={task}
               />
@@ -1081,6 +1107,7 @@ function SelectionBar({
 export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
 
@@ -1319,6 +1346,19 @@ export function KanbanBoardPage() {
     $collapsedLanes.set(overrides)
   }
 
+  const watchWorker = (taskId: string) => {
+    void openKanbanWorkerSession({
+      boardSlug: slug || undefined,
+      navigate,
+      request: host.request,
+      taskId
+    }).then(result => {
+      if (result === 'fallback') {
+        setOpenId(taskId)
+      }
+    })
+  }
+
   return (
     <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
       {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
@@ -1407,6 +1447,7 @@ export function KanbanBoardPage() {
                 onOpen={setOpenId}
                 onToggle={() => toggleLane(col.name, auto)}
                 onToggleSelect={toggleSelect}
+                onWatchWorker={watchWorker}
                 selected={selected}
               />
             )
