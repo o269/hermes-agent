@@ -9,15 +9,16 @@ must pass ``--apply`` to remove an eligible workspace.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
 import stat
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 DEFAULT_RETENTION_HOURS = 168.0
 DEFAULT_MAX_LIVE_WORKSPACES = 10_000
@@ -50,6 +51,13 @@ class CleanupRoot:
 class SafetySnapshot:
     running_workspaces: tuple[Path, ...]
     process_cwds: tuple[Path, ...]
+    proc_metrics: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProcScanResult:
+    cwds: tuple[Path, ...]
+    metrics: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -184,9 +192,85 @@ def paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
-def discover_process_cwds(proc_root: Path, *, max_processes: int) -> tuple[Path, ...]:
+def _default_pid_uid_lookup(pid_dir: Path) -> int:
+    """Return the owning UID of a stable pid directory via lstat."""
+    try:
+        before = pid_dir.lstat()
+        owner_uid = before.st_uid
+        after = pid_dir.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise SafetyError("proc_owner_unattributable") from exc
+    if (before.st_dev, before.st_ino, owner_uid) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_uid,
+    ):
+        raise SafetyError("proc_owner_changed")
+    return owner_uid
+
+
+def _pid_dir_vanished(pid_dir: Path) -> bool:
+    try:
+        pid_dir.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise SafetyError("proc_owner_unattributable") from exc
+    return False
+
+
+def _lookup_pid_uid(lookup: Callable[[Path], int], pid_dir: Path) -> int:
+    try:
+        owner_uid = lookup(pid_dir)
+    except FileNotFoundError:
+        raise
+    except SafetyError:
+        raise
+    except OSError as exc:
+        raise SafetyError("proc_owner_unattributable") from exc
+    if not isinstance(owner_uid, int) or isinstance(owner_uid, bool):
+        raise SafetyError("proc_owner_unattributable")
+    return owner_uid
+
+
+def _is_stable_zombie(pid_dir: Path) -> bool:
+    """Return whether a stable pid is a zombie, which has no kernel cwd."""
+    try:
+        before = pid_dir.lstat()
+        status = (pid_dir / "status").read_text(encoding="utf-8")
+        after = pid_dir.lstat()
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise SafetyError("proc_state_unattributable") from exc
+    if (before.st_dev, before.st_ino, before.st_uid) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_uid,
+    ):
+        raise SafetyError("proc_owner_changed")
+    state_lines = [line for line in status.splitlines() if line.startswith("State:")]
+    if len(state_lines) != 1:
+        raise SafetyError("proc_state_malformed")
+    state_fields = state_lines[0].split()
+    if len(state_fields) < 2 or len(state_fields[1]) != 1:
+        raise SafetyError("proc_state_malformed")
+    return state_fields[1] == "Z"
+
+
+def discover_process_cwds(
+    proc_root: Path,
+    *,
+    max_processes: int,
+    pid_uid_lookup: Callable[[Path], int] | None = None,
+    cwd_reader: Callable[[Path], str] = os.readlink,
+) -> ProcScanResult:
     if max_processes < 1:
         raise ValueError("max_processes must be positive")
+    lookup = pid_uid_lookup or _default_pid_uid_lookup
+    current_uid = os.geteuid()
     try:
         if not proc_root.is_absolute() or proc_root.is_symlink() or not proc_root.is_dir():
             raise SafetyError("proc_root_invalid")
@@ -203,24 +287,76 @@ def discover_process_cwds(proc_root: Path, *, max_processes: int) -> tuple[Path,
         raise SafetyError("proc_bound_exceeded")
 
     cwds: list[Path] = []
+    metrics: dict[str, int] = {
+        "pid_dirs_seen": len(pid_names),
+        "skipped_foreign_unreadable": 0,
+        "skipped_zombies": 0,
+    }
     for pid_name in pid_names:
         pid_dir = proc_root / pid_name
         cwd_link = pid_dir / "cwd"
         try:
-            target = os.readlink(cwd_link)
+            target = cwd_reader(cwd_link)
         except FileNotFoundError as exc:
             # A process that disappeared during enumeration is harmless.  If the
-            # pid directory remains, its cwd evidence is unreadable and deletion
-            # must fail closed.
-            if not pid_dir.exists():
+            # pid directory remains, only a stable zombie is cwd-less by kernel
+            # definition; every other persistent missing cwd fails closed.
+            if _pid_dir_vanished(pid_dir):
+                continue
+            try:
+                is_zombie = _is_stable_zombie(pid_dir)
+            except FileNotFoundError as exc2:
+                if _pid_dir_vanished(pid_dir):
+                    continue
+                raise SafetyError("proc_state_unattributable") from exc2
+            if is_zombie:
+                metrics["skipped_zombies"] += 1
                 continue
             raise SafetyError("proc_evidence_unreadable") from exc
         except OSError as exc:
-            raise SafetyError("proc_evidence_unreadable") from exc
+            # Only permission denial is eligible for a foreign-UID skip.  Other
+            # cwd failures remain fail-closed regardless of process ownership.
+            if exc.errno not in (errno.EACCES, errno.EPERM):
+                raise SafetyError("proc_evidence_unreadable") from exc
+            # A permission-denied cwd is acceptable to skip ONLY after the
+            # process UID has been attributed as foreign (different from the
+            # current UID) through a trustworthy lookup.  Same-UID unreadable
+            # evidence, or a lookup that is missing/malformed/changed, always
+            # fails closed.  We never infer UID from the pid or error alone.
+            try:
+                owner_uid = _lookup_pid_uid(lookup, pid_dir)
+            except FileNotFoundError as exc2:
+                if _pid_dir_vanished(pid_dir):
+                    continue
+                raise SafetyError("proc_owner_unattributable") from exc2
+            if owner_uid == current_uid:
+                raise SafetyError("proc_evidence_unreadable") from exc
+
+            try:
+                target = cwd_reader(cwd_link)
+            except FileNotFoundError as exc2:
+                if _pid_dir_vanished(pid_dir):
+                    continue
+                raise SafetyError("proc_evidence_unreadable") from exc2
+            except OSError as exc2:
+                if exc2.errno not in (errno.EACCES, errno.EPERM):
+                    raise SafetyError("proc_evidence_unreadable") from exc2
+                try:
+                    rechecked_uid = _lookup_pid_uid(lookup, pid_dir)
+                except FileNotFoundError as exc3:
+                    if _pid_dir_vanished(pid_dir):
+                        continue
+                    raise SafetyError("proc_owner_unattributable") from exc3
+                if rechecked_uid != owner_uid:
+                    raise SafetyError("proc_owner_changed")
+                metrics["skipped_foreign_unreadable"] += 1
+                continue
+        if not isinstance(target, str):
+            raise SafetyError("proc_evidence_malformed")
         if target.endswith(" (deleted)"):
             target = target[: -len(" (deleted)")]
         cwds.append(_canonical_absolute_path(target, "proc_evidence_malformed"))
-    return tuple(cwds)
+    return ProcScanResult(tuple(cwds), metrics)
 
 
 def _validate_root(root: Path) -> CleanupRoot:
@@ -350,10 +486,17 @@ def _snapshot(
     proc_root: Path,
     *,
     max_processes: int,
+    pid_uid_lookup: Callable[[Path], int] | None = None,
+    cwd_reader: Callable[[Path], str] = os.readlink,
 ) -> SafetySnapshot:
     running_workspaces = board_source.discover()
-    process_cwds = discover_process_cwds(proc_root, max_processes=max_processes)
-    return SafetySnapshot(running_workspaces, process_cwds)
+    scan = discover_process_cwds(
+        proc_root,
+        max_processes=max_processes,
+        pid_uid_lookup=pid_uid_lookup,
+        cwd_reader=cwd_reader,
+    )
+    return SafetySnapshot(running_workspaces, scan.cwds, scan.metrics)
 
 
 def _candidate_receipt(candidate: Candidate, evaluation: Evaluation) -> dict[str, Any]:
@@ -409,6 +552,8 @@ def run_reaper(
     proc_root: Path = Path("/proc"),
     max_live_workspaces: int = DEFAULT_MAX_LIVE_WORKSPACES,
     max_processes: int = DEFAULT_MAX_PROCESSES,
+    pid_uid_lookup: Callable[[Path], int] | None = None,
+    cwd_reader: Callable[[Path], str] = os.readlink,
 ) -> tuple[int, dict[str, Any]]:
     """Evaluate and optionally delete old direct-child workspaces."""
 
@@ -427,6 +572,8 @@ def run_reaper(
                 board_source,
                 proc_root,
                 max_processes=max_processes,
+                pid_uid_lookup=pid_uid_lookup,
+                cwd_reader=cwd_reader,
             )
         except SafetyError as exc:
             return EXIT_SAFETY_FAILURE, _error_receipt(
@@ -456,6 +603,7 @@ def run_reaper(
             "apply": apply,
             "candidates": receipt_rows,
             "error": None,
+            "metrics": {"process": dict(initial_snapshot.proc_metrics)},
             "retention_seconds": retention_seconds,
             "root": str(validated_root.path),
             "status": "ok",
@@ -495,6 +643,11 @@ def run_reaper(
                         board_source,
                         proc_root,
                         max_processes=max_processes,
+                        pid_uid_lookup=pid_uid_lookup,
+                        cwd_reader=cwd_reader,
+                    )
+                    receipt["metrics"]["process"] = dict(
+                        recheck_snapshot.proc_metrics
                     )
                 except SafetyError as exc:
                     receipt["status"] = "safety_failure"

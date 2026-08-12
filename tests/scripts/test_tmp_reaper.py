@@ -336,13 +336,137 @@ def test_symlink_cleanup_root_fails_closed(tmp_path: Path) -> None:
     assert doomed.is_dir()
 
 
-def test_unreadable_process_evidence_fails_closed(tmp_path: Path) -> None:
+def test_unreadable_same_uid_process_evidence_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    doomed = root / "doomed"
+    doomed.mkdir(parents=True)
+    mark_old(doomed)
+    proc_root = make_proc_root(tmp_path, [(123, tmp_path / "unrelated")])
+
+    def denied_cwd_reader(path: Path) -> str:
+        raise PermissionError(13, "permission denied", path)
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+        pid_uid_lookup=lambda _pid_dir: os.geteuid(),
+        cwd_reader=denied_cwd_reader,
+    )
+
+    assert exit_code == reaper.EXIT_SAFETY_FAILURE
+    assert receipt["status"] == "safety_failure"
+    assert receipt["error"] == {"code": "proc_evidence_unreadable"}
+    assert doomed.is_dir()
+
+
+def test_unreadable_foreign_uid_is_skipped_while_live_cwd_blocks_and_dead_deletes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspaces"
+    live = root / "live"
+    live_cwd = live / "checkout"
+    dead = root / "dead"
+    live_cwd.mkdir(parents=True)
+    dead.mkdir()
+    mark_old(live)
+    mark_old(dead)
+    proc_root = make_proc_root(
+        tmp_path,
+        [(101, tmp_path / "foreign-unreadable"), (102, live_cwd)],
+    )
+
+    def selective_cwd_reader(path: Path) -> str:
+        if path.parent.name == "101":
+            raise PermissionError(13, "permission denied", path)
+        return os.readlink(path)
+
+    def pid_uid_lookup(pid_dir: Path) -> int:
+        return os.geteuid() + 1 if pid_dir.name == "101" else os.geteuid()
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+        pid_uid_lookup=pid_uid_lookup,
+        cwd_reader=selective_cwd_reader,
+    )
+
+    live_row = candidate(receipt, "live")
+    dead_row = candidate(receipt, "dead")
+    assert exit_code == 0
+    assert receipt["status"] == "ok"
+    assert receipt["metrics"]["process"] == {
+        "pid_dirs_seen": 2,
+        "skipped_foreign_unreadable": 1,
+        "skipped_zombies": 0,
+    }
+    assert live.is_dir()
+    assert live_row["decision"] == "kept"
+    assert live_row["reason_codes"] == ["retention_elapsed", "process_cwd_overlap"]
+    assert not dead.exists()
+    assert dead_row["decision"] == "deleted"
+    assert dead_row["reason_codes"] == ["retention_elapsed", "deleted"]
+
+
+@pytest.mark.parametrize(
+    ("pid_uid_lookup", "error_code"),
+    [
+        (lambda _pid_dir: "1001", "proc_owner_unattributable"),
+        (
+            lambda _pid_dir: (_ for _ in ()).throw(FileNotFoundError()),
+            "proc_owner_unattributable",
+        ),
+        (
+            lambda _pid_dir, values=iter([os.geteuid() + 1, os.geteuid()]): next(
+                values
+            ),
+            "proc_owner_changed",
+        ),
+    ],
+)
+def test_unreadable_process_owner_untrustworthy_fails_closed(
+    tmp_path: Path,
+    pid_uid_lookup: Any,
+    error_code: str,
+) -> None:
+    root = tmp_path / "workspaces"
+    doomed = root / "doomed"
+    doomed.mkdir(parents=True)
+    mark_old(doomed)
+    proc_root = make_proc_root(tmp_path, [(123, tmp_path / "unrelated")])
+
+    def denied_cwd_reader(path: Path) -> str:
+        raise PermissionError(13, "permission denied", path)
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+        pid_uid_lookup=pid_uid_lookup,
+        cwd_reader=denied_cwd_reader,
+    )
+
+    assert exit_code == reaper.EXIT_SAFETY_FAILURE
+    assert receipt["error"] == {"code": error_code}
+    assert doomed.is_dir()
+
+
+def test_persistent_missing_cwd_fails_closed(tmp_path: Path) -> None:
     root = tmp_path / "workspaces"
     doomed = root / "doomed"
     doomed.mkdir(parents=True)
     mark_old(doomed)
     proc_root = tmp_path / "proc"
-    (proc_root / "123").mkdir(parents=True)  # Persistent pid dir, missing cwd.
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)  # Persistent pid dir, missing cwd.
+    (pid_dir / "status").write_text("Name:\ttest\nState:\tS (sleeping)\n", encoding="utf-8")
 
     exit_code, receipt = reaper.run_reaper(
         root,
@@ -354,6 +478,105 @@ def test_unreadable_process_evidence_fails_closed(tmp_path: Path) -> None:
 
     assert exit_code == reaper.EXIT_SAFETY_FAILURE
     assert receipt["error"] == {"code": "proc_evidence_unreadable"}
+    assert doomed.is_dir()
+
+
+def test_malformed_same_uid_cwd_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    doomed = root / "doomed"
+    doomed.mkdir(parents=True)
+    mark_old(doomed)
+    proc_root = make_proc_root(tmp_path, [(123, tmp_path / "unrelated")])
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+        cwd_reader=lambda _path: "relative/cwd",
+    )
+
+    assert exit_code == reaper.EXIT_SAFETY_FAILURE
+    assert receipt["error"] == {"code": "proc_evidence_malformed"}
+    assert doomed.is_dir()
+
+
+def test_pid_disappearance_is_skipped_only_after_directory_vanishes(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    old = root / "old"
+    old.mkdir(parents=True)
+    mark_old(old)
+    proc_root = make_proc_root(tmp_path, [(123, tmp_path / "unrelated")])
+
+    def disappearing_cwd_reader(path: Path) -> str:
+        path.unlink()
+        path.parent.rmdir()
+        raise FileNotFoundError(path)
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+        cwd_reader=disappearing_cwd_reader,
+    )
+
+    assert exit_code == 0
+    assert old.is_dir()
+    assert candidate(receipt, "old")["decision"] == "would_delete"
+
+
+def test_stable_zombie_without_cwd_is_visible_safe_skip(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    old = root / "old"
+    old.mkdir(parents=True)
+    mark_old(old)
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "status").write_text(
+        "Name:\ttest\nState:\tZ (zombie)\nUid:\t1000\t1000\t1000\t1000\n",
+        encoding="utf-8",
+    )
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+    )
+
+    assert exit_code == 0
+    assert old.is_dir()
+    assert candidate(receipt, "old")["decision"] == "would_delete"
+    assert receipt["metrics"]["process"] == {
+        "pid_dirs_seen": 1,
+        "skipped_foreign_unreadable": 0,
+        "skipped_zombies": 1,
+    }
+
+
+def test_malformed_state_for_missing_cwd_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    doomed = root / "doomed"
+    doomed.mkdir(parents=True)
+    mark_old(doomed)
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "status").write_text("Name:\ttest\n", encoding="utf-8")
+
+    exit_code, receipt = reaper.run_reaper(
+        root,
+        apply=True,
+        retention_seconds=0,
+        board_client=FakeBoardClient([]),
+        proc_root=proc_root,
+    )
+
+    assert exit_code == reaper.EXIT_SAFETY_FAILURE
+    assert receipt["error"] == {"code": "proc_state_malformed"}
     assert doomed.is_dir()
 
 
