@@ -5722,6 +5722,11 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+_TERMINAL_WORKSPACE_CLEANUP_STATUSES = frozenset(
+    {"done", "archived", "failed", "cancelled"}
+)
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5806,10 +5811,31 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT workspace_kind, workspace_path, status, worker_pid "
+                "FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+                continue
+            # Deferred cleanup is for a parent that already finished while its
+            # children still needed handoff artifacts. It must never turn a
+            # child's completion into deletion of a running parent's cwd.
+            if row["status"] not in _TERMINAL_WORKSPACE_CLEANUP_STATUSES:
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: parent is %s, not terminal",
+                    parent_id,
+                    row["status"],
+                )
+                continue
+            # A terminal transition can race worker teardown. A recycled PID
+            # may conservatively defer cleanup, which is safer than deleting a
+            # live worker's directory; this path never signals the PID.
+            if row["worker_pid"] is not None and _pid_alive(row["worker_pid"]):
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: worker pid %s is alive",
+                    parent_id,
+                    row["worker_pid"],
+                )
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
