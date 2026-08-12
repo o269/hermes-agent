@@ -36,8 +36,19 @@ from hermes_cli.session_export_md import (
 
 DEFAULT_HOT_DAYS = 30.0
 DEFAULT_ARCHIVE_GRACE_DAYS = 7.0
+# Hard floor: cold eligibility cannot be satisfied by lowering hot/grace.
+# Tests MUST assert against the literal 37-day / 3_196_800s values, not by
+# reading these constants from the module under test.
+MIN_COLD_AGE_DAYS = 37.0
+MIN_COLD_AGE_SECONDS = 3_196_800  # 37 * 86400
+# Rollback / stage bundle retention floor (14 days). Tests MUST assert the
+# literal 1_209_600 seconds rather than reading this constant.
+BUNDLE_RETENTION_SECONDS = 1_209_600  # 14 * 86400
 _ARCHIVE_VERSION = 1
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
+# Durable sessions columns required before any selection or deletion. Missing
+# columns fail closed — never treat absence as an empty invariant set.
+_REQUIRED_SESSIONS_COLUMNS = frozenset({"pinned", "last_activity_at"})
 DEFAULT_PERMANENT_HOLD_SOURCES = frozenset({
     "discord",
     "imessage",
@@ -176,15 +187,60 @@ def _live_state_paths() -> set[Path]:
             paths.add(Path(raw).expanduser().resolve(strict=False))
         except OSError:
             continue
+    for suffix in _SIDECAR_SUFFIXES:
+        if suffix == "":
+            continue
+        try:
+            paths.add((get_hermes_home() / ("state.db" + suffix)).resolve(strict=False))
+        except OSError:
+            continue
     return paths
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """Return (st_dev, st_ino) for an existing path, or None if missing."""
+    try:
+        st = path.expanduser().resolve(strict=False).stat()
+    except OSError:
+        return None
+    if not stat_is_reg_or_link(st.st_mode):
+        # Still compare inode for hardlink detection when path exists.
+        pass
+    return (int(st.st_dev), int(st.st_ino))
+
+
+def stat_is_reg_or_link(mode: int) -> bool:
+    import stat as stat_mod
+
+    return stat_mod.S_ISREG(mode) or stat_mod.S_ISLNK(mode)
+
+
+def _live_state_identities() -> set[tuple[int, int]]:
+    identities: set[tuple[int, int]] = set()
+    for path in _live_state_paths():
+        identity = _file_identity(path)
+        if identity is not None:
+            identities.add(identity)
+    # Also include unresolved live path variants (pre-resolve hardlink targets).
+    for raw in (DEFAULT_DB_PATH, get_hermes_home() / "state.db"):
+        identity = _file_identity(Path(raw))
+        if identity is not None:
+            identities.add(identity)
+        for suffix in _SIDECAR_SUFFIXES:
+            if suffix == "":
+                continue
+            identity = _file_identity(Path(str(raw) + suffix))
+            if identity is not None:
+                identities.add(identity)
+    return identities
 
 
 def reject_live_state_db(source_path: Path) -> Path:
     """Return a resolved source path or fail if it is the active profile DB.
 
-    The guard deliberately uses ``resolve(strict=True)`` for the candidate and
-    ``resolve(strict=False)`` for known live paths so symlinks cannot route a
-    destructive pass onto ``~/.hermes/state.db``.
+    Guards against path equality, symlink resolution, AND hardlink/alias
+    identity via ``(st_dev, st_ino)`` comparison. Path-only checks are not
+    sufficient: a hardlink of the live DB must also be refused.
     """
 
     source = _resolve_existing_file(source_path)
@@ -199,7 +255,32 @@ def reject_live_state_db(source_path: Path) -> Path:
             raise ColdArchiveError(
                 "refusing to use an active state.db sidecar as source"
             )
+    source_identity = _file_identity(source)
+    if source_identity is not None and source_identity in _live_state_identities():
+        raise ColdArchiveError(
+            "refusing to run cold archival against a hardlink/symlink/alias of "
+            "the active Hermes state.db; use a true offline copy (different inode)"
+        )
     return source
+
+
+def require_sessions_schema(conn: sqlite3.Connection) -> set[str]:
+    """Fail closed when durable conflict-resolution columns are missing.
+
+    A missing ``pinned`` or ``last_activity_at`` column must never be treated as
+    an empty invariant set. Selection and deletion both refuse until the
+    schema carries both columns.
+    """
+
+    columns = _table_columns(conn, "sessions")
+    missing = sorted(_REQUIRED_SESSIONS_COLUMNS - columns)
+    if missing:
+        raise ColdArchiveError(
+            "sessions schema missing required durable columns "
+            f"{missing}; refusing cold-archive selection/deletion "
+            "(fail closed — do not infer empty pin/activity invariants)"
+        )
+    return columns
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -248,17 +329,52 @@ def _placeholders(values: Sequence[str]) -> str:
 
 
 def _session_rows(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    require_sessions_schema(conn)
     rows = conn.execute(
         """
         SELECT s.*,
-               COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id),
-                        s.started_at) AS actual_last_active,
+               COALESCE(
+                   s.last_activity_at,
+                   (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id),
+                   s.started_at
+               ) AS actual_last_active,
                (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS actual_message_count
         FROM sessions s
         ORDER BY s.started_at ASC, s.id ASC
         """
     ).fetchall()
     return {str(row["id"]): dict(row) for row in rows}
+
+
+def effective_cold_cutoff(
+    *,
+    generated_at: float,
+    hot_days: float,
+    archive_grace_days: float,
+) -> tuple[float, float, float]:
+    """Return (cold_cutoff, hot_cutoff, effective_min_age_days).
+
+    Enforces a hard 37-day floor that cannot be bypassed by setting hot_days or
+    archive_grace_days to zero (or any value whose sum is below 37 days).
+    """
+
+    if hot_days < 0 or archive_grace_days < 0:
+        raise ColdArchiveError("hot_days and archive_grace_days must be non-negative")
+    configured_days = float(hot_days) + float(archive_grace_days)
+    # Literal floor comparison against 37.0 days — not overridable via knobs.
+    effective_days = max(configured_days, float(MIN_COLD_AGE_DAYS))
+    if effective_days * 86400.0 < float(MIN_COLD_AGE_SECONDS):
+        # Belt-and-suspenders: seconds floor must also hold.
+        effective_days = float(MIN_COLD_AGE_SECONDS) / 86400.0
+    cold_cutoff = float(generated_at) - effective_days * 86400.0
+    hot_cutoff = float(generated_at) - float(hot_days) * 86400.0
+    # Hot cutoff itself must never be newer than the hard floor window start.
+    floor_hot = float(generated_at) - float(MIN_COLD_AGE_SECONDS)
+    if hot_cutoff > floor_hot:
+        # hot_ids invariant uses a floor-aware boundary so "hot" always covers
+        # anything younger than 37 days even when hot_days is misconfigured low.
+        hot_cutoff = floor_hot
+    return cold_cutoff, hot_cutoff, effective_days
 
 
 def _parent_edges(rows: dict[str, dict[str, Any]]) -> list[tuple[str, str]]:
@@ -401,17 +517,19 @@ def build_gate_b_manifest(
 ) -> dict[str, Any]:
     """Build a redacted Gate-B manifest from an offline/read-only snapshot."""
 
-    if hot_days < 0 or archive_grace_days < 0:
-        raise ColdArchiveError("hot_days and archive_grace_days must be non-negative")
     generated_at = time.time() if now is None else float(now)
-    cutoff = generated_at - (float(hot_days) + float(archive_grace_days)) * 86400.0
-    hot_cutoff = generated_at - float(hot_days) * 86400.0
+    cutoff, hot_cutoff, effective_days = effective_cold_cutoff(
+        generated_at=generated_at,
+        hot_days=float(hot_days),
+        archive_grace_days=float(archive_grace_days),
+    )
     source = reject_live_state_db(source_db)
     compiled_title_holds = [re.compile(pattern) for pattern in hold_title_regexes]
     normalized_hold_sources = {str(source_name).lower() for source_name in hold_sources}
     normalized_cwd_holds = [str(prefix) for prefix in hold_cwd_prefixes]
 
     with _connect_readonly(source) as conn:
+        require_sessions_schema(conn)
         rows = _session_rows(conn)
         components = _connected_components(rows)
         selected_groups: list[dict[str, Any]] = []
@@ -433,9 +551,12 @@ def build_gate_b_manifest(
                     reasons.add("open_session")
                 if int(row.get("archived") or 0) != 1:
                     reasons.add("not_archived")
-                if int(row.get("pinned") or 0) != 0:
+                # pinned is a required durable column (schema-gated above).
+                if int(row["pinned"] or 0) != 0:
                     reasons.add("pinned")
-                if float(row.get("actual_last_active") or 0.0) >= cutoff:
+                # Exact 37-day boundary is ELIGIBLE (age >= 37d). Skip only when
+                # strictly newer than the cold cutoff (last_active > cutoff).
+                if float(row.get("actual_last_active") or 0.0) > cutoff:
                     reasons.add("inside_30d_hot_plus_7d_grace")
                 for hold_reason in _matches_holds(
                     row,
@@ -492,20 +613,29 @@ def build_gate_b_manifest(
             "policy": {
                 "hot_days": float(hot_days),
                 "archive_grace_days": float(archive_grace_days),
+                "min_cold_age_days": float(MIN_COLD_AGE_DAYS),
+                "min_cold_age_seconds": int(MIN_COLD_AGE_SECONDS),
+                "effective_min_age_days": float(effective_days),
+                "bundle_retention_seconds": int(BUNDLE_RETENTION_SECONDS),
                 "cold_cutoff_epoch": cutoff,
                 "cold_cutoff_utc": utc_iso(cutoff),
                 "hot_cutoff_epoch": hot_cutoff,
                 "hot_cutoff_utc": utc_iso(hot_cutoff),
+                "boundary_rule": "last_active > cold_cutoff => skip; exact boundary eligible",
                 "must_be_ended": True,
                 "must_be_archived": True,
                 "must_be_unpinned": True,
                 "must_select_whole_parent_child_component": True,
                 "actual_messages_rows_not_sessions_message_count": True,
+                "required_sessions_columns": sorted(_REQUIRED_SESSIONS_COLUMNS),
                 "default_permanent_hold_sources": sorted(normalized_hold_sources),
                 "hold_title_regexes": [
                     pattern.pattern for pattern in compiled_title_holds
                 ],
                 "hold_cwd_prefixes": normalized_cwd_holds,
+                "remote_publish_forbids_restricted_ids": True,
+                "remote_publish_forbids_parent_map": True,
+                "remote_publish_forbids_qmd_plaintext": True,
             },
             "counts": {
                 "sessions_total": len(rows),
@@ -566,7 +696,25 @@ def write_gate_b_manifest(stage_root: Path, manifest: dict[str, Any]) -> StageAr
     public_manifest = {
         key: value for key, value in manifest.items() if not key.startswith("_")
     }
-    manifest_path = _atomic_write_json(root / "GATE-B-MANIFEST.json", public_manifest)
+    manifest_path = root / "GATE-B-MANIFEST.json"
+    # Integrity gate: never overwrite an existing Gate-B attestation in place.
+    # A second write would replace the very bytes prior reviews may have hashed.
+    if manifest_path.exists():
+        existing_sha = sha256_path(manifest_path)
+        planned_text = (
+            json.dumps(public_manifest, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        )
+        planned_sha = _sha256_bytes(planned_text.encode("utf-8"))
+        if existing_sha != planned_sha:
+            raise ColdArchiveError(
+                "refusing to overwrite existing GATE-B-MANIFEST.json with different "
+                "bytes (integrity gate must not self-overwrite attested content); "
+                "use a fresh stage-root"
+            )
+        # Identical content — leave bytes untouched so attested hash stays stable.
+    else:
+        _atomic_write_json(manifest_path, public_manifest)
     ids = manifest.get("_restricted_selected_ids") or []
     ids_text = "".join(f"{sid}\n" for sid in ids)
     ids_path = _atomic_write_text(restricted / "selected-session-ids.txt", ids_text)
@@ -701,6 +849,42 @@ def _load_session_export(
     return base
 
 
+def _safe_qmd_filename(session: dict[str, Any]) -> str:
+    """Build a path-safe QMD filename that cannot escape the export directory.
+
+    Session IDs from the DB are untrusted path components: strip any directory
+    separators and ``..`` segments before composing the filename.
+    """
+
+    raw_name = safe_session_filename(session, fmt="qmd")
+    # Collapse any path segments — session_id may contain ../ or absolute paths.
+    leaf = Path(raw_name).name
+    leaf = leaf.replace("\x00", "")
+    if leaf in {"", ".", ".."} or "/" in leaf or "\\" in leaf:
+        raise ColdArchiveError(f"unsafe QMD export filename after sanitization: {raw_name!r}")
+    # Only allow a conservative charset in the final leaf.
+    if not re.match(r"^[A-Za-z0-9._-]+$", leaf):
+        digest = _sha256_bytes(str(session.get("id") or raw_name).encode("utf-8"))[:16]
+        leaf = f"session-{digest}.qmd"
+    if not leaf.endswith(".qmd"):
+        leaf = f"{leaf}.qmd"
+    return leaf
+
+
+def _contained_path(root: Path, relative_name: str) -> Path:
+    """Resolve ``root / relative_name`` and refuse path escape."""
+
+    root_resolved = root.expanduser().resolve(strict=False)
+    candidate = (root_resolved / relative_name).resolve(strict=False)
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ColdArchiveError(
+            f"refusing path escape outside stage directory: {candidate}"
+        ) from exc
+    return candidate
+
+
 def export_redacted_qmd(
     source_db: Path,
     stage: StageArtifacts,
@@ -713,15 +897,30 @@ def export_redacted_qmd(
     id_set = set(ids)
     exported: list[dict[str, Any]] = []
     total_messages = 0
+    qmd_root = stage.qmd_dir.expanduser().resolve(strict=False)
     with _connect_readonly(reject_live_state_db(source_db)) as conn:
+        require_sessions_schema(conn)
         components = _connected_components(_session_rows(conn))
         for component in components:
             if not set(component).issubset(id_set):
                 continue
             session = _load_session_export(conn, component)
             redacted = redact_session_data(session)
-            filename = safe_session_filename(redacted, fmt="qmd")
-            path = stage.qmd_dir / filename
+            filename = _safe_qmd_filename(redacted)
+            path = _contained_path(qmd_root, filename)
+            # Refuse to clobber Gate-B / restricted / receipt / other stage roots.
+            if path.exists() and path.resolve() != path:
+                pass
+            forbidden_names = {
+                "GATE-B-MANIFEST.json",
+                "COLD-ARCHIVE-RECEIPT.json",
+                "selected-session-ids.txt",
+                "lineage-parent-map.json",
+            }
+            if path.name in forbidden_names:
+                raise ColdArchiveError(
+                    f"QMD export filename collides with stage integrity artifact: {path.name}"
+                )
             text = render_session_markdown(redacted, fmt="qmd")
             _atomic_write_text(path, text)
             ok, reason = verify_export_file(path, redacted)
@@ -775,8 +974,13 @@ def publish_paths_with_rclone(
 
     This intentionally uses copy/check/readback only.  It never invokes rclone
     sync, delete, purge, dedupe, move, cleanup, or retention verbs.
+
+    Restricted IDs, parent maps, and QMD plaintext are never eligible for
+    remote publication — ``assert_publish_paths_are_remote_safe`` enforces that
+    before any network call.
     """
 
+    assert_publish_paths_are_remote_safe(paths)
     if not remote_root or re.search(r"[\r\n\x00]", remote_root):
         raise ColdArchiveError("invalid rclone remote root")
     if (
@@ -869,13 +1073,12 @@ def publish_paths_with_rclone(
 def _capture_invariants(
     conn: sqlite3.Connection, *, hot_cutoff: float
 ) -> dict[str, Any]:
-    pinned_ids = (
-        sorted(
-            str(row[0])
-            for row in conn.execute("SELECT id FROM sessions WHERE pinned = 1")
-        )
-        if _has_column(conn, "sessions", "pinned")
-        else []
+    # Fail closed: pinned / last_activity_at must exist. Never invent an empty
+    # pinned_ids set from a missing column.
+    require_sessions_schema(conn)
+    pinned_ids = sorted(
+        str(row[0])
+        for row in conn.execute("SELECT id FROM sessions WHERE pinned = 1")
     )
     invariants: dict[str, Any] = {
         "sessions": _count_where(conn, "SELECT COUNT(*) FROM sessions"),
@@ -890,8 +1093,11 @@ def _capture_invariants(
             for row in conn.execute(
                 """
                 SELECT s.id FROM sessions s
-                WHERE COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id),
-                               s.started_at) >= ?
+                WHERE COALESCE(
+                    s.last_activity_at,
+                    (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id),
+                    s.started_at
+                ) > ?
                 """,
                 (hot_cutoff,),
             )
@@ -1028,7 +1234,12 @@ def apply_retention_to_candidate(
     *,
     expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Delete only the reviewed selected IDs from an offline candidate copy."""
+    """Delete only the reviewed selected IDs from an offline candidate copy.
+
+    Deletion and invariant checks share one transaction: any post-delete
+    invariant failure rolls the deletion back. ``system_prompts`` rows are
+    never deleted (out of declared cold-archive scope).
+    """
 
     ids = sorted(str(sid) for sid in (manifest.get("_restricted_selected_ids") or []))
     if expected_manifest_sha256 and expected_manifest_sha256 != manifest.get(
@@ -1042,6 +1253,7 @@ def apply_retention_to_candidate(
 
     hot_cutoff = float(manifest["policy"]["hot_cutoff_epoch"])
     with _connect_candidate(candidate_db) as conn:
+        require_sessions_schema(conn)
         before = _capture_invariants(conn, hot_cutoff=hot_cutoff)
         before_search_survivors = _capture_search_survivor_invariants(conn, ids)
         existing = sorted(
@@ -1100,55 +1312,54 @@ def apply_retention_to_candidate(
                 f"DELETE FROM sessions WHERE id IN ({_placeholders(ids)})",
                 tuple(ids),
             )
-            if _table_exists(conn, "system_prompts"):
-                conn.execute(
-                    """
-                    DELETE FROM system_prompts
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM sessions
-                        WHERE sessions.system_prompt_hash = system_prompts.hash
-                    )
-                    """
+            # NOTE: deliberately do NOT touch system_prompts. Orphan prompt rows
+            # are outside declared cold-archive scope.
+
+            # Invariant checks run INSIDE the same transaction so failure rolls
+            # the deletion back rather than retaining a post-COMMIT failure.
+            after = _capture_invariants(conn, hot_cutoff=hot_cutoff)
+            survivor_parent_before = {
+                sid: parent
+                for sid, parent in before["parent_map"].items()
+                if sid not in set(ids)
+            }
+            if after["parent_map"] != survivor_parent_before:
+                raise ColdArchiveError("surviving parent_session_id map changed")
+            if before["sessions"] - after["sessions"] != len(ids):
+                raise ColdArchiveError(
+                    "session delta does not equal manifest selected count"
                 )
+            if before["messages"] - after["messages"] != selected_messages:
+                raise ColdArchiveError(
+                    "message delta does not equal manifest selected message count"
+                )
+            for invariant_key in ("open_ids", "pinned_ids", "hot_ids"):
+                if before[invariant_key] != after[invariant_key]:
+                    raise ColdArchiveError(f"{invariant_key} changed during retention")
+
+            integrity = [
+                str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
+            ]
+            if integrity != ["ok"]:
+                raise ColdArchiveError("PRAGMA integrity_check did not return exactly ok")
+            foreign_keys = [
+                list(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()
+            ]
+            if foreign_keys:
+                raise ColdArchiveError("PRAGMA foreign_key_check returned violations")
+            fts = _verify_fts_counts(conn)
+            after_search_survivors = _capture_search_survivor_invariants(conn, [])
+            if after_search_survivors != before_search_survivors:
+                raise ColdArchiveError("surviving message/search-index invariants changed")
+
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
 
-        after = _capture_invariants(conn, hot_cutoff=hot_cutoff)
-        survivor_parent_before = {
-            sid: parent
-            for sid, parent in before["parent_map"].items()
-            if sid not in set(ids)
-        }
-        if after["parent_map"] != survivor_parent_before:
-            raise ColdArchiveError("surviving parent_session_id map changed")
-        if before["sessions"] - after["sessions"] != len(ids):
-            raise ColdArchiveError(
-                "session delta does not equal manifest selected count"
-            )
-        if before["messages"] - after["messages"] != selected_messages:
-            raise ColdArchiveError(
-                "message delta does not equal manifest selected message count"
-            )
-        for invariant_key in ("open_ids", "pinned_ids", "hot_ids"):
-            if before[invariant_key] != after[invariant_key]:
-                raise ColdArchiveError(f"{invariant_key} changed during retention")
-
-        integrity = [
-            str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
-        ]
-        if integrity != ["ok"]:
-            raise ColdArchiveError("PRAGMA integrity_check did not return exactly ok")
-        foreign_keys = [
-            list(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()
-        ]
-        if foreign_keys:
-            raise ColdArchiveError("PRAGMA foreign_key_check returned violations")
-        fts = _verify_fts_counts(conn)
-        after_search_survivors = _capture_search_survivor_invariants(conn, [])
-        if after_search_survivors != before_search_survivors:
-            raise ColdArchiveError("surviving message/search-index invariants changed")
         return {
             "applied": True,
             "deleted_sessions": len(ids),
@@ -1162,7 +1373,59 @@ def apply_retention_to_candidate(
                     after["parent_map"], sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
             ),
+            "system_prompts_deleted": 0,
         }
+
+
+def classify_bundle_retention(
+    *,
+    bundle_mtime_epoch: float,
+    now_epoch: float,
+    retention_seconds: int = BUNDLE_RETENTION_SECONDS,
+) -> str:
+    """Return ``retain`` or ``eligible_for_purge`` for a rollback bundle.
+
+    Retention is a hard floor of ``retention_seconds`` (default 14 days =
+    1_209_600s). Bundles younger than the floor must never be purged by this
+    module. Callers that implement purge must use this classifier.
+    """
+
+    if retention_seconds < 0:
+        raise ColdArchiveError("bundle retention_seconds must be non-negative")
+    age = float(now_epoch) - float(bundle_mtime_epoch)
+    if age < float(retention_seconds):
+        return "retain"
+    return "eligible_for_purge"
+
+
+def assert_publish_paths_are_remote_safe(paths: Sequence[Path]) -> None:
+    """Refuse remote publication of restricted IDs, parent maps, or QMD plaintext."""
+
+    forbidden_suffixes = (".qmd",)
+    forbidden_names = {
+        "selected-session-ids.txt",
+        "lineage-parent-map.json",
+    }
+    for path in paths:
+        name = Path(path).name
+        if name in forbidden_names:
+            raise ColdArchiveError(
+                f"refusing remote publication of restricted artifact: {name}"
+            )
+        if name.endswith(forbidden_suffixes):
+            raise ColdArchiveError(
+                f"refusing remote publication of QMD plaintext: {name}"
+            )
+        # Also catch paths under restricted/ regardless of leaf name.
+        parts = {p.lower() for p in Path(path).parts}
+        if "restricted" in parts:
+            raise ColdArchiveError(
+                f"refusing remote publication of path under restricted/: {path}"
+            )
+        if "cold-qmd" in parts:
+            raise ColdArchiveError(
+                f"refusing remote publication of path under cold-qmd/: {path}"
+            )
 
 
 def run_cold_archive_pass(
@@ -1212,6 +1475,11 @@ def run_cold_archive_pass(
                 source, stage.stage_root / "rollback"
             )
             object.__setattr__(stage, "rollback_bundle_path", rollback_path)
+            rollback_report["bundle_retention_seconds"] = int(BUNDLE_RETENTION_SECONDS)
+            rollback_report["bundle_retention_policy"] = (
+                "retain bundles younger than bundle_retention_seconds; "
+                "purge eligibility is classify_bundle_retention only"
+            )
             qmd_report = export_redacted_qmd(source, stage, manifest)
             if (
                 qmd_report["message_count"]
@@ -1237,13 +1505,14 @@ def run_cold_archive_pass(
                     age_exe=age_exe,
                 )
                 object.__setattr__(stage, "rollback_encrypted_path", encrypted_path)
+                # NEVER publish restricted IDs, parent maps, or QMD plaintext.
+                # Allowed remote objects: public Gate-B manifest + age-encrypted
+                # rollback bundle only.
                 publish_list = [
                     stage.manifest_path,
-                    stage.restricted_ids_path,
-                    stage.restricted_groups_path,
-                    *[Path(item["path"]) for item in qmd_report["exported_files"]],
                     encrypted_path,
                 ]
+                assert_publish_paths_are_remote_safe(publish_list)
                 namespace = (
                     remote_namespace or f"hermes-state/{manifest['manifest_sha256']}"
                 )
@@ -1280,6 +1549,16 @@ def run_cold_archive_pass(
             "rollback_bundle": rollback_report,
             "rollback_encrypted": rollback_encrypted,
             "remote_publish": remote_report,
+            "remote_publish_policy": {
+                "publishes_restricted_ids": False,
+                "publishes_parent_map": False,
+                "publishes_qmd_plaintext": False,
+                "allowed_objects": [
+                    "GATE-B-MANIFEST.json",
+                    "rollback-source-bundle.tar.gz.age",
+                ],
+            },
+            "bundle_retention_seconds": int(BUNDLE_RETENTION_SECONDS),
             "retention": retention_report,
             "live_path_mutated": False,
             "vacuum_optimize_checkpoint_invoked": False,
@@ -1294,14 +1573,21 @@ def run_cold_archive_pass(
 
 
 __all__ = [
+    "BUNDLE_RETENTION_SECONDS",
     "ColdArchiveError",
     "DEFAULT_PERMANENT_HOLD_SOURCES",
+    "MIN_COLD_AGE_DAYS",
+    "MIN_COLD_AGE_SECONDS",
     "StageArtifacts",
     "apply_retention_to_candidate",
+    "assert_publish_paths_are_remote_safe",
     "build_gate_b_manifest",
+    "classify_bundle_retention",
+    "effective_cold_cutoff",
     "export_redacted_qmd",
     "publish_paths_with_rclone",
     "reject_live_state_db",
+    "require_sessions_schema",
     "run_cold_archive_pass",
     "write_gate_b_manifest",
 ]

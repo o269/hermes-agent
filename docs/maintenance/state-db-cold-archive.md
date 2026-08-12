@@ -4,20 +4,29 @@ This runbook documents the staged 30-day hot / 7-day archived-grace / cold-QMD p
 
 ## Non-goals and hard fences
 
-- Do not run this command against the active profile database at `~/.hermes/state.db`; the command refuses that path.
+- Do not run this command against the active profile database at `~/.hermes/state.db`; the command refuses that path, any symlink to it, and any hardlink/alias that shares its inode.
 - Do not enable `sessions.auto_prune`.
 - Do not run `hermes sessions optimize`, `VACUUM`, FTS optimize, WAL checkpoint, live `DELETE`, config changes, service changes, rclone sync/delete/purge/dedupe, or a production upload as part of author verification.
 - The command only mutates an offline recovered candidate when `--apply-retention` is explicitly supplied.
+- Never remotely publish restricted session IDs, the lineage parent map, or QMD plaintext. Ever.
+- Never delete `system_prompts` rows (including orphans); they are out of declared scope.
+- Do not overwrite an existing `GATE-B-MANIFEST.json` with different bytes; use a fresh `--stage-root`.
+
+## Schema prerequisites (fail closed)
+
+Selection and deletion require durable `sessions.pinned` and `sessions.last_activity_at` columns. If either is missing, the pass refuses. Missing columns are never treated as an empty invariant set.
 
 ## Policy encoded by default
 
 - Hot: sessions active within 30 days stay live.
 - Warm: already archived sessions get a 7-day reversible grace window.
-- Cold eligibility begins at inactive age >= 37 days.
-- A cold candidate must be ended, already archived, unpinned, and outside the hot+grace window.
+- **Hard floor:** cold eligibility cannot drop below inactive age **>= 37 days** (3_196_800 seconds), even if `--hot-days` / `--archive-grace-days` are set to 0.
+- Exact 37-day boundary is eligible (`last_active > cold_cutoff` is the skip rule).
+- A cold candidate must be ended, already archived, unpinned, and outside the effective cold window.
 - Selection is parent/child lineage-component safe: if any row in the component is open, pinned, unarchived, recent, held, or referenced by async/gateway state, the whole group is skipped.
 - Candidate sizing uses actual `messages` rows, never `sessions.message_count`.
 - Built-in permanent holds preserve customer/ops platform-source history (`telegram`, `discord`, `whatsapp`, `slack`, `signal`, `matrix`, `sms`, `imessage`, `photon`, `wecom`) unless the operator explicitly disables them.
+- Rollback/stage bundles have an explicit **14-day** retention floor (1_209_600 seconds) via `classify_bundle_retention`.
 
 ## Gate-B manifest only
 
@@ -33,15 +42,15 @@ hermes sessions cold-archive \
 
 Review:
 
-- `GATE-B-MANIFEST.json` — redacted counts/hashes/reason summary.
-- `restricted/selected-session-ids.txt` — exact IDs; keep mode 0600 and do not attach to public bus/card.
-- `restricted/lineage-parent-map.json` — restricted parent map receipt.
+- `GATE-B-MANIFEST.json` — redacted counts/hashes/reason summary (integrity-gated; not self-overwritten).
+- `restricted/selected-session-ids.txt` — exact IDs; keep mode 0600 and do not attach to public bus/card; **never remote-publish**.
+- `restricted/lineage-parent-map.json` — restricted parent map receipt; **never remote-publish**.
 
 Fable must approve the exact `gate_b_manifest_sha256` before destructive retention.
 
 ## Export, rollback bundle, and optional offsite publish
 
-The reviewed run creates a lossless rollback bundle before any deletion and restricted redacted QMD exports for the cold set:
+The reviewed run creates a lossless rollback bundle before any deletion and local redacted QMD exports for the cold set (QMD stays on the stage; it is not remotely published):
 
 ```bash
 hermes sessions cold-archive \
@@ -53,9 +62,14 @@ hermes sessions cold-archive \
   --remote-namespace hermes-state/<approved-manifest-sha>
 ```
 
-Remote publish is copy-only. It performs `rclone copyto`, `rclone check --checksum --one-way`, and an exact byte readback for every object. It does not run remote deletion, sync, purge, dedupe, move, cleanup, or retention.
+Remote publish is copy-only and limited to:
 
-The lossless rollback bundle is encrypted with age before remote publication. The private age identity must never be stored in the repository, bus, board, or on the VPS runtime path.
+- public `GATE-B-MANIFEST.json`
+- age-encrypted rollback bundle (`.tar.gz.age`)
+
+It performs `rclone copyto`, `rclone check --checksum --one-way`, and an exact byte readback for every object. It does not run remote deletion, sync, purge, dedupe, move, cleanup, or retention.
+
+The private age identity must never be stored in the repository, bus, board, or on the VPS runtime path.
 
 ## Applying retention to the offline candidate
 
@@ -68,7 +82,9 @@ hermes sessions cold-archive \
   --apply-retention
 ```
 
-The deletion transaction removes only selected sessions and their dependent `messages`, `session_model_usage`, `compression_locks`, and topic-binding rows. It never reparents surviving sessions. Post-delete verification requires:
+The deletion transaction removes only selected sessions and their dependent `messages`, `session_model_usage`, `compression_locks`, and topic-binding rows. It never reparents surviving sessions. **Invariant checks run inside the same transaction as the deletes** — any failure rolls the deletion back.
+
+Post-delete verification requires:
 
 - `PRAGMA integrity_check` exactly `ok`;
 - `PRAGMA foreign_key_check` zero rows;
@@ -93,6 +109,6 @@ This command also never installs the candidate over the active database automati
 
 ## Rollback
 
-Before candidate cutover, rollback is a direct restoration of the exact source bundle captured before retention while Hermes is fully stopped. Verify the rollback bundle manifest hashes before restore.
+Before candidate cutover, rollback is a direct restoration of the exact source bundle captured before retention while Hermes is fully stopped. Verify the rollback bundle manifest hashes before restore. Bundles younger than 14 days (1_209_600s) must be retained.
 
 If a candidate has already served new sessions, preserve both the failed candidate and rollback bundle, then stop for an operator decision on delta recovery instead of blindly discarding new rows.
