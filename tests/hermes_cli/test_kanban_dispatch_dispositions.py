@@ -10,6 +10,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+_REAL_GITHUB_PULL_STATE = getattr(kb, "_github_pull_state")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -222,3 +224,206 @@ def test_active_pr_claim_race_keeps_local_custody_detail(
     assert (entry.outcome, entry.reason) == ("held", "active_pr")
     assert entry.detail["pr_url"] == pr_url
     assert (task_id, "active_pr") in result.respawn_guarded
+
+
+def test_active_pr_guard_rechecks_github_state_without_releasing_open_control(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A closed PR releases its card; an actually-open sibling remains held."""
+    closed_url = "https://github.com/o269/hermes-agent/pull/67"
+    open_url = "https://github.com/o269/hermes-agent/pull/70"
+    states = {closed_url: "CLOSED", open_url: "OPEN"}
+    calls: list[str] = []
+
+    def github_state(pr_url):
+        calls.append(pr_url)
+        return states[pr_url]
+
+    monkeypatch.setattr(kb, "_github_pull_state", github_state, raising=False)
+    with kb.connect() as conn:
+        closed_card = kb.create_task(
+            conn, title="ordinary closed PR card", assignee="alpha", priority=20
+        )
+        kb.add_comment(conn, closed_card, "alpha", f"AUTHOR COMPLETE: {closed_url}")
+        open_card = kb.create_task(
+            conn, title="ordinary open PR card", assignee="beta", priority=10
+        )
+        kb.add_comment(conn, open_card, "beta", f"AUTHOR COMPLETE: {open_url}")
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    outcomes = _outcomes(result)
+    assert outcomes[closed_card][:2] == ("spawned", None)
+    assert outcomes[open_card][:2] == ("held", "active_pr")
+    assert calls == [closed_url, open_url]
+
+
+def test_closed_pr_releases_claim_time_guard(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """The atomic claim path uses the same live-state predicate as dispatch."""
+    closed_url = "https://github.com/o269/hermes-agent/pull/67"
+    monkeypatch.setattr(kb, "_github_pull_state", lambda _url: "CLOSED")
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="closed PR card", assignee="alpha")
+        kb.add_comment(conn, task_id, "alpha", f"AUTHOR COMPLETE: {closed_url}")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, _workspace: spawned.append(task.id)
+        )
+
+    assert _outcomes(result)[task_id][:2] == ("spawned", None)
+    assert spawned == [task_id]
+
+
+def test_closed_pr_does_not_consume_resume_marker(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    closed_url = "https://github.com/o269/hermes-agent/pull/67"
+    monkeypatch.setattr(kb, "_github_pull_state", lambda _url: "CLOSED")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="closed PR with marker", assignee="alpha")
+        kb.add_comment(conn, task_id, "alpha", f"AUTHOR COMPLETE: {closed_url}")
+        getattr(kb, "_append_event")(
+            conn,
+            task_id,
+            "resume_marker",
+            {
+                "actor": "fable",
+                "authorized_by": "operator-test",
+                "authorized_profile": "alpha",
+                "assignment_generation": getattr(
+                    kb, "_resume_assignment_generation"
+                )(conn, task_id),
+                "reason": "closed PR no longer needs custody bypass",
+            },
+        )
+
+        assert kb.claim_task(conn, task_id) is not None
+        consumed = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "resume_marker_consumed"
+        ]
+
+    assert consumed == []
+
+
+@pytest.mark.parametrize(
+    ("title", "matching_numbers"),
+    [
+        ("REWORK omnia#896+#897 - refresh stack", {896, 897}),
+        ("FIX omnia#896, #897 - refresh stack", {896, 897}),
+        ("Audit omnia#896+#897", set()),
+        ("FIX omnia#896 - not the sibling", {896}),
+    ],
+)
+def test_rework_title_matches_only_explicit_prs(title, matching_numbers):
+    for number in (896, 897, 898):
+        pr_url = f"https://github.com/o269/omnia/pull/{number}"
+        assert getattr(kb, "_title_marks_matching_pr_rework")(title, pr_url) is (
+            number in matching_numbers
+        )
+
+
+@pytest.mark.parametrize("marker", ["REWORK", "FIX"])
+def test_open_pr_rework_card_spawns_but_non_rework_sibling_stays_held(
+    kanban_home, all_assignees_spawnable, monkeypatch, marker
+):
+    """REWORK/FIX exempts only the matching PR, including the claim-time guard."""
+    pr_url = "https://github.com/o269/hermes-agent/pull/70"
+    other_pr_url = "https://github.com/o269/hermes-agent/pull/71"
+    calls: list[str] = []
+
+    def github_state(url):
+        calls.append(url)
+        return "OPEN"
+
+    monkeypatch.setattr(kb, "_github_pull_state", github_state, raising=False)
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        rework = kb.create_task(
+            conn,
+            title=f"{marker} hermes-agent#70 - repair the live fence",
+            assignee="alpha",
+            priority=40,
+        )
+        kb.add_comment(conn, rework, "alpha", f"Continue existing {pr_url}")
+        sibling = kb.create_task(
+            conn,
+            title="Audit hermes-agent#70 before landing",
+            assignee="beta",
+            priority=20,
+        )
+        kb.add_comment(conn, sibling, "beta", f"AUTHOR COMPLETE: {pr_url}")
+        wrong_pr = kb.create_task(
+            conn,
+            title="FIX hermes-agent#71 - unrelated repair",
+            assignee="charlie",
+            priority=20,
+        )
+        kb.add_comment(conn, wrong_pr, "charlie", f"Related: {pr_url}")
+        mixed_prs = kb.create_task(
+            conn,
+            title=f"{marker} hermes-agent#70 - with another open dependency",
+            assignee="delta",
+            priority=10,
+        )
+        kb.add_comment(
+            conn,
+            mixed_prs,
+            "delta",
+            f"Repair {pr_url}; dependency remains {other_pr_url}",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    outcomes = _outcomes(result)
+    assert outcomes[rework][:2] == ("spawned", None)
+    assert outcomes[sibling][:2] == ("held", "active_pr")
+    assert outcomes[wrong_pr][:2] == ("held", "active_pr")
+    assert outcomes[mixed_prs][:2] == ("held", "active_pr")
+    assert outcomes[mixed_prs][2]["pr_url"] == other_pr_url
+    assert spawned == [rework]
+    assert calls == [pr_url, pr_url, other_pr_url]
+
+
+def test_active_pr_state_lookup_failure_keeps_fail_closed_hold(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    pr_url = "https://github.com/o269/hermes-agent/pull/70"
+    monkeypatch.setattr(kb, "_github_pull_state", lambda _url: None, raising=False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary work", assignee="alpha")
+        kb.add_comment(conn, task_id, "alpha", f"AUTHOR COMPLETE: {pr_url}")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert _outcomes(result)[task_id][:2] == ("held", "active_pr")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, "OPEN\n", "OPEN"),
+        (0, "CLOSED\n", "CLOSED"),
+        (0, "MERGED\n", "MERGED"),
+        (1, "", None),
+        (0, "UNKNOWN\n", None),
+    ],
+)
+def test_github_pull_state_maps_live_cli_result_fail_closed(
+    monkeypatch, returncode, stdout, expected
+):
+    result = kb.subprocess.CompletedProcess(
+        args=["gh"], returncode=returncode, stdout=stdout
+    )
+    monkeypatch.setattr(kb.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert (
+        _REAL_GITHUB_PULL_STATE("https://github.com/o269/hermes-agent/pull/70")
+        == expected
+    )

@@ -88,7 +88,7 @@ import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4591,10 +4591,12 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     # Active-PR custody blocks ordinary claims. A valid owner-bound Fable marker
     # opens exactly one claim and is consumed atomically with the new run.
+    pr_states: dict[str, Optional[str]] = {}
     active_prs = _active_pr_custody(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+        pr_states=pr_states,
     )
     resume_marker = _next_resume_marker(conn, task_id) if active_prs else None
     if active_prs and resume_marker is None:
@@ -4605,6 +4607,8 @@ def claim_task(
             conn,
             task_id,
             cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+            pr_states=pr_states,
+            allow_state_lookup=False,
         )
         if fresh_active_prs:
             fresh_marker = _next_resume_marker(conn, task_id)
@@ -7544,6 +7548,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_REWORK_TITLE_RE = re.compile(
+    r"(?:^|[\s\[\](:-])(?:REWORK|FIX)(?=$|[\s\]\):_-])",
+    re.IGNORECASE,
+)
+
+
 def _canonical_pr_urls_from_text(body: str) -> tuple[str, ...]:
     """Return ordered, de-duplicated canonical GitHub PR URLs in ``body``."""
     urls: list[str] = []
@@ -9219,10 +9229,105 @@ def _active_pr_custody(
     task_id: str,
     *,
     cutoff: int,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
 ) -> tuple[str, ...]:
-    """Ordered canonical PR URLs this card actually owns inside the window."""
+    """Ordered PR URLs that still guard this card after live-state checks."""
     owned, _ = _active_pr_candidates(conn, task_id, cutoff=cutoff)
-    return tuple(str(record["canonical_url"]) for record in owned)
+    guarding = _guarding_active_pr_candidates(
+        conn,
+        task_id,
+        owned,
+        pr_states=pr_states,
+        allow_state_lookup=allow_state_lookup,
+    )
+    return tuple(str(record["canonical_url"]) for record in guarding)
+
+
+def _github_pull_state(pr_url: str) -> Optional[str]:
+    """Return GitHub's live PR state, or ``None`` when it cannot be verified.
+
+    ``None`` intentionally fails closed: a transient GitHub/``gh`` failure must
+    not turn the duplicate-author guard into a release-everything switch.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    state = proc.stdout.strip().upper()
+    return state if state in {"OPEN", "CLOSED", "MERGED"} else None
+
+
+def _title_marks_matching_pr_rework(title: str, pr_url: str) -> bool:
+    """Return true only for an explicit REWORK/FIX title naming this PR."""
+    if _RESPAWN_GUARD_REWORK_TITLE_RE.search(title or "") is None:
+        return False
+    match = _RESPAWN_GUARD_PR_URL_RE.fullmatch(pr_url)
+    if match is None:
+        return False
+    if pr_url in _canonical_pr_urls_from_text(title or ""):
+        return True
+    repo = re.escape(match.group("repo"))
+    number = re.escape(str(int(match.group("number"))))
+    if any(
+        pattern.search(title or "") is not None
+        for pattern in (
+            re.compile(rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*{number}\b", re.IGNORECASE),
+            re.compile(rf"\bPR\s*#?\s*{number}\b", re.IGNORECASE),
+        )
+    ):
+        return True
+    compound = re.compile(
+        rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*\d+"
+        rf"(?:\s*(?:\+|,|/|&|\band\b)\s*#\s*\d+)+",
+        re.IGNORECASE,
+    )
+    return any(
+        str(int(number))
+        in {str(int(value)) for value in re.findall(r"#\s*(\d+)", group.group(0))}
+        for group in compound.finditer(title or "")
+    )
+
+
+def _guarding_active_pr_candidates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owned: Sequence[Mapping[str, Any]],
+    *,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return owned PRs not released by either narrow exemption predicate."""
+    row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    title = str(row["title"] or "") if row is not None else ""
+    guarding: list[Mapping[str, Any]] = []
+    for record in owned:
+        pr_url = str(record["canonical_url"])
+        if _title_marks_matching_pr_rework(title, pr_url):
+            continue
+        if pr_states is not None and pr_url in pr_states:
+            state = pr_states[pr_url]
+        elif allow_state_lookup:
+            state = _github_pull_state(pr_url)
+            if pr_states is not None:
+                pr_states[pr_url] = state
+        else:
+            state = None
+        if state is not None and state != "OPEN":
+            continue
+        guarding.append(record)
+    return tuple(guarding)
 
 
 _RESUME_MARKER_KIND = "resume_marker"
@@ -9707,9 +9812,10 @@ def check_respawn_guard(
     # blocks respawn; a bare citation of another card's PR no longer freezes.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
-    if owned:
+    guarding = _guarding_active_pr_candidates(conn, task_id, owned)
+    if guarding:
         if detail_out is not None:
-            detail_out.update(_active_pr_guard_detail(owned, disowned))
+            detail_out.update(_active_pr_guard_detail(guarding, disowned))
         return "active_pr"
     if disowned:
         detail = _active_pr_guard_detail((), disowned)
