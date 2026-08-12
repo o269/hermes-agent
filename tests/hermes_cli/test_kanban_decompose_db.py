@@ -4,11 +4,15 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+VALID_ASSIGNEES = {"orch", "orchestrator", "researcher", "engineer", "worker"}
 
 
 @pytest.fixture
@@ -30,6 +34,11 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         tenant=tenant,
         triage=True,
     )
+
+
+def _decompose(conn, task_id: str, **kwargs):
+    kwargs.setdefault("idempotency_key", f"test-decompose:{task_id}")
+    return kb.decompose_triage_task(conn, task_id, **kwargs)
 
 
 def test_decomposition_eligibility_ignores_cross_posted_pr_citations(kanban_home):
@@ -113,7 +122,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
     ]
     with kb.connect() as conn:
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orchestrator",
@@ -142,7 +151,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -159,5 +168,99 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_live_parent_chain_and_fanout_cap_are_atomic_recurrence_fences(
+    kanban_home,
+    caplog,
+):
+    """Must-fire fixture for MP-4.3 ITEM 2.
+
+    Unfixed main decomposes a triage card under a live ancestor and accepts a
+    16-child burst. The fence must reject both without minting even one row.
+    """
+    assert "idempotency_key" in inspect.signature(
+        kb.decompose_triage_task
+    ).parameters, "stable decomposition attempt keys must be mandatory"
+    assert hasattr(
+        kb, "MAX_DECOMPOSITION_CHILDREN"
+    ), "decomposition must publish a hard child cap"
+    assert kb.MAX_DECOMPOSITION_CHILDREN == 15
+
+    with kb.connect() as conn:
+        ancestor = kb.create_task(conn, title="live ancestor")
+        parent = kb.create_task(conn, title="live parent", parents=[ancestor])
+        guarded_root = kb.create_task(
+            conn,
+            title="must stay whole",
+            parents=[parent],
+            triage=True,
+        )
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        blocked = _decompose(
+            conn,
+            guarded_root,
+            root_assignee="orchestrator",
+            children=[{"title": "must not exist", "assignee": "worker"}],
+        )
+        assert blocked is None
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert guarded_root not in kb.list_decomposition_eligible_triage_ids(conn)
+        assert "live parent chain detected" in caplog.text
+
+        burst_root = _create_triage(conn, title="oversized graph")
+        children = [
+            {"title": f"child {index}", "assignee": "worker"}
+            for index in range(kb.MAX_DECOMPOSITION_CHILDREN + 1)
+        ]
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="exceeds hard cap 15"):
+            _decompose(
+                conn,
+                burst_root,
+                root_assignee="orchestrator",
+                children=children,
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert "reason=fanout_cap" in caplog.text
+        assert "requested_children=16" in caplog.text
 
 
+def test_decomposition_retry_key_returns_original_children_without_remint(
+    kanban_home,
+):
+    key = "decomposition:stable-retry"
+    with kb.connect() as conn:
+        root = _create_triage(conn, title="retry-safe graph")
+        children = [
+            {"title": "first", "assignee": "worker"},
+            {"title": "second", "assignee": "worker"},
+        ]
+        first = _decompose(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=children,
+            idempotency_key=key,
+        )
+        assert first is not None
+        count_after_first = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        second = _decompose(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "replacement one", "assignee": "worker"},
+                {"title": "replacement two", "assignee": "worker"},
+            ],
+            idempotency_key=key,
+        )
+        persisted = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id IN (?, ?) ORDER BY id",
+            tuple(first),
+        ).fetchall()
+
+    assert second == first
+    assert count_after_first == 3
+    assert {row["idempotency_key"] for row in persisted} == {
+        f"{key}:{root}:0",
+        f"{key}:{root}:1",
+    }
