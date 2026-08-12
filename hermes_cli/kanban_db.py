@@ -7820,6 +7820,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    brief_path_blocked: list[str] = field(default_factory=list)
+    """Remote-host cards blocked this tick by brief-path-guard (rc 4)."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -7991,6 +7993,8 @@ _DISPOSITION_EVENT_DETAIL_KEYS = (
     "source_comment_id",
     "source_status",
     "window_seconds",
+    "guard_rc",
+    "guard_state",
 )
 
 
@@ -10045,6 +10049,221 @@ def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
     return bool(profile_exists(assignee))
 
 
+# ---------------------------------------------------------------------------
+# Cross-host brief-path guard (criterion 13 / t_3d64f74b)
+#
+# A brief that cites a godmode-bus path present on blitz and absent on the
+# remote host is how VPS2 workers silently work without the input they were
+# told to read. The checker lives at ~/godmode-bus/bin/brief-path-guard.sh
+# (rc 0 pass / 4 violation / 5 unverifiable). Dispatch is the only place that
+# knows card→host binding at spawn time, so it is the enforcement point.
+#
+# Policy (availability over a wedged board):
+#   rc 4 → do not spawn; card → blocked; violations as a comment
+#   rc 5 → spawn; UNVERIFIABLE lines as a warning comment
+#   rc 0 → spawn
+#   missing script / timeout / rc 1/2 / signal → spawn + warning comment
+# ---------------------------------------------------------------------------
+
+BRIEF_PATH_GUARD_ENV = "HERMES_BRIEF_PATH_GUARD"
+BRIEF_PATH_GUARD_TIMEOUT_SEC = 20
+BRIEF_PATH_GUARD_AUTHOR = "brief-path-guard"
+_BRIEF_PATH_GUARD_EVENT = "brief_path_guard"
+
+
+def _assignee_is_remote_host(assignee: Optional[str]) -> bool:
+    """True when the assignee names a non-blitz host lane (``vps2*``).
+
+    Matches ``brief-path-guard.sh --audit`` (``assignee LIKE 'vps2%'``).
+    """
+    return (assignee or "").strip().lower().startswith("vps2")
+
+
+def _brief_path_guard_script() -> Optional[Path]:
+    override = (os.environ.get(BRIEF_PATH_GUARD_ENV) or "").strip()
+    candidate = Path(override) if override else (
+        Path.home() / "godmode-bus" / "bin" / "brief-path-guard.sh"
+    )
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _brief_text_for_guard(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    parts = [row["title"] or "", row["body"] or ""]
+    return "\n".join(part for part in parts if part)
+
+
+def _brief_path_guard_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _latest_brief_path_guard_event(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == _BRIEF_PATH_GUARD_EVENT and isinstance(event.payload, dict):
+            return dict(event.payload)
+    return None
+
+
+def run_brief_path_guard(*, task_id: str, body: str) -> tuple[int, str]:
+    """Exec ``brief-path-guard.sh --stdin --host vps2``.
+
+    Returns ``(rc, combined_output)``. Uses ``--stdin`` with the dispatcher's
+    own brief text so the check is board-local (temp DBs, no sudo against
+    ``/var/lib/boardd``) and matches the bytes about to be dispatched.
+    """
+    script = _brief_path_guard_script()
+    if script is None:
+        return 2, "brief-path-guard missing; fail-open (availability over strictness)"
+    argv = [str(script), "--stdin", "--host", "vps2"]
+    try:
+        proc = subprocess.run(
+            argv,
+            input=body or "",
+            text=True,
+            capture_output=True,
+            timeout=BRIEF_PATH_GUARD_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = f"{exc.stdout or ''}{exc.stderr or ''}"
+        return 2, (
+            f"brief-path-guard timeout after {BRIEF_PATH_GUARD_TIMEOUT_SEC}s"
+            + (f"\n{out}" if out.strip() else "")
+        )
+    except Exception as exc:
+        return 2, f"brief-path-guard exec failed: {type(exc).__name__}: {exc}"
+    out = f"{proc.stdout or ''}{proc.stderr or ''}"
+    rc = int(proc.returncode)
+    if rc < 0:
+        return 2, f"brief-path-guard killed by signal {-rc}\n{out}".rstrip()
+    return rc, out.strip()
+
+
+def _record_brief_path_guard_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    rc: int,
+    body_sha256: str,
+    output: str,
+) -> None:
+    state = {0: "pass", 4: "violation", 5: "unverifiable"}.get(rc, "error")
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            _BRIEF_PATH_GUARD_EVENT,
+            {
+                "rc": rc,
+                "state": state,
+                "body_sha256": body_sha256,
+                "output": (output or "")[:2000],
+            },
+        )
+
+
+def _comment_brief_path_guard(conn: sqlite3.Connection, task_id: str, body: str) -> None:
+    text = (body or "").strip()
+    if not text:
+        return
+    try:
+        add_comment(conn, task_id, BRIEF_PATH_GUARD_AUTHOR, text)
+    except Exception:
+        _log.debug("brief-path-guard: failed to comment on %s", task_id, exc_info=True)
+
+
+def _enforce_brief_path_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    *,
+    dry_run: bool,
+) -> Optional[tuple[str, str, dict[str, Any]]]:
+    """Run the remote-host brief guard. Return a stop disposition or None."""
+    if not _assignee_is_remote_host(assignee):
+        return None
+    brief = _brief_text_for_guard(conn, task_id)
+    body_hash = _brief_path_guard_hash(brief)
+    prior = _latest_brief_path_guard_event(conn, task_id)
+    if prior and prior.get("body_sha256") == body_hash:
+        if int(prior.get("rc") or 0) != 4:
+            return None
+        if not dry_run:
+            task = get_task(conn, task_id)
+            if task is not None and task.status == "ready":
+                block_task(
+                    conn,
+                    task_id,
+                    reason="brief-path-guard: remote worker cannot read cited bus path",
+                    kind="needs_input",
+                )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    rc, output = run_brief_path_guard(task_id=task_id, body=brief)
+    if not dry_run:
+        _record_brief_path_guard_event(
+            conn, task_id, rc=rc, body_sha256=body_hash, output=output
+        )
+
+    if rc == 4:
+        if not dry_run:
+            _comment_brief_path_guard(
+                conn,
+                task_id,
+                "VIOLATION: brief cites a blitz-only godmode-bus path the "
+                "remote worker cannot read. Card blocked; do not spawn.\n\n"
+                f"{output}\n\n"
+                "Fix: copy the file into ~/godmode-bus/vps2-outbox/ (bridge "
+                "push) or attach via boardd, and cite a path that exists on "
+                "the target host.",
+            )
+            block_task(
+                conn,
+                task_id,
+                reason="brief-path-guard: remote worker cannot read cited bus path",
+                kind="needs_input",
+            )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    if rc == 5 and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "UNVERIFIABLE brief-path-guard (non-fatal; leaving for remote "
+            f"claim / spawn):\n\n{output}",
+        )
+    elif rc not in (0, 4, 5) and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "brief-path-guard error (fail-open; leaving for remote claim / "
+            f"spawn): rc={rc}\n\n{output}",
+        )
+    return None
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -10397,6 +10616,26 @@ def _dispatch_once_locked(
                     dry_run=dry_run,
                 )
                 continue
+        # Cross-host brief-path guard: a vps2* card whose brief cites a
+        # blitz-only godmode-bus path must not stay claimable. Run before
+        # the local-profile spawn check so remote lanes (claimed by
+        # vps2-dispatch, skipped here as nonspawnable) are still gated.
+        guard_stop = _enforce_brief_path_guard(
+            conn, row["id"], row_assignee, dry_run=dry_run
+        )
+        if guard_stop is not None:
+            outcome, reason, detail = guard_stop
+            result.brief_path_blocked.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                outcome,
+                reason=reason,
+                detail=detail,
+                dry_run=dry_run,
+            )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
