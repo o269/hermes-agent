@@ -309,6 +309,22 @@ This check is semantic and must run regardless of card age. Age can prioritize
 ordinary executor work; it cannot erase a named gate or recurring contract.
 Leave `authority_profiles` empty (the default) to preserve legacy behavior.
 
+When `authority_profiles` is configured, every supported assignment-writing
+surface converges on the same `hermes_cli.kanban_db` policy boundary:
+
+| Surface | Canonical assignment mutation |
+|---|---|
+| `hermes kanban create` / `assign` | `kanban_db.create_task` / `assign_task` |
+| `kanban_create` worker tool | `kanban_db.create_task` |
+| Dashboard create / single / bulk reassignment | `kanban_db.create_task` / `assign_task` |
+| `boardd` create / assign RPC | `kanban_db.create_task` / `assign_task` |
+| Internal reclaim/rebind | `kanban_db.reassign_task` |
+
+The one deliberate bypass is direct SQL used by privileged migration/repair
+code. Canonical connections still install the same assignment guard as SQLite
+`INSERT`/`UPDATE` triggers, so an unregistered writer fails closed. Do not treat
+raw SQL as a supported application assignment API.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

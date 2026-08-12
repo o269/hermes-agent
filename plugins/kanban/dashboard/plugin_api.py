@@ -835,7 +835,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
                 )
-            except RuntimeError as e:
+            except (RuntimeError, ValueError) as e:
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
@@ -1145,7 +1145,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
-                    except RuntimeError as e:
+                    except (RuntimeError, ValueError) as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
                     with kanban_db.write_txn(conn):

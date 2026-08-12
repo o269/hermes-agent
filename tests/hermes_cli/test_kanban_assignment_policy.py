@@ -10,10 +10,32 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban as kanban_cli
 from hermes_cli.kanban_assignment_policy import (
     assignment_guard_reason,
     is_nonspawnable_contract,
 )
+
+
+CANONICAL_ASSIGNMENT_MUTATION_PATHS = {
+    "kernel-create": "kanban_db.create_task",
+    "kernel-assign": "kanban_db.assign_task",
+    "kernel-reassign": "kanban_db.reassign_task",
+    "cli-create": "hermes_cli.kanban._cmd_create -> kanban_db.create_task",
+    "cli-assign": "hermes_cli.kanban._cmd_assign -> kanban_db.assign_task",
+    "tool-create": "tools.kanban_tools._handle_create -> kanban_db.create_task",
+    "dashboard-create": "plugin_api.create_task -> kanban_db.create_task",
+    "dashboard-reassign": "plugin_api.update_task/bulk_update -> kanban_db.assign_task",
+    "boardd-create": "scripts.fleet.boardd._h_create_task -> kanban_db.create_task",
+    "boardd-assign": "scripts.fleet.boardd._h_assign_task -> kanban_db.assign_task",
+}
+
+REMAINING_ASSIGNMENT_BYPASSES = {
+    # This is intentionally not a public mutation path.  It exists only as a
+    # privileged migration/repair escape hatch and remains fail-closed behind
+    # the connection-local SQLite assignment trigger.
+    "direct-sql": "registered SQLite connection + assignment-policy trigger",
+}
 
 
 # Exact 2026-07-30 live regression frontier. These rows were age-promoted by
@@ -99,6 +121,94 @@ def _must_get(conn: sqlite3.Connection, task_id: str):
     task = kb.get_task(conn, task_id)
     assert task is not None
     return task
+
+
+def _assert_fable_executor_rejected(conn: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="kanban assignment policy"):
+        kb.create_task(
+            conn,
+            title="[AUTHOR] ordinary source-code patch",
+            body="Implement the change and open a PR.",
+            assignee="fable",
+        )
+
+
+def test_public_assignment_mutations_are_inventory_mapped_to_kernel_boundary():
+    """Keep the shared-boundary claim auditable as new mutation paths appear."""
+
+    assert CANONICAL_ASSIGNMENT_MUTATION_PATHS == {
+        "kernel-create": "kanban_db.create_task",
+        "kernel-assign": "kanban_db.assign_task",
+        "kernel-reassign": "kanban_db.reassign_task",
+        "cli-create": "hermes_cli.kanban._cmd_create -> kanban_db.create_task",
+        "cli-assign": "hermes_cli.kanban._cmd_assign -> kanban_db.assign_task",
+        "tool-create": "tools.kanban_tools._handle_create -> kanban_db.create_task",
+        "dashboard-create": "plugin_api.create_task -> kanban_db.create_task",
+        "dashboard-reassign": "plugin_api.update_task/bulk_update -> kanban_db.assign_task",
+        "boardd-create": "scripts.fleet.boardd._h_create_task -> kanban_db.create_task",
+        "boardd-assign": "scripts.fleet.boardd._h_assign_task -> kanban_db.assign_task",
+    }
+    assert REMAINING_ASSIGNMENT_BYPASSES == {
+        "direct-sql": "registered SQLite connection + assignment-policy trigger",
+    }
+
+
+def test_authority_lane_fence_survives_fresh_connection_and_restart(
+    guarded_board,
+):
+    """The policy must be live on every canonical connection, not process memory."""
+
+    conn, _config_path, db_path = guarded_board
+    _assert_fable_executor_rejected(conn)
+
+    restarted = kb.connect(db_path)
+    try:
+        _assert_fable_executor_rejected(restarted)
+    finally:
+        restarted.close()
+
+
+def test_authority_lane_fence_is_mutation_sensitive(guarded_board):
+    """Executor prose, not only title markers, must activate the fence."""
+
+    conn, _config_path, _db_path = guarded_board
+    task_id = kb.create_task(
+        conn,
+        title="Operator custody review",
+        body="Control-plane ruling only.",
+        assignee="fable",
+        initial_status="blocked",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="assignment policy"):
+        conn.execute(
+            "UPDATE tasks SET body = 'Implement the source-code change and open a PR' "
+            "WHERE id = ?",
+            (task_id,),
+        )
+
+    task = _must_get(conn, task_id)
+    assert task.assignee == "fable"
+    assert task.body == "Control-plane ruling only."
+
+
+def test_cli_create_reaches_shared_authority_fence(
+    guarded_board,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    conn, _config_path, db_path = guarded_board
+    conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    rc = kanban_cli.run_slash(
+        'create "[AUTHOR] CLI source-code patch" '
+        '--body "Implement the change and open a PR" --assignee fable'
+    )
+
+    assert "kanban assignment policy" in str(rc)
+    assert "authority_executor_not_parked" in str(rc)
+    capsys.readouterr()
 
 
 def test_exact_live_regression_cards_are_boardqb_gates_and_kernel_parked(
