@@ -4,8 +4,10 @@ This module is intentionally separate from ``SessionDB.prune_sessions``.  The
 normal prune path is for interactive/live cleanup and reparents surviving child
 sessions to ``NULL``.  Cold archival is the opposite posture: it only mutates an
 offline candidate copy after a reviewed Gate-B manifest, a restricted redacted
-QMD export, a lossless rollback bundle, and optional fail-closed offsite
-readback verification.
+QMD export, a lossless rollback bundle, and fail-closed offsite
+readback verification. Destructive retention requires a distinct external
+approver identity plus a positive verified offsite permanence receipt —
+self-approve and delete-without-offsite paths fail closed.
 """
 
 from __future__ import annotations
@@ -49,6 +51,10 @@ _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 # Durable sessions columns required before any selection or deletion. Missing
 # columns fail closed — never treat absence as an empty invariant set.
 _REQUIRED_SESSIONS_COLUMNS = frozenset({"pinned", "last_activity_at"})
+# Offsite permanence: only this integrity token counts as a verified receipt.
+# Callers may not invent softer statuses; tests assert the literal string.
+OFFSITE_INTEGRITY_OK = "rclone-checksum-and-readback-ok"
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_PERMANENT_HOLD_SOURCES = frozenset({
     "discord",
     "imessage",
@@ -657,8 +663,9 @@ def build_gate_b_manifest(
                 )
             ),
         }
-        manifest["manifest_sha256"] = _manifest_digest(manifest)
+        # restricted_ids_sha256 is public and must be present before digest.
         manifest["restricted_ids_sha256"] = manifest["selected_ids_sha256"]
+        manifest["manifest_sha256"] = _manifest_digest(manifest)
         return {
             **manifest,
             "_restricted_selected_ids": sorted(selected_ids),
@@ -1065,9 +1072,189 @@ def publish_paths_with_rclone(
                 "bytes": local.stat().st_size,
                 "sha256": local_sha,
                 "readback_sha256": readback_sha,
-                "integrity": "rclone-checksum-and-readback-ok",
+                "integrity": OFFSITE_INTEGRITY_OK,
             })
     return published
+
+
+def _normalize_actor_identity(value: str | None, *, field: str) -> str:
+    if value is None:
+        raise ColdArchiveError(f"{field} is required for destructive retention")
+    normalized = " ".join(str(value).strip().split())
+    if not normalized:
+        raise ColdArchiveError(f"{field} must be a non-empty identity")
+    if len(normalized) > 256:
+        raise ColdArchiveError(f"{field} exceeds maximum length")
+    if re.search(r"[\r\n\x00]", normalized):
+        raise ColdArchiveError(f"{field} contains illegal control characters")
+    return normalized
+
+
+def require_distinct_gate_b_approval(
+    *,
+    approved_gate_b_manifest_sha256: str | None,
+    requestor_identity: str | None,
+    approver_identity: str | None,
+    computed_manifest_sha256: str,
+    on_disk_manifest_sha256: str | None = None,
+) -> dict[str, str]:
+    """Refuse self-approve and unattested Gate-B hashes for destructive retention.
+
+    The approved hash must be supplied by an external actor (CLI/operator), not
+    silently taken from the in-memory build of this same invocation. The
+    approver identity must be distinct from the requestor identity.
+    """
+
+    if not approved_gate_b_manifest_sha256:
+        raise ColdArchiveError(
+            "refusing retention without externally supplied "
+            "--approved-gate-b-sha256 (Gate-B must not self-approve)"
+        )
+    approved = str(approved_gate_b_manifest_sha256).strip().lower()
+    if not _SHA256_HEX_RE.match(approved):
+        raise ColdArchiveError(
+            "approved Gate-B manifest sha256 must be 64 lowercase hex characters"
+        )
+    requestor = _normalize_actor_identity(
+        requestor_identity, field="requestor_identity"
+    )
+    approver = _normalize_actor_identity(approver_identity, field="approver_identity")
+    if approver.casefold() == requestor.casefold():
+        raise ColdArchiveError(
+            "refusing Gate-B self-approve: approver_identity must be distinct "
+            f"from requestor_identity (both are {requestor!r})"
+        )
+    computed = str(computed_manifest_sha256).strip().lower()
+    if computed != approved:
+        raise ColdArchiveError(
+            "Gate-B manifest hash does not match externally approved "
+            "gate_b_manifest_sha256; refusing retention"
+        )
+    if on_disk_manifest_sha256 is not None:
+        disk = str(on_disk_manifest_sha256).strip().lower()
+        if disk != approved:
+            raise ColdArchiveError(
+                "on-disk GATE-B-MANIFEST.json sha256 does not match externally "
+                "approved hash; refusing retention"
+            )
+    return {
+        "approved_gate_b_manifest_sha256": approved,
+        "requestor_identity": requestor,
+        "approver_identity": approver,
+    }
+
+
+def verify_offsite_permanence_receipt(
+    receipt: Sequence[dict[str, Any]] | None,
+    *,
+    required_local_artifacts: Sequence[Path] | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless receipt proves encrypted offsite readback permanence.
+
+    Deletion must not proceed on assumed prior-step success. A valid receipt
+    requires at least:
+
+    - public ``GATE-B-MANIFEST.json`` with integrity
+      ``rclone-checksum-and-readback-ok`` and matching sha256/readback_sha256
+    - one age-encrypted object (name ends with ``.age``) with the same integrity
+
+    When ``required_local_artifacts`` is supplied, each local path must appear
+    in the receipt with a matching sha256 (existence + integrity confirmed).
+    """
+
+    if not receipt:
+        raise ColdArchiveError(
+            "refusing deletion without verified offsite permanence receipt "
+            "(encrypted publish + readback required before --apply-retention)"
+        )
+    if not isinstance(receipt, (list, tuple)):
+        raise ColdArchiveError("offsite permanence receipt must be a list")
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(receipt):
+        if not isinstance(entry, dict):
+            raise ColdArchiveError(f"offsite receipt entry {index} is not an object")
+        local_path = Path(str(entry.get("local_path") or ""))
+        name = local_path.name
+        if not name:
+            raise ColdArchiveError(f"offsite receipt entry {index} missing local_path")
+        remote = str(entry.get("remote") or "").strip()
+        if not remote:
+            raise ColdArchiveError(
+                f"offsite receipt entry for {name} missing remote location"
+            )
+        integrity = str(entry.get("integrity") or "")
+        if integrity != OFFSITE_INTEGRITY_OK:
+            raise ColdArchiveError(
+                f"offsite receipt for {name} lacks verified integrity "
+                f"{OFFSITE_INTEGRITY_OK!r} (got {integrity!r})"
+            )
+        sha = str(entry.get("sha256") or "").strip().lower()
+        readback = str(entry.get("readback_sha256") or "").strip().lower()
+        if not _SHA256_HEX_RE.match(sha) or not _SHA256_HEX_RE.match(readback):
+            raise ColdArchiveError(
+                f"offsite receipt for {name} missing valid sha256/readback_sha256"
+            )
+        if sha != readback:
+            raise ColdArchiveError(
+                f"offsite receipt for {name} sha256 != readback_sha256"
+            )
+        try:
+            size = int(entry.get("bytes"))
+        except (TypeError, ValueError) as exc:
+            raise ColdArchiveError(
+                f"offsite receipt for {name} missing valid byte size"
+            ) from exc
+        if size < 0:
+            raise ColdArchiveError(f"offsite receipt for {name} has negative bytes")
+        by_name[name] = entry
+
+    if "GATE-B-MANIFEST.json" not in by_name:
+        raise ColdArchiveError(
+            "offsite permanence receipt missing verified GATE-B-MANIFEST.json"
+        )
+    age_names = [name for name in by_name if name.endswith(".age")]
+    if not age_names:
+        raise ColdArchiveError(
+            "offsite permanence receipt missing verified age-encrypted rollback "
+            "bundle (.age)"
+        )
+
+    if required_local_artifacts is not None:
+        if not required_local_artifacts:
+            raise ColdArchiveError(
+                "required_local_artifacts must not be empty when supplied"
+            )
+        for artifact in required_local_artifacts:
+            path = Path(artifact)
+            if not path.is_file():
+                raise ColdArchiveError(
+                    f"required offsite artifact missing on disk: {path}"
+                )
+            name = path.name
+            if name not in by_name:
+                raise ColdArchiveError(
+                    f"offsite receipt does not cover required artifact: {name}"
+                )
+            local_sha = sha256_path(path)
+            entry_sha = str(by_name[name]["sha256"]).strip().lower()
+            if local_sha != entry_sha:
+                raise ColdArchiveError(
+                    f"offsite receipt sha256 does not match local artifact {name}"
+                )
+            local_size = path.stat().st_size
+            if int(by_name[name]["bytes"]) != local_size:
+                raise ColdArchiveError(
+                    f"offsite receipt size does not match local artifact {name}"
+                )
+
+    return {
+        "verified": True,
+        "integrity": OFFSITE_INTEGRITY_OK,
+        "objects": sorted(by_name),
+        "gate_b_sha256": str(by_name["GATE-B-MANIFEST.json"]["sha256"]).lower(),
+        "encrypted_bundle_names": sorted(age_names),
+    }
 
 
 def _capture_invariants(
@@ -1232,24 +1419,79 @@ def apply_retention_to_candidate(
     candidate_db: Path,
     manifest: dict[str, Any],
     *,
-    expected_manifest_sha256: str | None = None,
+    expected_manifest_sha256: str,
+    offsite_permanence_receipt: Sequence[dict[str, Any]],
+    requestor_identity: str | None = None,
+    approver_identity: str | None = None,
+    gate_b_approval: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Delete only the reviewed selected IDs from an offline candidate copy.
 
     Deletion and invariant checks share one transaction: any post-delete
     invariant failure rolls the deletion back. ``system_prompts`` rows are
     never deleted (out of declared cold-archive scope).
+
+    Custody gates (fail closed):
+
+    - ``expected_manifest_sha256`` is required and must match the manifest
+      (externally approved Gate-B hash — not optional self-hash).
+    - When ``requestor_identity`` / ``approver_identity`` are supplied (or a
+      precomputed ``gate_b_approval``), self-approve is refused.
+    - ``offsite_permanence_receipt`` must positively verify encrypted offsite
+      readback of Gate-B + age bundle before any DELETE.
     """
 
-    ids = sorted(str(sid) for sid in (manifest.get("_restricted_selected_ids") or []))
-    if expected_manifest_sha256 and expected_manifest_sha256 != manifest.get(
-        "manifest_sha256"
-    ):
+    if not expected_manifest_sha256:
+        raise ColdArchiveError(
+            "expected_manifest_sha256 is required; refusing unattested retention"
+        )
+    expected = str(expected_manifest_sha256).strip().lower()
+    if not _SHA256_HEX_RE.match(expected):
+        raise ColdArchiveError(
+            "expected_manifest_sha256 must be 64 lowercase hex characters"
+        )
+    if expected != str(manifest.get("manifest_sha256") or "").strip().lower():
         raise ColdArchiveError("Gate-B manifest hash mismatch; refusing retention")
+
+    approval = gate_b_approval
+    if approval is None and (
+        requestor_identity is not None or approver_identity is not None
+    ):
+        approval = require_distinct_gate_b_approval(
+            approved_gate_b_manifest_sha256=expected,
+            requestor_identity=requestor_identity,
+            approver_identity=approver_identity,
+            computed_manifest_sha256=str(manifest.get("manifest_sha256") or ""),
+        )
+    elif approval is None:
+        # Direct library callers must still prove distinct approval when deleting.
+        raise ColdArchiveError(
+            "refusing retention without distinct Gate-B approval identities "
+            "(requestor_identity and approver_identity required)"
+        )
+    else:
+        # Re-validate precomputed approval against this call's expected hash.
+        require_distinct_gate_b_approval(
+            approved_gate_b_manifest_sha256=approval.get(
+                "approved_gate_b_manifest_sha256"
+            ),
+            requestor_identity=approval.get("requestor_identity"),
+            approver_identity=approval.get("approver_identity"),
+            computed_manifest_sha256=str(manifest.get("manifest_sha256") or ""),
+        )
+
+    offsite_verified = verify_offsite_permanence_receipt(offsite_permanence_receipt)
+
+    ids = sorted(str(sid) for sid in (manifest.get("_restricted_selected_ids") or []))
     if _ids_digest(ids) != manifest.get("selected_ids_sha256"):
         raise ColdArchiveError("restricted selected IDs do not match manifest digest")
     if not ids:
-        return {"applied": False, "reason": "no selected sessions"}
+        return {
+            "applied": False,
+            "reason": "no selected sessions",
+            "gate_b_approval": approval,
+            "offsite_permanence": offsite_verified,
+        }
 
     hot_cutoff = float(manifest["policy"]["hot_cutoff_epoch"])
     with _connect_candidate(candidate_db) as conn:
@@ -1374,6 +1616,8 @@ def apply_retention_to_candidate(
                 ).encode("utf-8")
             ),
             "system_prompts_deleted": 0,
+            "gate_b_approval": approval,
+            "offsite_permanence": offsite_verified,
         }
 
 
@@ -1446,6 +1690,10 @@ def run_cold_archive_pass(
     age_recipient_file: Path | None = None,
     age_exe: str = "age",
     rclone_exe: str = "rclone",
+    approved_gate_b_manifest_sha256: str | None = None,
+    requestor_identity: str | None = None,
+    approver_identity: str | None = None,
+    verified_offsite_receipt: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     source = reject_live_state_db(source_db)
     old_umask = os.umask(0o077)
@@ -1469,6 +1717,8 @@ def run_cold_archive_pass(
         }
         remote_report: list[dict[str, Any]] = []
         retention_report: dict[str, Any] = {"applied": False, "reason": "manifest-only"}
+        gate_b_approval: dict[str, str] | None = None
+        offsite_verified: dict[str, Any] | None = None
 
         if not manifest_only and manifest["counts"]["selected_sessions"]:
             rollback_path, rollback_report = _copy_rollback_bundle(
@@ -1486,54 +1736,110 @@ def run_cold_archive_pass(
                 != manifest["counts"]["selected_messages_actual"]
             ):
                 raise ColdArchiveError("QMD message count does not match manifest")
-            if rclone_remote:
-                if rclone_config is None:
+            if apply_retention or rclone_remote:
+                # Destructive retention always requires encrypted offsite publish
+                # + readback in this pass (or a pre-verified receipt covering the
+                # same local artifacts). Publish path is no longer optional when
+                # deleting.
+                if apply_retention and not rclone_remote and not verified_offsite_receipt:
                     raise ColdArchiveError(
-                        "--rclone-config is required when --rclone-remote is set"
+                        "refusing --apply-retention without offsite permanence: "
+                        "set --rclone-remote (and config/age recipient) or supply "
+                        "a verified offsite receipt covering Gate-B + .age bundle"
                     )
-                if age_recipient_file is None:
-                    raise ColdArchiveError(
-                        "--age-recipient-file is required before publishing rollback bundle"
+                if rclone_remote:
+                    if rclone_config is None:
+                        raise ColdArchiveError(
+                            "--rclone-config is required when --rclone-remote is set"
+                        )
+                    if age_recipient_file is None:
+                        raise ColdArchiveError(
+                            "--age-recipient-file is required before publishing "
+                            "rollback bundle"
+                        )
+                    encrypted_path = rollback_path.with_suffix(
+                        rollback_path.suffix + ".age"
                     )
-                encrypted_path = rollback_path.with_suffix(
-                    rollback_path.suffix + ".age"
-                )
-                rollback_encrypted = encrypt_file_with_age(
-                    rollback_path,
-                    encrypted_path,
-                    recipient_file=age_recipient_file,
-                    age_exe=age_exe,
-                )
-                object.__setattr__(stage, "rollback_encrypted_path", encrypted_path)
-                # NEVER publish restricted IDs, parent maps, or QMD plaintext.
-                # Allowed remote objects: public Gate-B manifest + age-encrypted
-                # rollback bundle only.
-                publish_list = [
-                    stage.manifest_path,
-                    encrypted_path,
-                ]
-                assert_publish_paths_are_remote_safe(publish_list)
-                namespace = (
-                    remote_namespace or f"hermes-state/{manifest['manifest_sha256']}"
-                )
-                remote_report = publish_paths_with_rclone(
-                    publish_list,
-                    remote_root=rclone_remote,
-                    rclone_config=rclone_config,
-                    namespace=namespace,
-                    rclone_exe=rclone_exe,
-                )
+                    rollback_encrypted = encrypt_file_with_age(
+                        rollback_path,
+                        encrypted_path,
+                        recipient_file=age_recipient_file,
+                        age_exe=age_exe,
+                    )
+                    object.__setattr__(stage, "rollback_encrypted_path", encrypted_path)
+                    # NEVER publish restricted IDs, parent maps, or QMD plaintext.
+                    # Allowed remote objects: public Gate-B manifest + age-encrypted
+                    # rollback bundle only.
+                    publish_list = [
+                        stage.manifest_path,
+                        encrypted_path,
+                    ]
+                    assert_publish_paths_are_remote_safe(publish_list)
+                    namespace = (
+                        remote_namespace or f"hermes-state/{manifest['manifest_sha256']}"
+                    )
+                    remote_report = publish_paths_with_rclone(
+                        publish_list,
+                        remote_root=rclone_remote,
+                        rclone_config=rclone_config,
+                        namespace=namespace,
+                        rclone_exe=rclone_exe,
+                    )
             if apply_retention:
+                on_disk_payload = json.loads(
+                    stage.manifest_path.read_text(encoding="utf-8")
+                )
+                on_disk_logical_sha = _manifest_digest(on_disk_payload)
+                gate_b_approval = require_distinct_gate_b_approval(
+                    approved_gate_b_manifest_sha256=approved_gate_b_manifest_sha256,
+                    requestor_identity=requestor_identity,
+                    approver_identity=approver_identity,
+                    computed_manifest_sha256=str(manifest["manifest_sha256"]),
+                    on_disk_manifest_sha256=on_disk_logical_sha,
+                )
+                permanence_source = (
+                    list(verified_offsite_receipt)
+                    if verified_offsite_receipt is not None
+                    else list(remote_report)
+                )
+                required_artifacts: list[Path] = [stage.manifest_path]
+                enc_path = stage.rollback_encrypted_path
+                if enc_path is not None and Path(enc_path).is_file():
+                    required_artifacts.append(Path(enc_path))
+                elif verified_offsite_receipt is None:
+                    raise ColdArchiveError(
+                        "encrypted rollback bundle missing; cannot verify offsite "
+                        "permanence before deletion"
+                    )
+                offsite_verified = verify_offsite_permanence_receipt(
+                    permanence_source,
+                    required_local_artifacts=required_artifacts,
+                )
                 retention_report = apply_retention_to_candidate(
                     source,
                     manifest,
-                    expected_manifest_sha256=manifest["manifest_sha256"],
+                    expected_manifest_sha256=gate_b_approval[
+                        "approved_gate_b_manifest_sha256"
+                    ],
+                    offsite_permanence_receipt=permanence_source,
+                    gate_b_approval=gate_b_approval,
                 )
             else:
                 retention_report = {
                     "applied": False,
                     "reason": "apply-retention-not-set",
                 }
+
+        elif apply_retention and not manifest["counts"]["selected_sessions"]:
+            retention_report = {
+                "applied": False,
+                "reason": "no selected sessions",
+            }
+        elif apply_retention and manifest_only:
+            raise ColdArchiveError(
+                "refusing --apply-retention with --manifest-only "
+                "(export + verified offsite permanence required before delete)"
+            )
 
         receipt = {
             "operation": "hermes-state-cold-archive-pass",
@@ -1543,12 +1849,14 @@ def run_cold_archive_pass(
             "manifest_path": str(stage.manifest_path),
             "manifest_sha256": sha256_path(stage.manifest_path),
             "gate_b_manifest_sha256": manifest["manifest_sha256"],
+            "gate_b_approval": gate_b_approval,
             "restricted_ids_path": str(stage.restricted_ids_path),
             "restricted_ids_sha256": sha256_path(stage.restricted_ids_path),
             "qmd_export": qmd_report,
             "rollback_bundle": rollback_report,
             "rollback_encrypted": rollback_encrypted,
             "remote_publish": remote_report,
+            "offsite_permanence": offsite_verified,
             "remote_publish_policy": {
                 "publishes_restricted_ids": False,
                 "publishes_parent_map": False,
@@ -1557,6 +1865,8 @@ def run_cold_archive_pass(
                     "GATE-B-MANIFEST.json",
                     "rollback-source-bundle.tar.gz.age",
                 ],
+                "deletion_requires_verified_offsite": True,
+                "deletion_requires_distinct_approver": True,
             },
             "bundle_retention_seconds": int(BUNDLE_RETENTION_SECONDS),
             "retention": retention_report,
@@ -1578,6 +1888,7 @@ __all__ = [
     "DEFAULT_PERMANENT_HOLD_SOURCES",
     "MIN_COLD_AGE_DAYS",
     "MIN_COLD_AGE_SECONDS",
+    "OFFSITE_INTEGRITY_OK",
     "StageArtifacts",
     "apply_retention_to_candidate",
     "assert_publish_paths_are_remote_safe",
@@ -1587,7 +1898,9 @@ __all__ = [
     "export_redacted_qmd",
     "publish_paths_with_rclone",
     "reject_live_state_db",
+    "require_distinct_gate_b_approval",
     "require_sessions_schema",
     "run_cold_archive_pass",
+    "verify_offsite_permanence_receipt",
     "write_gate_b_manifest",
 ]

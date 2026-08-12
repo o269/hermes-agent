@@ -96,6 +96,144 @@ def _build_db_current_production_schema(path: Path) -> SessionDB:
     return _build_db(path, with_required_columns=False)
 
 
+def _valid_offsite_receipt_for_paths(paths: list[Path]) -> list[dict]:
+    """Build a positive offsite permanence receipt bound to local artifact bytes."""
+    receipt = []
+    for path in paths:
+        sha = cold.sha256_path(path)
+        receipt.append(
+            {
+                "local_path": str(path),
+                "remote": f"gdrive:hermes-state-test/{path.name}",
+                "bytes": path.stat().st_size,
+                "sha256": sha,
+                "readback_sha256": sha,
+                "integrity": "rclone-checksum-and-readback-ok",
+            }
+        )
+    return receipt
+
+
+def _synthetic_offsite_receipt(
+    *,
+    gate_b_sha: str = "ab" * 32,
+    age_sha: str = "cd" * 32,
+    gate_b_bytes: int = 12,
+    age_bytes: int = 8,
+    integrity: str = "rclone-checksum-and-readback-ok",
+) -> list[dict]:
+    return [
+        {
+            "local_path": "/stage/GATE-B-MANIFEST.json",
+            "remote": "gdrive:hermes-state-test/GATE-B-MANIFEST.json",
+            "bytes": gate_b_bytes,
+            "sha256": gate_b_sha,
+            "readback_sha256": gate_b_sha,
+            "integrity": integrity,
+        },
+        {
+            "local_path": "/stage/rollback-source-bundle.tar.gz.age",
+            "remote": "gdrive:hermes-state-test/rollback-source-bundle.tar.gz.age",
+            "bytes": age_bytes,
+            "sha256": age_sha,
+            "readback_sha256": age_sha,
+            "integrity": integrity,
+        },
+    ]
+
+
+def _install_hermetic_offsite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake age encrypt + rclone publish so retention can run without network."""
+
+    def fake_encrypt(source, output, **kw):
+        Path(output).write_bytes(b"enc-fixture")
+        return {
+            "path": str(output),
+            "sha256": cold.sha256_path(Path(output)),
+            "bytes": Path(output).stat().st_size,
+        }
+
+    def fake_publish(paths, **kwargs):
+        cold.assert_publish_paths_are_remote_safe(paths)
+        return _valid_offsite_receipt_for_paths([Path(p) for p in paths])
+
+    monkeypatch.setattr(cold, "encrypt_file_with_age", fake_encrypt)
+    monkeypatch.setattr(cold, "publish_paths_with_rclone", fake_publish)
+
+
+def _custody_kwargs(
+    *,
+    approved_sha: str,
+    requestor: str = "ops-requestor",
+    approver: str = "fable-approver",
+) -> dict:
+    return {
+        "approved_gate_b_manifest_sha256": approved_sha,
+        "requestor_identity": requestor,
+        "approver_identity": approver,
+        "rclone_remote": "gdrive:vps-offload/hermes-state-archives",
+        "rclone_config": None,  # filled by caller after path exists
+        "age_recipient_file": None,  # filled by caller
+    }
+
+
+def _run_delete_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_path: Path,
+    *,
+    stage_name: str = "stage",
+    **extra,
+) -> dict:
+    """run_cold_archive_pass with hermetic O3+O5 custody satisfied."""
+    _install_hermetic_offsite(monkeypatch)
+    recipient = tmp_path / "recv.pub"
+    if not recipient.exists():
+        recipient.write_text("age1test\n", encoding="utf-8")
+    config = tmp_path / "rclone.conf"
+    if not config.exists():
+        config.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+    # Preview hash with the same clock/holds the pass will use.
+    now = extra.get("now", NOW)
+    holds = extra.get("hold_sources", [])
+    preview = cold.build_gate_b_manifest(db_path, now=now, hold_sources=holds)
+    kwargs = {
+        "source_db": db_path,
+        "stage_root": tmp_path / stage_name,
+        "now": now,
+        "hold_sources": holds,
+        "apply_retention": True,
+        "approved_gate_b_manifest_sha256": preview["manifest_sha256"],
+        "requestor_identity": "ops-requestor",
+        "approver_identity": "fable-approver",
+        "rclone_remote": "gdrive:vps-offload/hermes-state-archives",
+        "rclone_config": config,
+        "age_recipient_file": recipient,
+    }
+    kwargs.update(extra)
+    if "approved_gate_b_manifest_sha256" not in extra:
+        kwargs["approved_gate_b_manifest_sha256"] = preview["manifest_sha256"]
+    return cold.run_cold_archive_pass(**kwargs)
+
+
+def _apply_retention_ok(
+    db_path: Path,
+    manifest: dict,
+    *,
+    offsite: list[dict] | None = None,
+    requestor: str = "ops-requestor",
+    approver: str = "fable-approver",
+) -> dict:
+    return cold.apply_retention_to_candidate(
+        db_path,
+        manifest,
+        expected_manifest_sha256=manifest["manifest_sha256"],
+        offsite_permanence_receipt=offsite or _synthetic_offsite_receipt(),
+        requestor_identity=requestor,
+        approver_identity=approver,
+    )
+
+
 def test_manifest_skips_32_parent_84_child_hazard(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     db = _build_db(db_path)
@@ -140,6 +278,7 @@ def test_manifest_skips_32_parent_84_child_hazard(tmp_path: Path) -> None:
 
 
 def test_cold_archive_export_delete_preserves_survivors_and_actual_message_counts(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "candidate.db"
@@ -185,13 +324,7 @@ def test_cold_archive_export_delete_preserves_survivors_and_actual_message_count
     finally:
         db.close()
 
-    receipt = cold.run_cold_archive_pass(
-        source_db=db_path,
-        stage_root=tmp_path / "stage",
-        now=NOW,
-        hold_sources=[],
-        apply_retention=True,
-    )
+    receipt = _run_delete_pass(monkeypatch, tmp_path, db_path)
 
     assert receipt["retention"]["applied"] is True
     assert receipt["retention"]["deleted_sessions"] == 2
@@ -211,6 +344,10 @@ def test_cold_archive_export_delete_preserves_survivors_and_actual_message_count
     assert receipt["remote_publish_policy"]["publishes_restricted_ids"] is False
     assert receipt["remote_publish_policy"]["publishes_parent_map"] is False
     assert receipt["remote_publish_policy"]["publishes_qmd_plaintext"] is False
+    assert receipt["remote_publish_policy"]["deletion_requires_verified_offsite"] is True
+    assert receipt["remote_publish_policy"]["deletion_requires_distinct_approver"] is True
+    assert receipt["gate_b_approval"]["approver_identity"] == "fable-approver"
+    assert receipt["offsite_permanence"]["verified"] is True
 
     conn = cold._connect_readonly(db_path)
     try:
@@ -273,10 +410,15 @@ def test_manifest_hash_mismatch_refuses_delete(tmp_path: Path) -> None:
             db_path,
             manifest,
             expected_manifest_sha256="0" * 64,
+            offsite_permanence_receipt=_synthetic_offsite_receipt(),
+            requestor_identity="ops-requestor",
+            approver_identity="fable-approver",
         )
 
 
-def test_replay_after_success_is_idempotent_no_candidates(tmp_path: Path) -> None:
+def test_replay_after_success_is_idempotent_no_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     db_path = tmp_path / "state.db"
     db = _build_db(db_path)
     try:
@@ -284,20 +426,8 @@ def test_replay_after_success_is_idempotent_no_candidates(tmp_path: Path) -> Non
     finally:
         db.close()
 
-    first = cold.run_cold_archive_pass(
-        source_db=db_path,
-        stage_root=tmp_path / "stage1",
-        now=NOW,
-        hold_sources=[],
-        apply_retention=True,
-    )
-    second = cold.run_cold_archive_pass(
-        source_db=db_path,
-        stage_root=tmp_path / "stage2",
-        now=NOW,
-        hold_sources=[],
-        apply_retention=True,
-    )
+    first = _run_delete_pass(monkeypatch, tmp_path, db_path, stage_name="stage1")
+    second = _run_delete_pass(monkeypatch, tmp_path, db_path, stage_name="stage2")
 
     assert first["retention"]["applied"] is True
     assert second["qmd_export"]["exported_files"] == []
@@ -319,13 +449,7 @@ def test_qmd_export_failure_fails_closed_before_delete(
     )
 
     with pytest.raises(ColdArchiveError, match="QMD export verification failed"):
-        cold.run_cold_archive_pass(
-            source_db=db_path,
-            stage_root=tmp_path / "stage",
-            now=NOW,
-            hold_sources=[],
-            apply_retention=True,
-        )
+        _run_delete_pass(monkeypatch, tmp_path, db_path)
 
     conn = cold._connect_readonly(db_path)
     try:
@@ -516,6 +640,9 @@ def test_finding1_missing_pinned_refuses_delete_not_empty_invariant(
             db_path,
             manifest,
             expected_manifest_sha256=manifest["manifest_sha256"],
+            offsite_permanence_receipt=_synthetic_offsite_receipt(),
+            requestor_identity="ops-requestor",
+            approver_identity="fable-approver",
         )
     # Row must still exist.
     conn = sqlite3.connect(str(db_path))
@@ -689,11 +816,8 @@ def test_finding5_invariant_failure_rolls_back_deletion(
     monkeypatch.setattr(cold, "_capture_invariants", flaky_capture)
 
     with pytest.raises(ColdArchiveError, match="open_ids changed"):
-        cold.apply_retention_to_candidate(
-            db_path,
-            manifest,
-            expected_manifest_sha256=manifest["manifest_sha256"],
-        )
+        _apply_retention_ok(db_path, manifest)
+
 
     conn = sqlite3.connect(str(db_path))
     try:
@@ -750,7 +874,9 @@ def test_finding6_exact_37_day_boundary_is_selected(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_finding7_system_prompts_orphans_not_deleted(tmp_path: Path) -> None:
+def test_finding7_system_prompts_orphans_not_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     db_path = tmp_path / "state.db"
     db = _build_db(db_path)
     try:
@@ -777,13 +903,7 @@ def test_finding7_system_prompts_orphans_not_deleted(tmp_path: Path) -> None:
     finally:
         db.close()
 
-    receipt = cold.run_cold_archive_pass(
-        source_db=db_path,
-        stage_root=tmp_path / "stage",
-        now=NOW,
-        hold_sources=[],
-        apply_retention=True,
-    )
+    receipt = _run_delete_pass(monkeypatch, tmp_path, db_path)
     assert receipt["retention"]["applied"] is True
     assert receipt["retention"].get("system_prompts_deleted", 0) == 0
 
@@ -880,17 +1000,7 @@ def test_finding9_run_pass_remote_list_excludes_sensitive(
     def fake_publish(paths, **kwargs):
         published.append([Path(p).name for p in paths])
         cold.assert_publish_paths_are_remote_safe(paths)
-        return [
-            {
-                "local_path": str(p),
-                "remote": f"gdrive:x/{Path(p).name}",
-                "bytes": Path(p).stat().st_size,
-                "sha256": cold.sha256_path(Path(p)),
-                "readback_sha256": cold.sha256_path(Path(p)),
-                "integrity": "ok",
-            }
-            for p in paths
-        ]
+        return _valid_offsite_receipt_for_paths([Path(p) for p in paths])
 
     monkeypatch.setattr(cold, "publish_paths_with_rclone", fake_publish)
     monkeypatch.setattr(
@@ -977,3 +1087,247 @@ def test_pr52_exact_14d_bundle_retention_not_derived_from_mutable_constant() -> 
     fourteen_days = 14 * 86_400
     assert fourteen_days == LITERAL_BUNDLE_RETENTION_SECONDS
     assert fourteen_days == 1_209_600
+
+
+# ---------------------------------------------------------------------------
+# O3 — Gate-B external approval / no self-approve (HIGH residual)
+# ---------------------------------------------------------------------------
+
+
+def test_o3_apply_retention_refuses_without_external_approved_sha(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Falsify: single-shot self-build+self-hash+delete must fail closed."""
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+
+    _install_hermetic_offsite(monkeypatch)
+    recipient = tmp_path / "recv.pub"
+    recipient.write_text("age1test\n", encoding="utf-8")
+    config = tmp_path / "rclone.conf"
+    config.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+
+    with pytest.raises(ColdArchiveError, match="self-approve|approved-gate-b-sha256"):
+        cold.run_cold_archive_pass(
+            source_db=db_path,
+            stage_root=tmp_path / "stage",
+            now=NOW,
+            hold_sources=[],
+            apply_retention=True,
+            # deliberately omit approved_gate_b_manifest_sha256
+            requestor_identity="ops-requestor",
+            approver_identity="fable-approver",
+            rclone_remote="gdrive:vps-offload/hermes-state-archives",
+            rclone_config=config,
+            age_recipient_file=recipient,
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id='eligible'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_o3_self_approve_same_identity_refuses_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+
+    with pytest.raises(ColdArchiveError, match="self-approve"):
+        _run_delete_pass(
+            monkeypatch,
+            tmp_path,
+            db_path,
+            requestor_identity="same-actor",
+            approver_identity="same-actor",
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id='eligible'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_o3_self_approve_casefold_identity_refuses(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+    manifest = cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
+    with pytest.raises(ColdArchiveError, match="self-approve"):
+        cold.apply_retention_to_candidate(
+            db_path,
+            manifest,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            offsite_permanence_receipt=_synthetic_offsite_receipt(),
+            requestor_identity="Fable",
+            approver_identity="fable",
+        )
+
+
+def test_o3_library_delete_requires_distinct_identities(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+    manifest = cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
+    with pytest.raises(ColdArchiveError, match="distinct Gate-B approval"):
+        cold.apply_retention_to_candidate(
+            db_path,
+            manifest,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            offsite_permanence_receipt=_synthetic_offsite_receipt(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# O5 — delete requires verified encrypted offsite permanence (HIGH residual)
+# ---------------------------------------------------------------------------
+
+
+def test_o5_apply_retention_refuses_without_offsite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Falsify: apply_retention with zero remote must not delete."""
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+
+    preview = cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
+    with pytest.raises(ColdArchiveError, match="offsite permanence"):
+        cold.run_cold_archive_pass(
+            source_db=db_path,
+            stage_root=tmp_path / "stage",
+            now=NOW,
+            hold_sources=[],
+            apply_retention=True,
+            approved_gate_b_manifest_sha256=preview["manifest_sha256"],
+            requestor_identity="ops-requestor",
+            approver_identity="fable-approver",
+            # no rclone_remote, no verified_offsite_receipt
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id='eligible'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_o5_apply_retention_to_candidate_refuses_empty_offsite_receipt(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+    manifest = cold.build_gate_b_manifest(db_path, now=NOW, hold_sources=[])
+    with pytest.raises(ColdArchiveError, match="offsite permanence receipt"):
+        cold.apply_retention_to_candidate(
+            db_path,
+            manifest,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            offsite_permanence_receipt=[],
+            requestor_identity="ops-requestor",
+            approver_identity="fable-approver",
+        )
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id='eligible'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_o5_offsite_receipt_requires_literal_integrity_token() -> None:
+    # Literal token — do not accept softer statuses like "ok".
+    with pytest.raises(ColdArchiveError, match="integrity"):
+        cold.verify_offsite_permanence_receipt(
+            _synthetic_offsite_receipt(integrity="ok")
+        )
+    ok = cold.verify_offsite_permanence_receipt(_synthetic_offsite_receipt())
+    assert ok["verified"] is True
+    assert ok["integrity"] == "rclone-checksum-and-readback-ok"
+
+
+def test_o5_offsite_receipt_requires_gate_b_and_age_bundle() -> None:
+    only_gate = [
+        {
+            "local_path": "/stage/GATE-B-MANIFEST.json",
+            "remote": "gdrive:x/GATE-B-MANIFEST.json",
+            "bytes": 1,
+            "sha256": "ab" * 32,
+            "readback_sha256": "ab" * 32,
+            "integrity": "rclone-checksum-and-readback-ok",
+        }
+    ]
+    with pytest.raises(ColdArchiveError, match="\\.age"):
+        cold.verify_offsite_permanence_receipt(only_gate)
+
+
+def test_o5_happy_path_with_verified_offsite_deletes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "state.db"
+    db = _build_db(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=80, content="eligible")
+    finally:
+        db.close()
+    receipt = _run_delete_pass(monkeypatch, tmp_path, db_path)
+    assert receipt["retention"]["applied"] is True
+    assert receipt["offsite_permanence"]["verified"] is True
+    assert "GATE-B-MANIFEST.json" in receipt["offsite_permanence"]["objects"]
+    assert any(
+        name.endswith(".age")
+        for name in receipt["offsite_permanence"]["encrypted_bundle_names"]
+    )
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id='eligible'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        conn.close()

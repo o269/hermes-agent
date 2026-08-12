@@ -7,10 +7,12 @@ This runbook documents the staged 30-day hot / 7-day archived-grace / cold-QMD p
 - Do not run this command against the active profile database at `~/.hermes/state.db`; the command refuses that path, any symlink to it, and any hardlink/alias that shares its inode.
 - Do not enable `sessions.auto_prune`.
 - Do not run `hermes sessions optimize`, `VACUUM`, FTS optimize, WAL checkpoint, live `DELETE`, config changes, service changes, rclone sync/delete/purge/dedupe, or a production upload as part of author verification.
-- The command only mutates an offline recovered candidate when `--apply-retention` is explicitly supplied.
+- The command only mutates an offline recovered candidate when `--apply-retention` is explicitly supplied **and** custody gates below are satisfied.
 - Never remotely publish restricted session IDs, the lineage parent map, or QMD plaintext. Ever.
 - Never delete `system_prompts` rows (including orphans); they are out of declared scope.
 - Do not overwrite an existing `GATE-B-MANIFEST.json` with different bytes; use a fresh `--stage-root`.
+- **Gate-B must not self-approve.** Destructive retention requires an externally supplied `--approved-gate-b-sha256` and a distinct `--approver-identity` that is not the `--requestor-identity`.
+- **No delete without verified offsite permanence.** `--apply-retention` refuses unless encrypted offsite publish + readback succeeded for public Gate-B + the `.age` rollback bundle (live in this invocation via rclone, or via `--verified-offsite-receipt` covering those objects).
 
 ## Schema prerequisites (fail closed)
 
@@ -46,11 +48,11 @@ Review:
 - `restricted/selected-session-ids.txt` — exact IDs; keep mode 0600 and do not attach to public bus/card; **never remote-publish**.
 - `restricted/lineage-parent-map.json` — restricted parent map receipt; **never remote-publish**.
 
-Fable must approve the exact `gate_b_manifest_sha256` before destructive retention.
+Record `gate_b_manifest_sha256` from the receipt. **A distinct approver (Fable)** must approve that exact hash before destructive retention. The same actor who requests deletion cannot approve it.
 
-## Export, rollback bundle, and optional offsite publish
+## Export, rollback bundle, and required offsite publish
 
-The reviewed run creates a lossless rollback bundle before any deletion and local redacted QMD exports for the cold set (QMD stays on the stage; it is not remotely published):
+The reviewed run creates a lossless rollback bundle before any deletion and local redacted QMD exports for the cold set (QMD stays on the stage; it is not remotely published). Encrypted offsite permanence is required before delete:
 
 ```bash
 hermes sessions cold-archive \
@@ -67,20 +69,35 @@ Remote publish is copy-only and limited to:
 - public `GATE-B-MANIFEST.json`
 - age-encrypted rollback bundle (`.tar.gz.age`)
 
-It performs `rclone copyto`, `rclone check --checksum --one-way`, and an exact byte readback for every object. It does not run remote deletion, sync, purge, dedupe, move, cleanup, or retention.
+It performs `rclone copyto`, `rclone check --checksum --one-way`, and an exact byte readback for every object. It does not run remote deletion, sync, purge, dedupe, move, cleanup, or retention. Only integrity token `rclone-checksum-and-readback-ok` counts as a verified offsite receipt entry.
 
 The private age identity must never be stored in the repository, bus, board, or on the VPS runtime path.
 
 ## Applying retention to the offline candidate
 
-Only after the Gate-B manifest and cold export have been verified:
+Only after:
+
+1. Gate-B export is complete,
+2. A **distinct** approver has approved the exact `gate_b_manifest_sha256`,
+3. Encrypted offsite publish + readback has produced a positive permanence receipt,
 
 ```bash
 hermes sessions cold-archive \
   --source /secure/offline-candidate/state.db \
   --stage-root /secure/hermes-state-archive/<approved-run> \
+  --age-recipient-file /etc/hermes-state-archive.age.pub \
+  --rclone-config /var/lib/hermes-state-offsite/rclone.conf \
+  --rclone-remote gdrive:vps-offload/hermes-state-archives \
+  --remote-namespace hermes-state/<approved-manifest-sha> \
+  --approved-gate-b-sha256 <approved-manifest-sha> \
+  --requestor-identity "ops@example" \
+  --approver-identity "fable" \
   --apply-retention
 ```
+
+Alternatively, pass `--verified-offsite-receipt /path/to/prior-receipt.json` (full prior cold-archive receipt or its `remote_publish` list) instead of re-running rclone in the delete invocation. The receipt is re-verified (existence of Gate-B + `.age` entries, integrity token, sha256==readback_sha256, and local Gate-B bytes bind) — prior-step success is never assumed.
+
+Single-shot self-build + self-hash + delete **without** external approval identities and offsite proof **fails closed**.
 
 The deletion transaction removes only selected sessions and their dependent `messages`, `session_model_usage`, `compression_locks`, and topic-binding rows. It never reparents surviving sessions. **Invariant checks run inside the same transaction as the deletes** — any failure rolls the deletion back.
 

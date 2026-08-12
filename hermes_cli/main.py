@@ -14924,7 +14924,41 @@ def main():
     sessions_cold_archive.add_argument(
         "--apply-retention",
         action="store_true",
-        help="After export/verification, delete the reviewed set from the offline candidate",
+        help=(
+            "After export, external Gate-B approval, and verified offsite "
+            "permanence, delete the reviewed set from the offline candidate"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-gate-b-sha256",
+        help=(
+            "Externally approved Gate-B manifest sha256 (64 hex). Required with "
+            "--apply-retention; the tool must not self-approve."
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--requestor-identity",
+        help=(
+            "Identity of the actor requesting destructive retention "
+            "(required with --apply-retention)"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--approver-identity",
+        help=(
+            "Distinct identity that approved the Gate-B hash "
+            "(required with --apply-retention; must differ from requestor)"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--verified-offsite-receipt",
+        type=Path,
+        help=(
+            "JSON file with a prior rclone publish+readback receipt "
+            "(Gate-B + .age). Alternative to running publish in this invocation; "
+            "required form of offsite proof when --rclone-remote is omitted "
+            "with --apply-retention"
+        ),
     )
     sessions_cold_archive.add_argument(
         "--hot-days",
@@ -15084,6 +15118,20 @@ def main():
                 else list(DEFAULT_PERMANENT_HOLD_SOURCES)
             )
             hold_sources.extend(getattr(args, "hold_source", None) or [])
+            verified_receipt = None
+            receipt_path = getattr(args, "verified_offsite_receipt", None)
+            if receipt_path is not None:
+                try:
+                    import json as _json_receipt
+
+                    verified_receipt = _json_receipt.loads(
+                        Path(receipt_path).read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as exc:
+                    print(f"Error: cold archive failed closed: invalid offsite receipt: {exc}")
+                    return 1
+                if isinstance(verified_receipt, dict) and "remote_publish" in verified_receipt:
+                    verified_receipt = verified_receipt["remote_publish"]
             try:
                 receipt = run_cold_archive_pass(
                     source_db=args.source,
@@ -15102,6 +15150,12 @@ def main():
                     age_recipient_file=getattr(args, "age_recipient_file", None),
                     age_exe=getattr(args, "age_exe", "age"),
                     rclone_exe=getattr(args, "rclone_exe", "rclone"),
+                    approved_gate_b_manifest_sha256=getattr(
+                        args, "approved_gate_b_sha256", None
+                    ),
+                    requestor_identity=getattr(args, "requestor_identity", None),
+                    approver_identity=getattr(args, "approver_identity", None),
+                    verified_offsite_receipt=verified_receipt,
                 )
             except ColdArchiveError as exc:
                 print(f"Error: cold archive failed closed: {exc}")
