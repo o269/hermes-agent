@@ -1999,7 +1999,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # hold a reference so short-lived reader threads' connections are
         # not GC'd without close() — that would leak tracked fds in
         # _live_connections.  close() drains this set.
+        #
+        # Owner threads are tracked alongside each connection so dead-thread
+        # pruning can close orphaned read conns. Without that, a long-lived
+        # SessionDB (dashboard TUI gateway `_get_db()`, messaging gateway)
+        # leaks one ro connection (db+wal fds) per short-lived worker thread
+        # for the process lifetime — the dashboard hit 1024/1024 FDs after
+        # ~6 days (Errno 24) and took the fleet with it (p87 / 2026-08-07).
         self._read_conns: "set[sqlite3.Connection]" = set()
+        self._read_conn_owners: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2234,6 +2242,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Read-path split ──
 
+    def _prune_dead_read_conns_unlocked(self) -> int:
+        """Close read-only connections whose owning thread has exited.
+
+        Must be called while holding ``self._read_conns_lock``. Returns the
+        number of connections closed. Safe no-op when the owner list is empty.
+        """
+        if not self._read_conn_owners:
+            return 0
+        survivors: "list[tuple[threading.Thread, sqlite3.Connection]]" = []
+        closed = 0
+        for owner, conn in self._read_conn_owners:
+            try:
+                alive = owner.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                survivors.append((owner, conn))
+                continue
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._read_conns.discard(conn)
+            closed += 1
+        if closed:
+            self._read_conn_owners = survivors
+            logger.debug(
+                "pruned %d dead-thread read connection(s) for %s (live=%d)",
+                closed,
+                self.db_path,
+                len(survivors),
+            )
+        return closed
+
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
 
@@ -2246,21 +2288,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Fresh read transactions begin per statement (autocommit), so each
         query observes everything committed so far — read-your-writes holds
         for the flush-then-search patterns in a turn.
+
+        Each connection is owned by the creating thread and registered in
+        ``_read_conn_owners``. On every open (and cheaply on cache hit every
+        so often) dead-thread owners are pruned so long-lived SessionDB
+        instances do not accumulate fds forever.
         """
         if not self._wal_active or self.read_only:
             return None
         conn = getattr(self._read_local, "conn", None)
         if conn is not None:
+            # Opportunistic prune on the hot path, rate-limited so a busy
+            # reader does not walk the owner list on every SELECT.
+            n = getattr(self._read_local, "prune_ticks", 0) + 1
+            self._read_local.prune_ticks = n
+            if n % 64 == 0:
+                with self._read_conns_lock:
+                    if not self._read_conns_closed:
+                        self._prune_dead_read_conns_unlocked()
             return conn
         if getattr(self._read_local, "failed", False):
             return None
         try:
+            # check_same_thread=False: these conns are owned by SessionDB and
+            # must be close()-able from another thread during dead-thread
+            # pruning and SessionDB.close(). Default True makes close() raise
+            # ProgrammingError (silently swallowed), permanently leaking the
+            # db+wal fds — root cause of the dashboard Errno 24 outage.
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
                 timeout=5.0,
                 isolation_level=None,
+                check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
@@ -2277,7 +2338,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
+                # Drop orphans before registering a new owner so a burst of
+                # short-lived worker threads cannot grow the set unboundedly.
+                self._prune_dead_read_conns_unlocked()
                 self._read_conns.add(conn)
+                self._read_conn_owners.append((threading.current_thread(), conn))
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -2285,6 +2350,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             return None
         self._read_local.conn = conn
+        self._read_local.prune_ticks = 0
         return conn
 
     @contextmanager
@@ -2822,6 +2888,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._read_conns_closed = True
             read_conns = list(self._read_conns)
             self._read_conns.clear()
+            self._read_conn_owners.clear()
         for conn in read_conns:
             try:
                 conn.close()
