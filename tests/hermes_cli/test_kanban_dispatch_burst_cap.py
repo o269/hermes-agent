@@ -108,31 +108,6 @@ def test_none_budget_is_unbounded(conn, all_assignees_spawnable):
 
 
 # ---------------------------------------------------------------------------
-# Normal operation — the fence must not disrupt legitimate ticks
-# ---------------------------------------------------------------------------
-
-
-def test_queue_within_budget_spawns_everything(conn, all_assignees_spawnable):
-    ids = _create_ready(conn, 3)
-    calls = []
-    result = kb.dispatch_once(
-        conn, spawn_fn=_spawn_spy(calls), max_spawn_per_tick=4
-    )
-    assert sorted(t for t, _, _ in result.spawned) == sorted(ids)
-    assert len(calls) == 3
-
-
-def test_none_budget_is_unbounded(conn, all_assignees_spawnable):
-    """Library back-compat: callers that never pass the new knob keep the
-    old unbounded behavior. Only the CLI/gateway entry points apply the
-    default fence."""
-    ids = _create_ready(conn, 6)
-    calls = []
-    result = kb.dispatch_once(conn, spawn_fn=_spawn_spy(calls))
-    assert sorted(t for t, _, _ in result.spawned) == sorted(ids)
-
-
-# ---------------------------------------------------------------------------
 # Must-fire — create the exact bad condition, assert the fence blocks it.
 # These tests FAIL when the ``_spawn_budget`` check is removed from
 # ``_dispatch_once_locked`` (verified: 4 failed / 6 passed with the fence
