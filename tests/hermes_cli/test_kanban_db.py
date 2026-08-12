@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -27,6 +29,74 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+@pytest.mark.parametrize(
+    ("actor", "profile_context", "expected_actor"),
+    [
+        ("operator:fable", None, "operator:fable"),
+        (None, "codex2", "profile:codex2"),
+        (None, None, "unknown"),
+    ],
+)
+def test_assign_task_records_actor_provenance(
+    kanban_home,
+    monkeypatch,
+    actor,
+    profile_context,
+    expected_actor,
+):
+    """Every assigned event identifies the caller, including unknown fallback."""
+    if profile_context is None:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_PROFILE", profile_context)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="assignment provenance", assignee="before")
+        assert kb.assign_task(conn, task_id, "after", actor=actor)
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'assigned' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert event is not None
+    assert json.loads(event["payload"]) == {
+        "actor": expected_actor,
+        "assignee": "after",
+    }
+
+
+def test_production_assignment_callers_pass_actor_explicitly():
+    """The known CLI, dashboard, and reassign delegate paths name their caller."""
+    repo_root = Path(__file__).resolve().parents[2]
+    source_paths = [
+        repo_root / "hermes_cli" / "kanban.py",
+        repo_root / "hermes_cli" / "kanban_db.py",
+        repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py",
+    ]
+    uncovered: list[str] = []
+    call_count = 0
+    for source_path in source_paths:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            call_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else node.func.id if isinstance(node.func, ast.Name) else None
+            )
+            if call_name not in {"assign_task", "reassign_task"}:
+                continue
+            call_count += 1
+            if not any(keyword.arg == "actor" for keyword in node.keywords):
+                relative = source_path.relative_to(repo_root)
+                uncovered.append(f"{relative}:{node.lineno} {call_name}")
+
+    assert call_count == 7
+    assert uncovered == []
 
 
 def _init_git_repo(repo: Path) -> None:

@@ -1028,7 +1028,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None:
             try:
                 ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
+                    conn,
+                    task_id,
+                    payload.assignee or None,
+                    actor="caller:kanban-dashboard",
                 )
             except (RuntimeError, ValueError) as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -1364,10 +1367,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             ok = kanban_db.reassign_task(
                                 conn, tid, payload.assignee or None,
                                 reclaim_first=True,
+                                actor="caller:kanban-dashboard",
                             )
                         else:
                             ok = kanban_db.assign_task(
                                 conn, tid, payload.assignee or None,
+                                actor="caller:kanban-dashboard",
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
@@ -1832,6 +1837,7 @@ def reassign_task_endpoint(
             payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
+            actor="caller:kanban-dashboard",
         )
         if not ok:
             raise HTTPException(
