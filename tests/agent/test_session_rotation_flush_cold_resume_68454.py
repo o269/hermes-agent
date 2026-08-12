@@ -37,6 +37,10 @@ def _make_flush_agent(db: SessionDB, session_id: str):
         _pending_cli_user_message=None,
     )
     agent._ensure_db_session = lambda: None
+    # The production flush now redacts every durable message before writing it.
+    # Keep this lightweight shell aligned with that contract instead of bypassing
+    # redaction (construction is still avoided so the test remains offline).
+    agent._redact_message_content = AIAgent._redact_message_content
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )
