@@ -14,9 +14,10 @@ Environment=HERMES_HOME=/var/lib/boardd
 Environment=HERMES_KANBAN_BROKER=0
 Environment=HERMES_KANBAN_DB=/var/lib/boardd/fleet/kanban.db
 Environment=BOARDD_SOCK=/run/boardd/boardd.sock
-# Functional write path: create + verify + archive + verify through the broker.
-# The 90s initial offset avoids the 900s backup boundary; boardd also enforces
-# a shared maintenance lock so backup and canary cannot overlap when timing drifts.
+# Functional write path: insert + verify task/event/run rows inside one broker
+# transaction, then ROLLBACK and verify zero persisted rows. The 90s initial
+# offset avoids the 900s backup boundary; the shared maintenance lock remains
+# the hard concurrency guard when timing drifts.
 Environment=BOARDD_WRITE_CANARY_MODE=periodic
 Environment=BOARDD_WRITE_CANARY_START_DELAY_S=90
 Environment=BOARDD_WRITE_CANARY_INTERVAL_S=300

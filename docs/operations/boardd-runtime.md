@@ -77,28 +77,24 @@ The detector does not run migrations or repair the live schema.
 ## Functional write canary
 
 `boardd` owns a broker-loopback functional probe. It connects to the Unix socket
-with `kb_client.Client`, opens a `boardd_shim.BrokerConnection`, and calls the
-canonical `kanban_db.create_task` and `kanban_db.archive_task` operations. It does
-not open SQLite directly and does not use the lightweight native `create_task`
-handler. A healthy run performs four broker-visible checks:
+with `kb_client.Client`, opens a `boardd_shim.BrokerConnection`, and exercises the
+same bounded interactive-transaction surface used by kanban clients. A healthy
+run performs four broker-visible checks:
 
-1. reconcile any active card with the complete reserved marker set;
-2. create a blocked, unassigned disposable card and verify the create receipt;
-3. archive it in a separate transaction; and
-4. read it back and verify the terminal `archived` state.
+1. open `BEGIN IMMEDIATE` through boardd;
+2. insert one task, one task event, and one task run using a unique reserved id;
+3. read all three rows back inside the transaction and verify exact counts; and
+4. explicitly `ROLLBACK`, then query the unique id again and require zero task,
+   event, and run rows.
 
-Canary cards use `created_by=__hermes_boardd_write_canary_v1__`, an idempotency
-key in the same reserved namespace, and matching title/body markers. Cleanup
-requires every marker to agree and uses a case-sensitive literal key prefix.
-Discovery treats any individual reserved creator, key prefix, title prefix, or
-body marker as a namespace claim; a partial-marker row therefore fails loudly
-rather than escaping reconciliation or being mistaken for an owned canary.
-The archive UPDATE carries all expected identity fields as an atomic guard; a
-card changed after discovery is never archived. A partial namespace match fails
-loudly as an identity collision and is not reported as an orphan. Canary archive
-also suppresses the normal global dependency recompute because reserved cards
-cannot have links, so the probe does not perturb normal queues. Blocked canary
-cards cannot enter dispatch and archived cards are hidden from normal lists.
+The task/event/run ids reported by `ping` are ephemeral transaction receipts;
+they never identify persisted rows. The probe does not call `create_task`,
+`archive_task`, or any lifecycle hook, so it cannot create a visible card,
+append board history, trigger dispatch, or perturb dependency queues. The
+reserved `__hermes_boardd_write_canary_v1__` marker exists only inside the
+rolled-back transaction and in health diagnostics. A successful run reports
+`probe_kind=rollback-transaction` and
+`last_persisted_counts={tasks:0,task_events:0,task_runs:0}`.
 
 The service defaults are:
 
@@ -136,24 +132,27 @@ sudo tail -n 20 /var/lib/boardd/fleet/boardd-HEALTH-ALERT
 ```
 
 `write_canary_ok=false`, `health_ok=false`, and a non-null
-`write_canary_alarm` mean the real create/archive path failed. The alarm includes
-`kind`, `phase`, normalized `error_code`, `error_type`, `task_id`,
-`orphan_task_ids`, cleanup diagnostics, and a stable fingerprint. Raw OS and
-retry text is diagnostic only and is excluded from fingerprint identity, so
-transport jitter cannot create alert storms. Unknown-column failures are
-classified as `schema-drift`; transaction deadlines as `write-canary-timeout`;
-create receipt, archive, and terminal-state mismatches retain their precise
-phase. Identical failures update the in-memory count every run but write at most
-one repeat event per repeat interval. A changed fingerprint emits an immediate transition, and a
-successful full run emits an immediate recovery. No transition or recovery is
-suppressed by the repeat limiter. Emitted alarm state includes its first/last and
-last-emitted timestamps; boardd restores the latest unresolved write-canary alarm
-from the alert journal at startup, so a process restart neither resets the repeat
-window nor suppresses the eventual recovery notice.
+`write_canary_alarm` mean the real interactive write/verify/rollback path failed.
+The alarm includes `kind`, `phase`, normalized `error_code`, `error_type`, an
+ephemeral `task_id`, and a stable fingerprint. Raw OS and retry text is
+diagnostic only and is excluded from fingerprint identity, so transport jitter
+cannot create alert storms. Unknown-column failures are classified as
+`schema-drift`; transaction deadlines as `write-canary-timeout`; invalid insert
+receipts as `write-canary-verification`; rollback failures as
+`write-canary-rollback`; and any non-zero post-rollback count as
+`write-canary-persistence`. Identical failures update the in-memory count every
+run but write at most one repeat event per repeat interval. A changed fingerprint
+emits an immediate transition, and a successful full run emits an immediate
+recovery. No transition or recovery is suppressed by the repeat limiter. Emitted
+alarm state includes its first/last and last-emitted timestamps; boardd restores
+the latest unresolved write-canary alarm from the alert journal at startup, so a
+process restart neither resets the repeat window nor suppresses the eventual
+recovery notice.
 
-An archive failure always reports the affected task id. The next run searches
-for active full-marker canaries first and archives them before creating a new
-probe. Inspect suspected orphans through boardd:
+The rollback probe never searches for or mutates canary rows from older
+create/archive releases. During cutover, inspect legacy rows through boardd and
+archive any remaining active card once; do not repair or delete it with direct
+SQLite:
 
 ```bash
 sudo -u boardd env \
@@ -162,12 +161,10 @@ sudo -u boardd env \
   "SELECT id,title,status,created_at FROM tasks WHERE status!='archived' AND created_by='__hermes_boardd_write_canary_v1__' ORDER BY created_at"
 ```
 
-If a full-marker orphan remains after broker recovery, Fable may archive the
-reported id with `hermes kanban --board fleet archive <task-id>`. Never repair it
-with direct SQLite. `disabled` is an explicit loss of functional coverage and is
-only for a bounded maintenance exception. `once` is for a disposable staging
-broker or automated test; it retries a brief backup/manual overlap until one
-actual probe runs. Production stays `periodic`.
+`disabled` is an explicit loss of functional coverage and is only for a bounded
+maintenance exception. `once` is for a disposable staging broker or automated
+test; it retries a brief backup/manual overlap until one actual probe runs.
+Production stays `periodic`.
 
 ### Stop / SIGTERM contract
 
