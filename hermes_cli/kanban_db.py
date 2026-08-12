@@ -3868,6 +3868,25 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _claim_lock_is_local(claim_lock: Optional[str]) -> bool:
+    """Return whether ``claim_lock`` names a worker on this host.
+
+    Direct SQLite claims use ``worker-host:pid``. Brokered fleet claims are
+    namespaced as ``broker-host:worker-host:pid`` (and may gain more prefixes),
+    so the worker host is always the component immediately before the final
+    process identifier. Comparing the leftmost component makes every worker
+    connected through the local broker look host-local and lets this host reap
+    a live remote PID by number coincidence or absence.
+    """
+    if not claim_lock:
+        return False
+    parts = str(claim_lock).rsplit(":", 2)
+    if len(parts) < 2 or not parts[-2]:
+        return False
+    local_host = _claimer_id().split(":", 1)[0]
+    return parts[-2] == local_host
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -5868,7 +5887,6 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
     stale = conn.execute(
         "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
@@ -5882,17 +5900,18 @@ def release_stale_claims(
         "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
+    local_stale = [row for row in stale if _claim_lock_is_local(row["claim_lock"])]
     stale_snapshot = _snapshot_worker_processes(
-        task_ids={row["id"] for row in stale},
+        task_ids={row["id"] for row in local_stale},
         process_groups={
             int(row["worker_pgid"])
-            for row in stale
+            for row in local_stale
             if row["worker_pgid"] is not None
         },
-    ) if stale else []
+    ) if local_stale else []
     for row in stale:
         lock = row["claim_lock"] or ""
-        host_local = lock.startswith(host_prefix)
+        host_local = _claim_lock_is_local(lock)
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -5902,25 +5921,32 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
-        owned = _owned_worker_processes(
-            stale_snapshot,
-            task_id=row["id"],
-            run_id=row["current_run_id"],
-            worker_pgid=row["worker_pgid"],
-            worker_sid=row["worker_sid"],
-            worker_boot_id=row["worker_boot_id"],
-            worker_group_started_at=row["worker_group_started_at"],
-            board_db=board_db,
-            board_slug=board_slug,
+        owned = (
+            _owned_worker_processes(
+                stale_snapshot,
+                task_id=row["id"],
+                run_id=row["current_run_id"],
+                worker_pgid=row["worker_pgid"],
+                worker_sid=row["worker_sid"],
+                worker_boot_id=row["worker_boot_id"],
+                worker_group_started_at=row["worker_group_started_at"],
+                board_db=board_db,
+                board_slug=board_slug,
+            )
+            if host_local
+            else []
         )
-        worker_alive = _recorded_worker_alive(
-            row["worker_pid"],
-            worker_pgid=row["worker_pgid"],
-            worker_sid=row["worker_sid"],
-            worker_boot_id=row["worker_boot_id"],
-            worker_started_at=row["worker_started_at"],
-        ) or bool(owned)
-        if host_local and worker_alive and not heartbeat_stale:
+        worker_alive = host_local and (
+            _recorded_worker_alive(
+                row["worker_pid"],
+                worker_pgid=row["worker_pgid"],
+                worker_sid=row["worker_sid"],
+                worker_boot_id=row["worker_boot_id"],
+                worker_started_at=row["worker_started_at"],
+            )
+            or bool(owned)
+        )
+        if worker_alive and not heartbeat_stale:
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
                 cur = conn.execute(
@@ -11637,8 +11663,7 @@ def _terminate_reclaimed_worker(
     if not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if not _claim_lock_is_local(claim_lock):
         return info
     info["host_local"] = True
 
@@ -12079,7 +12104,6 @@ def enforce_max_runtime(
     """
     timed_out: list[str] = []
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
 
     rows = conn.execute(
@@ -12096,8 +12120,7 @@ def enforce_max_runtime(
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
-        lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _claim_lock_is_local(row["claim_lock"]):
             continue
         # Runtime is per attempt, not lifetime-of-task. ``tasks.started_at``
         # intentionally records the first time a task ever started, so retries
@@ -12230,7 +12253,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     board_db, board_slug = _connection_worker_board_identity(conn)
     reclaimed: list[str] = []
 
@@ -12484,12 +12506,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     candidates: list[sqlite3.Row] = []
     for row in rows:
         # Only check liveness for claims owned by this host.
         lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _claim_lock_is_local(lock):
             continue
         # Grace is per attempt. ``tasks.started_at`` is intentionally sticky
         # across retries and made a fresh retry look hours old (#t_86a7e7a9).
