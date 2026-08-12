@@ -9,7 +9,10 @@ whether a task still has an open parent) before enforcing the result.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 # Executor-shaped cards may wait on a non-spawnable authority lane, but only in
@@ -18,6 +21,13 @@ from typing import Optional
 EXECUTOR_AUTHORITY_PARKED_STATUSES = frozenset({"todo", "scheduled", "blocked"})
 TERMINAL_STATUSES = frozenset({"done", "archived", "failed", "cancelled"})
 ACTIVE_STATUSES = frozenset({"ready", "review", "running"})
+
+# Configuration may make the proof window stricter, but can never stretch it
+# beyond the fleet's 24-hour lane-health boundary.
+MAX_LANE_HEALTH_AGE_SECONDS = 24 * 60 * 60
+MAX_LANE_HEALTH_FUTURE_SKEW_SECONDS = 5 * 60
+_MAX_LANE_HEALTH_RECEIPT_BYTES = 16 * 1024
+_PROFILE_RECEIPT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 
 # Exact incident rows are durable authority controls even if a raw writer tries
 # to erase every semantic marker in the same UPDATE that changes custody/state.
@@ -140,6 +150,216 @@ _PARKING_CONTRACT_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class LaneEligibilityPolicy:
+    """Filesystem-backed proof policy for executor-lane assignments."""
+
+    receipt_dir: Optional[Path] = None
+    max_age_seconds: int = MAX_LANE_HEALTH_AGE_SECONDS
+    future_skew_seconds: int = MAX_LANE_HEALTH_FUTURE_SKEW_SECONDS
+    de_rostered_prefixes: tuple[str, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return self.receipt_dir is not None or bool(self.de_rostered_prefixes)
+
+
+def _profile_values(raw: object, *, key: str) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"invalid {key}: expected comma string or list")
+    return tuple(
+        dict.fromkeys(
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        )
+    )
+
+
+def lane_eligibility_policy_from_config(
+    kanban_config: Mapping[str, object],
+    *,
+    authority_root: Path,
+) -> LaneEligibilityPolicy:
+    """Build the lane policy from the board authority's canonical config."""
+
+    raw_dir = kanban_config.get("lane_health_receipts_dir", "")
+    if raw_dir is None:
+        raw_dir = ""
+    if not isinstance(raw_dir, str):
+        raise ValueError("invalid lane_health_receipts_dir: expected a path string")
+    receipt_dir: Optional[Path] = None
+    if raw_dir.strip():
+        candidate = Path(raw_dir.strip()).expanduser()
+        receipt_dir = candidate if candidate.is_absolute() else authority_root / candidate
+
+    raw_max_age = kanban_config.get(
+        "lane_health_max_age_seconds", MAX_LANE_HEALTH_AGE_SECONDS
+    )
+    if not isinstance(raw_max_age, (str, int)) or isinstance(raw_max_age, bool):
+        raise ValueError("invalid lane_health_max_age_seconds: expected an integer")
+    try:
+        max_age = int(raw_max_age)
+    except ValueError as exc:
+        raise ValueError("invalid lane_health_max_age_seconds: expected an integer") from exc
+    if max_age <= 0 or max_age > MAX_LANE_HEALTH_AGE_SECONDS:
+        raise ValueError(
+            "invalid lane_health_max_age_seconds: must be between 1 and 86400"
+        )
+
+    raw_future_skew = kanban_config.get(
+        "lane_health_future_skew_seconds", MAX_LANE_HEALTH_FUTURE_SKEW_SECONDS
+    )
+    if not isinstance(raw_future_skew, (str, int)) or isinstance(raw_future_skew, bool):
+        raise ValueError("invalid lane_health_future_skew_seconds: expected an integer")
+    try:
+        future_skew = int(raw_future_skew)
+    except ValueError as exc:
+        raise ValueError("invalid lane_health_future_skew_seconds: expected an integer") from exc
+    if future_skew < 0 or future_skew > MAX_LANE_HEALTH_FUTURE_SKEW_SECONDS:
+        raise ValueError(
+            "invalid lane_health_future_skew_seconds: must be between 0 and 300"
+        )
+
+    prefixes = _profile_values(
+        kanban_config.get("de_rostered_profile_prefixes", ""),
+        key="de_rostered_profile_prefixes",
+    )
+    return LaneEligibilityPolicy(
+        receipt_dir=receipt_dir,
+        max_age_seconds=max_age,
+        future_skew_seconds=future_skew,
+        de_rostered_prefixes=prefixes,
+    )
+
+
+def _receipt_values(path: Path) -> Optional[dict[str, str]]:
+    """Parse one bounded KEY=VALUE receipt, rejecting ambiguous duplicates."""
+
+    try:
+        if path.stat().st_size > _MAX_LANE_HEALTH_RECEIPT_BYTES:
+            return None
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            return None
+        key, value = line.split("=", 1)
+        key = key.strip().upper()
+        if not key or key in values:
+            return None
+        values[key] = value.strip()
+    return values
+
+
+def lane_eligibility_reason(
+    assignee: Optional[str],
+    *,
+    policy: LaneEligibilityPolicy,
+    authority_profiles: Iterable[str] = (),
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Return a stable, profile-bearing denial code for a lane assignment."""
+
+    candidate = str(assignee or "").strip().casefold()
+    if not candidate or not policy.enabled:
+        return None
+    authorities = {
+        str(profile).strip().casefold()
+        for profile in authority_profiles
+        if str(profile).strip()
+    }
+    if candidate in authorities:
+        # Authority lanes are an explicit exception and remain constrained by
+        # the non-spawnable state policy in ``assignment_guard_reason``.
+        return None
+    if any(candidate.startswith(prefix) for prefix in policy.de_rostered_prefixes):
+        return f"lane_derostered:{candidate}"
+    if policy.receipt_dir is None:
+        return None
+    if not _PROFILE_RECEIPT_NAME_RE.fullmatch(candidate):
+        return f"lane_health_profile_invalid:{candidate}"
+
+    try:
+        receipt_root = policy.receipt_dir.resolve(strict=True)
+        if not receipt_root.is_dir():
+            return f"lane_health_receipt_dir_unavailable:{candidate}"
+    except OSError:
+        return f"lane_health_receipt_dir_unavailable:{candidate}"
+    try:
+        receipt_path = (receipt_root / f"{candidate}.env").resolve(strict=True)
+    except FileNotFoundError:
+        return f"lane_health_receipt_missing:{candidate}"
+    except OSError:
+        return f"lane_health_receipt_invalid:{candidate}"
+    if receipt_path.parent != receipt_root or not receipt_path.is_file():
+        return f"lane_health_receipt_invalid:{candidate}"
+
+    values = _receipt_values(receipt_path)
+    if values is None:
+        return f"lane_health_receipt_invalid:{candidate}"
+    status_ok: Optional[bool] = None
+    if "LANE_OK" in values:
+        status_ok = values["LANE_OK"].casefold() in {"1", "true", "yes"}
+    if "STATUS" in values:
+        status_value = values["STATUS"].strip().upper() == "LANE_OK"
+        if status_ok is not None and status_ok != status_value:
+            return f"lane_health_receipt_invalid:{candidate}"
+        status_ok = status_value
+    if status_ok is None:
+        return f"lane_health_receipt_invalid:{candidate}"
+    if not status_ok:
+        return f"lane_health_receipt_unhealthy:{candidate}"
+
+    probed_raw = values.get("PROBED_AT")
+    if not probed_raw:
+        return f"lane_health_receipt_invalid:{candidate}"
+    try:
+        probed_at = datetime.fromisoformat(probed_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return f"lane_health_receipt_invalid:{candidate}"
+    if probed_at.tzinfo is None:
+        return f"lane_health_receipt_invalid:{candidate}"
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age_seconds = (observed_at - probed_at.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < -policy.future_skew_seconds:
+        return f"lane_health_receipt_future:{candidate}"
+    if age_seconds > policy.max_age_seconds:
+        return f"lane_health_receipt_stale:{candidate}"
+    return None
+
+
+def receipted_lane_names(
+    policy: LaneEligibilityPolicy,
+    *,
+    now: Optional[datetime] = None,
+) -> set[str]:
+    """Return fresh, non-de-rostered receipt stems for remote roster lanes."""
+
+    if policy.receipt_dir is None:
+        return set()
+    try:
+        root = policy.receipt_dir.resolve(strict=True)
+        entries = tuple(root.glob("*.env"))
+    except OSError:
+        return set()
+    result: set[str] = set()
+    for entry in entries:
+        name = entry.stem.casefold()
+        if lane_eligibility_reason(name, policy=policy, now=now) is None:
+            result.add(name)
+    return result
+
+
 def _blob(title: Optional[str], body: Optional[str]) -> str:
     return f"{title or ''}\n{body or ''}".strip()
 
@@ -227,6 +447,7 @@ def assignment_guard_reason(
     old_body: Optional[str] = None,
     old_assignee: Optional[str] = None,
     old_status: Optional[str] = None,
+    lane_policy: Optional[LaneEligibilityPolicy] = None,
 ) -> Optional[str]:
     """Return a stable denial code, or ``None`` when the state is allowed.
 
@@ -249,7 +470,7 @@ def assignment_guard_reason(
         for profile in profile_values
         if str(profile).strip()
     }
-    if not authorities:
+    if not authorities and (lane_policy is None or not lane_policy.enabled):
         return None
 
     candidate = str(assignee or "").strip().casefold()
@@ -313,4 +534,10 @@ def assignment_guard_reason(
         if not has_open_parent and not has_nonspawnable_parking_contract(title, body):
             return "authority_executor_missing_parking_contract"
 
+    if lane_policy is not None:
+        return lane_eligibility_reason(
+            assignee,
+            policy=lane_policy,
+            authority_profiles=authorities,
+        )
     return None

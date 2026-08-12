@@ -2253,6 +2253,17 @@ DEFAULT_CONFIG = {
         # assignment behavior. When configured, executor-shaped work may wait
         # on these lanes only in a dependency-held/explicitly parked state.
         "authority_profiles": "",
+        # Optional canonical directory of per-lane `*.env` health receipts.
+        # When set, executor assignments fail closed unless the lane has a
+        # bounded, fresh LANE_OK receipt. Relative paths resolve from the
+        # board authority root, never from the invoking worker's cwd.
+        "lane_health_receipts_dir": "",
+        # Receipt age/future-skew bounds. The policy refuses values above the
+        # fleet-wide hard caps (24h age and 5m future skew).
+        "lane_health_max_age_seconds": 24 * 60 * 60,
+        "lane_health_future_skew_seconds": 5 * 60,
+        # Comma string or list of lane prefixes denied regardless of receipt.
+        "de_rostered_profile_prefixes": "",
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

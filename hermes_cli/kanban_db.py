@@ -91,7 +91,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.kanban_assignment_policy import (
+    LaneEligibilityPolicy,
     assignment_guard_reason as _pure_assignment_guard_reason,
+    lane_eligibility_policy_from_config,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1564,20 +1566,11 @@ class AssignmentPolicyConfigError(RuntimeError):
     """Authority-profile config could not be resolved safely for this board."""
 
 
-def _configured_board_profiles(
+def _configured_kanban_policy(
     conn: sqlite3.Connection,
-    key: str,
-    default: object,
-) -> tuple[str, ...]:
-    """Read a profile allowlist from the config bound to ``conn``'s board.
+) -> tuple[Path, dict[str, object]]:
+    """Read canonical Kanban policy config bound to ``conn``'s board."""
 
-    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
-    policy.  The opened SQLite path resolves the canonical root, matching the
-    continuation-authority model. A present but unreadable/malformed config is
-    an enforcement error, never an empty allowlist that disables the fence.
-    """
-
-    raw = default
     authority_root = _continuation_authority_root(conn)
     if authority_root is None:
         raise AssignmentPolicyConfigError("assignment authority root is unresolved")
@@ -1598,16 +1591,37 @@ def _configured_board_profiles(
         raise AssignmentPolicyConfigError(
             f"invalid assignment authority config at {config_path}: root must be a mapping"
         )
-    kanban_config = payload.get("kanban")
-    if kanban_config is None:
-        kanban_config = {}
-    if not isinstance(kanban_config, dict):
+    configured = payload.get("kanban")
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
         raise AssignmentPolicyConfigError(
             f"invalid assignment authority config at {config_path}: kanban must be a mapping"
         )
-    configured = kanban_config.get(key)
-    if configured is not None:
-        raw = configured
+
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    defaults = DEFAULT_CONFIG.get("kanban")
+    merged: dict[str, object] = dict(defaults) if isinstance(defaults, dict) else {}
+    merged.update(configured)
+    return authority_root, merged
+
+
+def _configured_board_profiles(
+    conn: sqlite3.Connection,
+    key: str,
+    default: object,
+) -> tuple[str, ...]:
+    """Read a profile allowlist from the config bound to ``conn``'s board.
+
+    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
+    policy. The opened SQLite path resolves the canonical root. A present but
+    malformed config is an enforcement error, never an empty allowlist that
+    disables the fence.
+    """
+
+    _authority_root, kanban_config = _configured_kanban_policy(conn)
+    raw = kanban_config.get(key, default)
     if isinstance(raw, str):
         raw = raw.split(",")
     if not isinstance(raw, (list, tuple)):
@@ -1635,6 +1649,25 @@ def _authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
     return _configured_board_profiles(conn, "authority_profiles", default)
 
 
+def assignment_authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Return the explicit non-spawnable authority allowlist for this board."""
+
+    return _authority_profiles(conn)
+
+
+def lane_eligibility_policy(conn: sqlite3.Connection) -> LaneEligibilityPolicy:
+    """Return the fail-closed lane policy bound to this board connection."""
+
+    authority_root, kanban_config = _configured_kanban_policy(conn)
+    try:
+        return lane_eligibility_policy_from_config(
+            kanban_config,
+            authority_root=authority_root,
+        )
+    except ValueError as exc:
+        raise AssignmentPolicyConfigError(str(exc)) from exc
+
+
 def _assignment_guard_reason(
     conn: sqlite3.Connection,
     *,
@@ -1649,18 +1682,20 @@ def _assignment_guard_reason(
     old_assignee: Optional[str] = None,
     old_status: Optional[str] = None,
 ) -> Optional[str]:
+    authorities = _authority_profiles(conn)
     return _pure_assignment_guard_reason(
         title=title,
         body=body,
         assignee=assignee,
         status=status,
-        authority_profiles=_authority_profiles(conn),
+        authority_profiles=authorities,
         has_open_parent=has_open_parent,
         task_id=task_id,
         old_title=old_title,
         old_body=old_body,
         old_assignee=old_assignee,
         old_status=old_status,
+        lane_policy=lane_eligibility_policy(conn),
     )
 
 
@@ -1744,12 +1779,13 @@ def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
             conn.rollback()
         raise
 
-    if _authority_profiles(conn):
+    if _authority_profiles(conn) or lane_eligibility_policy(conn).enabled:
         return
 
-    # A valid empty authority allowlist intentionally disables the fence. Drop
-    # both triggers atomically only after configuration parsed successfully,
-    # preserving legacy raw-SQL compatibility for installations not opted in.
+    # Valid empty authority and lane-health policies intentionally disable the
+    # fence. Drop both triggers atomically only after configuration parsed
+    # successfully, preserving legacy raw-SQL compatibility for installations
+    # not opted in.
     try:
         conn.executescript(
             "BEGIN IMMEDIATE;"
@@ -8085,6 +8121,12 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_lane_ineligible: list[tuple[str, str, str]] = field(default_factory=list)
+    """Ready tasks fenced before claim as ``(task_id, assignee, reason)``.
+
+    This is a hard no-spawn outcome backed by the same assignment policy used
+    by typed APIs and SQLite triggers; reasons include the lane name so daemon
+    and CLI receipts are actionable without another board query."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -10216,13 +10258,28 @@ def record_respawn_guard_decision(
 
 
 def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
-    """Preserve the local-lineage profile predicate behind one dispatch hook."""
+    """Return whether an assignee names a concrete local worker profile.
+
+    ``default`` is the base control-plane profile, not a dispatcher worker.
+    Unknown profiles and partial installs fail closed so a typo or degraded
+    profile registry cannot fall through to a metered base-config process.
+    """
     if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        canonical = normalize_profile_name(assignee)
+    except Exception:
+        canonical = str(assignee).strip().casefold()
+        if not canonical:
+            return False
+    if canonical == "default":
         return False
     try:
         from hermes_cli.profiles import profile_exists
     except Exception:
-        return True
+        return False
     return bool(profile_exists(assignee))
 
 
@@ -10485,20 +10542,13 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Resolve through the same fail-closed predicate as explicit assignees.
+    # Bare ``default`` and missing profiles must never mint a base-config
+    # worker as an implicit fallback.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    _default_assignee_resolved = bool(
+        _default_assignee and _assignee_has_spawn_target(_default_assignee)
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
@@ -10578,6 +10628,36 @@ def _dispatch_once_locked(
                     dry_run=dry_run,
                 )
                 continue
+        candidate_task = get_task(conn, row["id"])
+        if candidate_task is None:
+            continue
+        lane_denial = _assignment_guard_reason(
+            conn,
+            title=candidate_task.title,
+            body=candidate_task.body,
+            assignee=row_assignee,
+            status="ready",
+            has_open_parent=_task_has_open_parent(conn, row["id"]),
+            task_id=row["id"],
+            old_title=candidate_task.title,
+            old_body=candidate_task.body,
+            old_assignee=candidate_task.assignee,
+            old_status=candidate_task.status,
+        )
+        if lane_denial:
+            result.skipped_lane_ineligible.append(
+                (row["id"], row_assignee, lane_denial)
+            )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="lane_ineligible",
+                detail={"assignee": row_assignee, "policy_reason": lane_denial},
+                dry_run=dry_run,
+            )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -10834,11 +10914,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_has_spawn_target(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
@@ -11279,6 +11355,11 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    if profile_arg == "default":
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no spawn target "
+            "(fail-closed; default never spawns a kanban worker)"
+        )
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -11301,12 +11382,11 @@ def _default_spawn(
     from hermes_cli.profiles import resolve_profile_env
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Kanban spawn refused: assignee profile {profile_arg!r} "
+            "is unresolvable"
+        ) from exc
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

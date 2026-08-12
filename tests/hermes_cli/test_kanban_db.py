@@ -998,6 +998,7 @@ class TestSharedBoardPaths:
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
+        (default_home / "profiles" / "coder").mkdir(parents=True)
 
         from gateway import session_context as sc
 
