@@ -142,12 +142,19 @@ class Client:
     # mutations
     def create_task(self, *, title, assignee=None, status="running", body=None,
                     created_by=None, priority=0, workspace_kind="scratch",
-                    id=None, op_id=None, idempotency_key=None):
+                    id=None, op_id=None, idempotency_key=None,
+                    session_id=None, worker_session_id=None):
+        # ``session_id`` (creator provenance) and ``worker_session_id``
+        # (executing worker's own session) must survive the boardd channel:
+        # anything not carried here is silently dropped on the live board
+        # even when the caller populated it (Symptom D).
         return self._request("create_task", {
             "title": title, "assignee": assignee, "status": status, "body": body,
             "created_by": created_by, "priority": priority,
             "workspace_kind": workspace_kind, "id": id,
-            "idempotency_key": idempotency_key}, mutation=True,
+            "idempotency_key": idempotency_key,
+            "session_id": session_id,
+            "worker_session_id": worker_session_id}, mutation=True,
             op_id=op_id)["result"]
 
     def add_comment(self, task_id, author, body, *, op_id=None):
@@ -192,6 +199,26 @@ class Client:
                 "StatusTransitionRejected",
             )
         return {"rowcount": 1, "status": status}
+
+    def set_worker_session(self, task_id, worker_session_id, *,
+                           claim_lock=None, op_id=None):
+        """Record the executing worker's session id on a running card.
+
+        Same single-writer shape as ``set_status``: execute the canonical
+        ``kanban_db.set_worker_session`` transaction over a BrokerConnection
+        instead of adding another boardd-native mutation that would fork the
+        write logic. ``op_id`` retained for source compatibility.
+        """
+        del op_id
+        from hermes_cli import boardd_shim, kanban_db
+
+        conn = boardd_shim.BrokerConnection(client=self)
+        try:
+            return kanban_db.set_worker_session(
+                conn, task_id, worker_session_id, claim_lock=claim_lock
+            )
+        finally:
+            conn.close()
 
     def heartbeat(self, task_id, note=None, *, op_id=None):
         return self._request("heartbeat", {"task_id": task_id, "note": note},

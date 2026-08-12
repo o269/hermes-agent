@@ -662,6 +662,20 @@ class AIAgent:
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+            return
+        # Kanban worker: now that this session's row exists, record its id on
+        # the card as ``worker_session_id`` so Desktop/TUI can open the LIVE
+        # worker session from the board (the sidebar deny-lists source=kanban,
+        # so without this pointer the running session is unreachable). Guarded
+        # by HERMES_KANBAN_TASK — non-worker sessions never touch the board.
+        # Best-effort by contract: the back-fill never raises.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                from hermes_cli.kanban_db import backfill_worker_session_from_env
+
+                backfill_worker_session_from_env(self.session_id)
+            except Exception:
+                logger.debug("worker_session back-fill failed", exc_info=True)
 
     def _transition_context_engine_session(
         self,

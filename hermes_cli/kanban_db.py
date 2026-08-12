@@ -1305,6 +1305,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Hermes session id of the EXECUTING worker for the current/most recent
+    -- run. Distinct from ``session_id`` (creator provenance, above): this is
+    -- the state.db session a Desktop/TUI client can actually open to watch
+    -- the worker. Back-filled by the worker itself on its first turn (see
+    -- run_agent._ensure_db_session) guarded by the claim lock, so a stale
+    -- retry can never overwrite the current attempt's session. NULL until
+    -- the worker's session row exists.
+    worker_session_id    TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2764,6 +2772,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    if "worker_session_id" not in cols:
+        # Executing worker's own state.db session id (distinct from the
+        # creator-provenance ``session_id``). NULL on legacy rows; back-filled
+        # per-attempt by the worker once its session row exists.
+        _add_column_if_missing(
+            conn, "tasks", "worker_session_id", "worker_session_id TEXT"
         )
 
     if "block_kind" not in cols:
@@ -4845,6 +4861,86 @@ def heartbeat_claim(
                     (expires, run_id),
                 )
             return True
+        return False
+
+
+def set_worker_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_session_id: str,
+    *,
+    claim_lock: Optional[str] = None,
+) -> bool:
+    """Record the EXECUTING worker's own state.db session id on the task.
+
+    Distinct from creator provenance (``tasks.session_id``): this is the
+    session a Desktop/TUI client opens to watch the worker live. Called by
+    the worker itself once its session row exists (first turn), so it is
+    per-attempt by construction.
+
+    When ``claim_lock`` is provided (the worker echoes back
+    ``HERMES_KANBAN_CLAIM_LOCK`` from its spawn env) the write is CAS-guarded
+    on it: a stale worker from a reclaimed attempt can never overwrite the
+    current attempt's session id. Without a lock the write still requires the
+    task to be ``running``. Returns True when a row was updated.
+    """
+    sid = str(worker_session_id or "").strip()
+    if not sid:
+        return False
+    with write_txn(conn):
+        if claim_lock:
+            cur = conn.execute(
+                "UPDATE tasks SET worker_session_id = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+                (sid, task_id, claim_lock),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET worker_session_id = ? "
+                "WHERE id = ? AND status = 'running'",
+                (sid, task_id),
+            )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "worker_session",
+            {"worker_session_id": sid},
+            run_id=_current_run_id(conn, task_id),
+        )
+        return True
+
+
+def backfill_worker_session_from_env(session_id: str) -> bool:
+    """Worker-side back-fill entry point (called from run_agent on the first
+    turn, right after the session row is created).
+
+    Reads the dispatcher-pinned env (``HERMES_KANBAN_TASK`` for the card,
+    ``HERMES_KANBAN_DB``/``HERMES_KANBAN_BOARD`` for board resolution via
+    :func:`connect`, ``HERMES_KANBAN_CLAIM_LOCK`` for the CAS guard) and
+    records ``session_id`` as the task's ``worker_session_id``. Returns True
+    on a successful write; False (never raises) otherwise — session creation
+    must not be breakable by board unavailability.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not session_id:
+        return False
+    try:
+        conn = connect()
+        try:
+            return set_worker_session(
+                conn,
+                task_id,
+                session_id,
+                claim_lock=(os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None),
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "worker_session back-fill failed for task %s", task_id, exc_info=True
+        )
         return False
 
 
