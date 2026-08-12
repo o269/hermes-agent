@@ -127,6 +127,49 @@ A read-only receipt check found the PR OPEN at that same head with live
 `reviewDecision: CHANGES_REQUESTED`. The mechanical bridge in this PR is what
 turns that proven manual delivery into repeatable card-to-review projection.
 
+## Trust boundary and operating model
+
+The kanban comment stream is **untrusted input**. `task_comments.author` is a
+caller-supplied label: any fleet seat running as the shared `odai` Unix user can
+claim another seat's name. The bridge's required `--require-authors` allowlist is
+defense in depth against accidental matches; it is not authentication and must
+never be represented as one.
+
+The only current hard authorization boundary is the sudo-gated launcher that
+reads `/etc/omnia-lander.pem` as root, constructs a short-lived `FVB_APP_JWT`
+inside the point-of-use process, and invokes `--apply`. The bridge verifies that
+JWT against `/app`, requires the code-pinned App identity `omnia-lander` / ID
+`4555281`, and only then mints the installation token named by
+`FVB_REVIEWER_INSTALLATION_ID`. `FVB_REVIEWER_APP_ID`, when supplied for launcher
+compatibility, must equal that pinned ID and cannot select a different trusted
+App. `--apply` now refuses to run without this verified-App-JWT launcher; a
+direct user token or pre-minted installation token may be used only for dry-run
+reads. The launcher must review the dry-run candidate set and its `BOARD FILTER
+WARNING` lines before applying it.
+
+Board-backed modes require an explicit reviewer-label allowlist, for example:
+
+```text
+scripts/fleet/fleet_verdict_bridge.py scan \
+  --repo o269/omnia \
+  --require-authors fable \
+  --require-authors security
+```
+
+Only review-shaped cards are eligible: `[REVIEW]` / `[SECURITY REVIEW]`, a title
+beginning with `REVIEW` / `RE-REVIEW`, or `R<number> REVIEW` variants. An
+ordinary author card that merely mentions PASS/FIX_REQUIRED/review in its prose
+is excluded. Excluded structured verdicts are emitted as dry-run warnings and
+become failing `review-required:rejected-board-verdict` projections rather than
+silently minting a successful gate.
+
+**Do not timer-mechanize `--apply`.** A cron/systemd timer would give
+unauthenticated, spoofable board labels automatic access to the App's review
+identity. Mechanized apply remains prohibited until verdict provenance is
+broker-enforced by boardd or carried in root-verified signed/artifact sidecars.
+Until then Fable/operator launches apply through sudo after inspecting dry-run
+output. This is the trust model, not a temporary documentation preference.
+
 The App JWT was verified against `/app`; installation ID `152840057` was used
 to mint the installation token for App ID `4555281` only after App ID/slug
 verification. The private key at `/etc/omnia-lander.pem` remained root-owned

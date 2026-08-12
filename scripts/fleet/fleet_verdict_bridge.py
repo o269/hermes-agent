@@ -3,7 +3,8 @@
 
 The command is dry-run by default. ``--apply`` is the only mode that writes to
 GitHub. Board access uses hermes_cli.kb_client (boardd); this module never opens
-kanban.db. Authentication is read by ``gh`` from ``GH_TOKEN`` at point of use.
+kanban.db. Dry-run reads use normal ``gh`` authentication; apply requires a
+sudo-gated, cryptographically verified ``FVB_APP_JWT`` launcher.
 
 A public GitHub review body is deliberately narrower than a private board
 comment. PASS emits "No blocking findings". A changes verdict must contain at
@@ -31,6 +32,8 @@ from typing import Any, Iterable, Sequence
 
 MARKER_VERSION = "fvb:v3"
 DEFAULT_CONTEXT = "fleet-review-gate"
+TRUSTED_REVIEWER_APP_ID = "4555281"
+TRUSTED_REVIEWER_APP_SLUG = "omnia-lander"
 PASS_TOKENS = frozenset({
     "APPROVE",
     "APPROVED",
@@ -68,12 +71,20 @@ VERDICT_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _TOKEN_ALTERNATION = "|".join(
-    sorted(PASS_TOKENS | CHANGES_TOKENS, key=len, reverse=True)
+    str(token) for token in sorted(PASS_TOKENS | CHANGES_TOKENS, key=len, reverse=True)
 )
 PLAIN_VERDICT_RE = re.compile(
     rf"^\s*(?:#{{1,6}}\s*)?(?:SECURITY\s+)?\*{{0,2}}"
     rf"({_TOKEN_ALTERNATION})\*{{0,2}}\s*(?=@|—|/|$)",
     re.IGNORECASE | re.MULTILINE,
+)
+REVIEW_TITLE_RE = re.compile(
+    r"^\s*(?:p\d+\s*[-—:]\s*)?"
+    r"(?:\[[^\]\r\n]{1,80}\]\s*)*"
+    r"(?:\[(?:SECURITY\s+)?REVIEW\]|"
+    r"(?:R\d+(?:\.\d+)?\s+)?"
+    r"(?:(?:SECURITY|INDEPENDENT)\s+)?(?:RE-?REVIEW|REVIEW)\b)",
+    re.IGNORECASE,
 )
 HEAD_RE = re.compile(
     r"(?:exact[-_ ]?head|head|commit|@)\s*[`:=#-]*\s*([0-9a-f]{7,40})\b",
@@ -195,21 +206,25 @@ def github_client_from_environment() -> GhClient:
     app_jwt = os.environ.get("FVB_APP_JWT")
     if not app_jwt:
         return GhClient()
-    expected_id = os.environ.get("FVB_REVIEWER_APP_ID")
+    configured_id = os.environ.get("FVB_REVIEWER_APP_ID")
     installation_id = os.environ.get("FVB_REVIEWER_INSTALLATION_ID")
-    if not expected_id or not installation_id:
+    if configured_id and configured_id != TRUSTED_REVIEWER_APP_ID:
         raise BridgeError(
-            "FVB_APP_JWT requires FVB_REVIEWER_APP_ID and FVB_REVIEWER_INSTALLATION_ID"
+            "configured reviewer App ID does not match the pinned omnia-lander App"
         )
+    if not installation_id:
+        raise BridgeError("FVB_APP_JWT requires FVB_REVIEWER_INSTALLATION_ID")
     app_client = GhClient(token=app_jwt)
     app = app_client.api("GET", "/app")
     if not isinstance(app, dict):
         raise BridgeError("GitHub returned no App identity")
     app_id = str(app.get("id") or "")
     slug = str(app.get("slug") or "")
-    if app_id != expected_id or not slug:
+    if app_id != TRUSTED_REVIEWER_APP_ID or slug != TRUSTED_REVIEWER_APP_SLUG:
         raise BridgeError(
-            f"App identity mismatch: expected id {expected_id}, received {app_id or 'none'}"
+            "App identity mismatch: expected "
+            f"{TRUSTED_REVIEWER_APP_SLUG} ({TRUSTED_REVIEWER_APP_ID}), received "
+            f"{slug or 'no-slug'} ({app_id or 'no-id'})"
         )
     minted = app_client.api(
         "POST", f"/app/installations/{installation_id}/access_tokens", {}
@@ -219,10 +234,36 @@ def github_client_from_environment() -> GhClient:
     return GhClient(token=str(minted["token"]), verified_login=f"{slug}[bot]")
 
 
-class BoardSource:
-    """Read verdicts through the boardd broker-backed client."""
+def _required_author_set(values: Sequence[str] | None) -> frozenset[str]:
+    """Normalize a repeatable/comma-separated defense-in-depth allowlist."""
+    return frozenset(
+        author.strip().casefold()
+        for value in values or ()
+        for author in value.split(",")
+        if author.strip()
+    )
 
-    def __init__(self, client: Any | None = None):
+
+def is_review_card_title(title: str) -> bool:
+    """Accept only titles that explicitly identify a review workflow card."""
+    return REVIEW_TITLE_RE.search(title) is not None
+
+
+class BoardSource:
+    """Read filtered verdicts through the boardd broker-backed client.
+
+    Board comment authors are caller-supplied strings, not authenticated
+    principals. ``required_authors`` is therefore defense in depth against
+    accidental matches, not a provenance boundary. Apply custody lives in the
+    root-gated, verified-App-JWT launcher.
+    """
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        required_authors: Sequence[str] | None = None,
+    ):
         if client is None:
             repo_root = Path(__file__).resolve().parents[2]
             if str(repo_root) not in sys.path:
@@ -231,8 +272,17 @@ class BoardSource:
 
             client = Client()
         self.client = client
+        self.required_authors = _required_author_set(required_authors)
+        self.warnings: list[str] = []
+        self.rejected_verdicts: list[Verdict] = []
 
     def verdicts(self) -> list[Verdict]:
+        if not self.required_authors:
+            raise BridgeError(
+                "board verdict reads require an explicit --require-authors allowlist"
+            )
+        self.warnings = []
+        self.rejected_verdicts = []
         try:
             rows = self.client.query(
                 """
@@ -256,16 +306,32 @@ class BoardSource:
             ) from exc
         parsed: list[Verdict] = []
         for row in rows:
+            author = str(row.get("author") or "unknown")
+            title = _decode_board_hex(row.get("title_hex"))
             verdict = parse_verdict(
                 card=str(row["task_id"]),
-                author=str(row.get("author") or "unknown"),
+                author=author,
                 created_at=_coerce_created_at(row["created_at"]),
                 comment=_decode_board_hex(row.get("comment_hex")),
-                title=_decode_board_hex(row.get("title_hex")),
+                title=title,
                 task_body=_decode_board_hex(row.get("task_hex")),
             )
-            if verdict is not None:
-                parsed.append(verdict)
+            if verdict is None:
+                continue
+            if not is_review_card_title(title):
+                self.rejected_verdicts.append(verdict)
+                self.warnings.append(
+                    f"card {verdict.card} ignored: title is not review-shaped"
+                )
+                continue
+            if author.casefold() not in self.required_authors:
+                self.rejected_verdicts.append(verdict)
+                self.warnings.append(
+                    f"card {verdict.card} ignored: comment author {author!r} "
+                    "is not in --require-authors"
+                )
+                continue
+            parsed.append(verdict)
         return parsed
 
 
@@ -883,11 +949,28 @@ def _manual_verdict(args: argparse.Namespace) -> Verdict:
     )
 
 
+def _emit_board_warnings(
+    board: Any,
+    *,
+    card: str | None = None,
+    emitted: set[str] | None = None,
+) -> None:
+    for warning in getattr(board, "warnings", ()):
+        if card is not None and not warning.startswith(f"card {card} "):
+            continue
+        if emitted is not None and warning in emitted:
+            continue
+        print(f"BOARD FILTER WARNING: {warning}", file=sys.stderr)
+        if emitted is not None:
+            emitted.add(warning)
+
+
 def cmd_post(args: argparse.Namespace, gh: GhClient, board: BoardSource | None) -> int:
     if args.card:
         if board is None:  # defensive; main constructs it for card mode
             raise BridgeError("board source unavailable for --card")
         verdicts = board.verdicts()
+        _emit_board_warnings(board, card=args.card)
         card_verdict = latest_by_card(verdicts).get(args.card)
         if card_verdict is None:
             raise BridgeError(f"no structured verdict found on card {args.card}")
@@ -928,13 +1011,20 @@ def cmd_scan(args: argparse.Namespace, gh: GhClient, board: BoardSource) -> int:
     since = since or 0
     verdicts = board.verdicts()
     current = latest_by_pr(verdicts)
-    ambiguous = latest_ambiguous_by_pr_number(verdicts)
+    rejected = latest_by_pr(getattr(board, "rejected_verdicts", ()))
+    ambiguous = latest_ambiguous_by_pr_number([
+        *verdicts,
+        *getattr(board, "rejected_verdicts", ()),
+    ])
+    observed_verdicts = [*verdicts, *getattr(board, "rejected_verdicts", ())]
     newest = max(
-        since, max((verdict.created_at for verdict in verdicts), default=since)
+        since,
+        max((verdict.created_at for verdict in observed_verdicts), default=since),
     )
     repositories = args.repo or ["o269/omnia"]
     patterns = tuple(args.sensitive_path or SENSITIVE_PATHS)
     had_errors = False
+    emitted_warnings: set[str] = set()
     for repo in repositories:
         try:
             open_prs = gh.pages(
@@ -947,11 +1037,30 @@ def cmd_scan(args: argparse.Namespace, gh: GhClient, board: BoardSource) -> int:
         for pr_data in open_prs:
             pr = int(pr_data["number"])
             verdict = current.get((repo.lower(), pr))
+            rejected_verdict = rejected.get((repo.lower(), pr))
             ambiguous_verdict = ambiguous.get(pr)
             board_blocker = None
+            if rejected_verdict is not None and (
+                verdict is None or rejected_verdict.created_at >= verdict.created_at
+            ):
+                _emit_board_warnings(
+                    board,
+                    card=rejected_verdict.card,
+                    emitted=emitted_warnings,
+                )
+                board_blocker = (
+                    "review-required:rejected-board-verdict "
+                    f"card={rejected_verdict.card} verdict={rejected_verdict.token}"
+                )
+                verdict = None
             if ambiguous_verdict is not None and (
                 verdict is None or ambiguous_verdict.created_at >= verdict.created_at
             ):
+                _emit_board_warnings(
+                    board,
+                    card=ambiguous_verdict.card,
+                    emitted=emitted_warnings,
+                )
                 board_blocker = (
                     "review-required:ambiguous-board-target "
                     f"card={ambiguous_verdict.card} verdict={ambiguous_verdict.token}"
@@ -1008,6 +1117,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("FVB_REVIEWER_LOGIN"),
         help="expected reviewer bot login; required for GitHub App installation tokens",
     )
+    common.add_argument(
+        "--require-authors",
+        action="append",
+        metavar="AUTHOR[,AUTHOR...]",
+        help=(
+            "required board-comment author allowlist (defense in depth only); "
+            "repeat or comma-separate values"
+        ),
+    )
     common.add_argument("--context", default=DEFAULT_CONTEXT)
     common.add_argument(
         "--sensitive-path",
@@ -1050,9 +1168,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "post" and not args.card:
         if not (args.repo and args.pr and args.verdict and args.head):
             parser.error("post requires --card or --repo/--pr/--verdict/--head")
+    board_mode = args.command == "scan" or bool(args.card)
+    if board_mode and not _required_author_set(args.require_authors):
+        parser.error("board modes require at least one --require-authors value")
     try:
+        if args.apply and not os.environ.get("FVB_APP_JWT"):
+            raise BridgeError(
+                "--apply requires the sudo-gated FVB_APP_JWT launcher; "
+                "direct user or installation tokens are read-only inputs"
+            )
         gh = github_client_from_environment()
-        board = BoardSource() if args.command == "scan" or args.card else None
+        board = (
+            BoardSource(required_authors=args.require_authors) if board_mode else None
+        )
         if args.command == "post":
             return cmd_post(args, gh, board)
         if board is None:  # defensive; scan always constructs it

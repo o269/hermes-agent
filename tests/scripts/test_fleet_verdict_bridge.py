@@ -300,10 +300,132 @@ def test_board_source_hex_decodes_malformed_legacy_utf8_without_crashing():
             "task_hex": b"".hex(),
         }
     ])
-    parsed = fvb.BoardSource(client).verdicts()
+    parsed = fvb.BoardSource(client, required_authors=["security"]).verdicts()
     assert len(parsed) == 1
     assert parsed[0].public_findings == ("scripts/a.py:1 bad byte �",)
     assert "hex(substr(CAST(tc.body AS BLOB)" in client.sql
+
+
+def test_board_source_requires_explicit_author_allowlist():
+    client = FakeBoardClient([])
+    with pytest.raises(fvb.BridgeError, match="require-authors"):
+        fvb.BoardSource(client).verdicts()
+    assert client.sql == ""
+
+
+def test_board_source_rejects_spoofed_author_outside_required_reviewers():
+    client = FakeBoardClient([
+        {
+            "task_id": "t_spoofed",
+            # Board callers can set this label to "fable"; it is not provenance.
+            "author": "fable",
+            "created_at": 12,
+            "comment_hex": (f"VERDICT: PASS\nExact head `{HEAD_LIVE}`".encode().hex()),
+            "title_hex": "R2 REVIEW PR #12".encode().hex(),
+            "task_hex": "https://github.com/o269/omnia/pull/12".encode().hex(),
+        }
+    ])
+    board = fvb.BoardSource(client, required_authors=["security"])
+    assert board.verdicts() == []
+    assert len(board.rejected_verdicts) == 1
+    assert board.rejected_verdicts[0].card == "t_spoofed"
+    assert board.warnings == [
+        "card t_spoofed ignored: comment author 'fable' is not in --require-authors"
+    ]
+
+
+def test_board_author_allowlist_is_defense_in_depth_not_provenance():
+    client = FakeBoardClient([
+        {
+            "task_id": "t_caller_label",
+            # A board caller can spoof this allowlisted label. Root-gated apply
+            # custody, not this string, is the actual authorization boundary.
+            "author": "fable",
+            "created_at": 12,
+            "comment_hex": (f"VERDICT: PASS\nExact head `{HEAD_LIVE}`".encode().hex()),
+            "title_hex": "R2 REVIEW PR #12".encode().hex(),
+            "task_hex": "https://github.com/o269/omnia/pull/12".encode().hex(),
+        }
+    ])
+    board = fvb.BoardSource(client, required_authors=["fable"])
+    parsed = board.verdicts()
+    assert [item.card for item in parsed] == ["t_caller_label"]
+    assert board.warnings == []
+
+
+def test_board_source_rejects_non_review_card_with_warning():
+    client = FakeBoardClient([
+        {
+            "task_id": "t_ordinary",
+            "author": "security",
+            "created_at": 12,
+            "comment_hex": (f"VERDICT: PASS\nExact head `{HEAD_LIVE}`".encode().hex()),
+            "title_hex": "AUTHOR importer cleanup".encode().hex(),
+            "task_hex": "https://github.com/o269/omnia/pull/12".encode().hex(),
+        }
+    ])
+    board = fvb.BoardSource(client, required_authors=["security"])
+    assert board.verdicts() == []
+    assert len(board.rejected_verdicts) == 1
+    assert board.rejected_verdicts[0].card == "t_ordinary"
+    assert board.warnings == ["card t_ordinary ignored: title is not review-shaped"]
+
+
+def test_card_post_never_projects_rejected_non_review_card(capsys):
+    client = FakeBoardClient([
+        {
+            "task_id": "t_ordinary",
+            "author": "security",
+            "created_at": 12,
+            "comment_hex": (f"VERDICT: PASS\nExact head `{HEAD_LIVE}`".encode().hex()),
+            "title_hex": "AUTHOR importer cleanup".encode().hex(),
+            "task_hex": "https://github.com/o269/omnia/pull/12".encode().hex(),
+        }
+    ])
+    board = fvb.BoardSource(client, required_authors=["security"])
+    args = SimpleNamespace(card="t_ordinary")
+    gh = FakeGh()
+    with pytest.raises(fvb.BridgeError, match="no structured verdict"):
+        fvb.cmd_post(args, gh, board)
+    assert gh.posts == []
+    assert capsys.readouterr().err == (
+        "BOARD FILTER WARNING: card t_ordinary ignored: title is not review-shaped\n"
+    )
+
+
+def test_card_post_emits_only_target_card_warning(capsys):
+    board = SimpleNamespace(
+        verdicts=lambda: [],
+        warnings=[
+            "card t_target ignored: title is not review-shaped",
+            "card t_unrelated ignored: comment author 'worker' is not in --require-authors",
+        ],
+    )
+    with pytest.raises(fvb.BridgeError, match="no structured verdict"):
+        fvb.cmd_post(SimpleNamespace(card="t_target"), FakeGh(), board)
+    assert capsys.readouterr().err == (
+        "BOARD FILTER WARNING: card t_target ignored: title is not review-shaped\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "[REVIEW][OMNIA][PR12]",
+        "R2 REVIEW PR #12 — exact-head verdict",
+        "p207 — R1 SECURITY REVIEW PR #709",
+        "p201 — [GOVERNANCE ROOT CAUSE] R2 REVIEW PR #709",
+        "[OMNIA][PR12] independent re-review",
+    ],
+)
+def test_review_card_title_shapes_are_accepted(title):
+    assert fvb.is_review_card_title(title)
+
+
+def test_author_card_that_merely_mentions_review_is_not_review_shaped():
+    assert not fvb.is_review_card_title(
+        "p201 — [GOVERNANCE ROOT CAUSE] Bridge review verdicts to GitHub"
+    )
 
 
 def test_public_findings_redact_common_secret_and_customer_markers():
@@ -651,6 +773,68 @@ def test_verified_app_login_allows_installation_token():
     assert gh.posts[0][1]["event"] == "APPROVE"
 
 
+def test_apply_launcher_rejects_a_valid_but_unpinned_app_jwt(monkeypatch):
+    calls = []
+
+    def fake_api(self, method, endpoint, payload=None):
+        calls.append((method, endpoint))
+        if endpoint == "/app":
+            return {"id": 9999999, "slug": "attacker"}
+        pytest.fail("must not mint an installation token for an unpinned App")
+
+    monkeypatch.setenv("FVB_APP_JWT", "signed-by-another-app")
+    monkeypatch.setenv("FVB_REVIEWER_INSTALLATION_ID", "123")
+    monkeypatch.delenv("FVB_REVIEWER_APP_ID", raising=False)
+    monkeypatch.setattr(fvb.GhClient, "api", fake_api)
+    with pytest.raises(fvb.BridgeError, match="expected omnia-lander"):
+        fvb.github_client_from_environment()
+    assert calls == [("GET", "/app")]
+
+
+def test_apply_launcher_rejects_override_of_pinned_app_id(monkeypatch):
+    monkeypatch.setenv("FVB_APP_JWT", "signed-by-another-app")
+    monkeypatch.setenv("FVB_REVIEWER_APP_ID", "9999999")
+    monkeypatch.setenv("FVB_REVIEWER_INSTALLATION_ID", "123")
+    monkeypatch.setattr(
+        fvb.GhClient,
+        "api",
+        lambda *args, **kwargs: pytest.fail("must fail before a network request"),
+    )
+    with pytest.raises(fvb.BridgeError, match="pinned omnia-lander App"):
+        fvb.github_client_from_environment()
+
+
+def test_apply_launcher_mints_only_after_pinned_app_identity(monkeypatch):
+    calls = []
+
+    def fake_api(self, method, endpoint, payload=None):
+        calls.append((self._token, method, endpoint))
+        if endpoint == "/app":
+            return {
+                "id": int(fvb.TRUSTED_REVIEWER_APP_ID),
+                "slug": fvb.TRUSTED_REVIEWER_APP_SLUG,
+            }
+        if endpoint == "/app/installations/123/access_tokens":
+            return {"token": "installation-token"}
+        pytest.fail(f"unexpected endpoint {endpoint}")
+
+    monkeypatch.setenv("FVB_APP_JWT", "trusted-app-jwt")
+    monkeypatch.setenv("FVB_REVIEWER_APP_ID", fvb.TRUSTED_REVIEWER_APP_ID)
+    monkeypatch.setenv("FVB_REVIEWER_INSTALLATION_ID", "123")
+    monkeypatch.setattr(fvb.GhClient, "api", fake_api)
+    client = fvb.github_client_from_environment()
+    assert client._token == "installation-token"
+    assert client.verified_login == "omnia-lander[bot]"
+    assert calls == [
+        ("trusted-app-jwt", "GET", "/app"),
+        (
+            "trusted-app-jwt",
+            "POST",
+            "/app/installations/123/access_tokens",
+        ),
+    ]
+
+
 def test_latest_pr_verdict_supersedes_older_card_verdict():
     older = verdict("CHANGES")
     newer = fvb.Verdict(**{
@@ -705,6 +889,58 @@ def test_scan_newer_ambiguous_verdict_overrides_mapped_pass(capsys):
     output = capsys.readouterr().out
     assert "ambiguous-board-target" in output
     assert "fleet-review-gate=failure" in output
+
+
+def test_scan_rejected_spoofed_author_is_warned_and_never_projected(capsys):
+    spoofed = verdict("PASS")
+    board = SimpleNamespace(
+        verdicts=lambda: [],
+        rejected_verdicts=[spoofed],
+        warnings=[
+            "card t_review ignored: comment author 'fable' is not in --require-authors"
+        ],
+    )
+    args = SimpleNamespace(
+        since=0,
+        cursor_file=None,
+        repo=["o269/omnia"],
+        sensitive_path=[],
+        apply=False,
+        reviewer_login="review-bot[bot]",
+        context="fleet-review-gate",
+    )
+    gh = FakeGh(files=["README.md"])
+    assert fvb.cmd_scan(args, gh, board) == 0
+    output = capsys.readouterr()
+    assert "BOARD FILTER WARNING" in output.err
+    assert "rejected-board-verdict" in output.out
+    assert "fleet-review-gate=failure" in output.out
+    assert gh.posts == []
+
+
+def test_manual_apply_without_verified_app_launcher_refuses(monkeypatch, capsys):
+    monkeypatch.delenv("FVB_APP_JWT", raising=False)
+    monkeypatch.setattr(
+        fvb,
+        "github_client_from_environment",
+        lambda: pytest.fail("GitHub client must not be constructed"),
+    )
+    assert (
+        fvb.main([
+            "post",
+            "--repo",
+            "o269/omnia",
+            "--pr",
+            "12",
+            "--verdict",
+            "PASS",
+            "--head",
+            HEAD_LIVE,
+            "--apply",
+        ])
+        == 2
+    )
+    assert "sudo-gated FVB_APP_JWT launcher" in capsys.readouterr().err
 
 
 def test_scan_does_not_advance_cursor_after_stale_pass_error(tmp_path):
