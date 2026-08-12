@@ -3175,6 +3175,25 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _claim_lock_is_local(claim_lock: Optional[str]) -> bool:
+    """Return whether ``claim_lock`` names a worker on this host.
+
+    Direct SQLite claims use ``worker-host:pid``. Brokered fleet claims are
+    namespaced as ``broker-host:worker-host:pid`` (and may gain more prefixes),
+    so the worker host is always the component immediately before the final
+    process identifier. Comparing the leftmost component makes every worker
+    connected through the local broker look host-local and lets this host reap
+    a live remote PID by number coincidence or absence.
+    """
+    if not claim_lock:
+        return False
+    parts = str(claim_lock).rsplit(":", 2)
+    if len(parts) < 2 or not parts[-2]:
+        return False
+    local_host = _claimer_id().split(":", 1)[0]
+    return parts[-2] == local_host
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -4861,7 +4880,6 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
@@ -4871,7 +4889,7 @@ def release_stale_claims(
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
-        host_local = lock.startswith(host_prefix)
+        host_local = _claim_lock_is_local(lock)
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -7822,8 +7840,7 @@ def _terminate_reclaimed_worker(
     if not pid or pid <= 0 or not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if not _claim_lock_is_local(claim_lock):
         return info
     info["host_local"] = True
 
@@ -7993,7 +8010,6 @@ def enforce_max_runtime(
     import signal
     timed_out: list[str] = []
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
@@ -8006,8 +8022,7 @@ def enforce_max_runtime(
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
-        lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _claim_lock_is_local(row["claim_lock"]):
             continue
         # Runtime is per attempt, not lifetime-of-task. ``tasks.started_at``
         # intentionally records the first time a task ever started, so retries
@@ -8347,11 +8362,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
-            # Only check liveness for claims owned by this host.
+            # Only check liveness for claims owned by this host —
+            # host-aware via the claim lock's worker-host component (#65),
+            # NOT left-prefix matching (which treated every brokered claim
+            # as local and let this host reap live remote workers).
             lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+            if not _claim_lock_is_local(lock):
                 continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID

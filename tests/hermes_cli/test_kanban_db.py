@@ -178,6 +178,136 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
 
+def test_claim_once_wins_second_loses(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        first = kb.claim_task(conn, t, claimer="host:1")
+        assert first is not None and first.status == "running"
+        second = kb.claim_task(conn, t, claimer="host:2")
+        assert second is None
+
+
+def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t, claimer="host:1")
+        expires = kb.get_task(conn, t).claim_expires
+    assert expires is not None
+    assert expires > int(time.time()) + 3000
+
+
+def test_claim_lock_locality_uses_worker_host_not_broker_prefix(monkeypatch):
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "host-b:9000")
+
+    assert kb._claim_lock_is_local("host-b:123") is True
+    assert kb._claim_lock_is_local("host-b:host-b:123") is True
+    assert kb._claim_lock_is_local("host-b:host-a:123") is False
+    assert kb._claim_lock_is_local("broker:host-a:123") is False
+    assert kb._claim_lock_is_local("seat-sticky") is False
+    assert kb._claim_lock_is_local(None) is False
+
+
+def test_detect_crashed_workers_never_probes_remote_host_pid(
+    kanban_home, monkeypatch,
+):
+    """Host B must not reclaim host A through a host-B broker prefix."""
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "host-b:9000")
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    def fail_remote_probe(*_args, **_kwargs):
+        raise AssertionError("remote worker PID was probed in the local process table")
+
+    monkeypatch.setattr(kb, "_pid_alive", fail_remote_probe)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="remote worker", assignee="worker-a")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="host-b:host-a:4321",
+        ) is not None
+        kb._set_worker_pid(conn, task_id, 987654)
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        kinds = [event.kind for event in kb.list_events(conn, task_id)]
+        assert "crashed" not in kinds
+
+
+def test_release_stale_remote_claim_uses_expiry_not_local_pid_probe(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "host-b:9000")
+
+    def fail_remote_probe(*_args, **_kwargs):
+        raise AssertionError("remote worker PID was probed in the local process table")
+
+    monkeypatch.setattr(kb, "_pid_alive", fail_remote_probe)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="expired remote", assignee="worker-a")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="host-b:host-a:4321",
+        ) is not None
+        kb._set_worker_pid(conn, task_id, 987654)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (int(time.time()) - 1, task_id),
+            )
+
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_remote_stale_heartbeat_reclaims_without_local_pid_probe(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "host-b:9000")
+
+    def fail_remote_probe(*_args, **_kwargs):
+        raise AssertionError("remote worker PID was probed in the local process table")
+
+    monkeypatch.setattr(kb, "_pid_alive", fail_remote_probe)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale remote", assignee="worker-a")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="host-b:host-a:4321",
+        ) is not None
+        kb._set_worker_pid(conn, task_id, 987654)
+        old = int(time.time()) - kb._STALE_HEARTBEAT_GAP_SECONDS - 10
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                (old, old, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old, task_id),
+            )
+
+        assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_claim_fails_on_non_ready(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        # Move to todo by introducing an unsatisfied parent.
+        p = kb.create_task(conn, title="p")
+        kb.link_tasks(conn, p, t)
+        assert kb.get_task(conn, t).status == "todo"
+        assert kb.claim_task(conn, t) is None
 
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
