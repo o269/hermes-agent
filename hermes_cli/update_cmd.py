@@ -1072,7 +1072,62 @@ def _update_via_zip(args):
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
 
+def _fleet_branch_guard(git_cmd: list[str], cwd: Path) -> None:
+    """Abort an update that would move this checkout off a non-default branch.
+
+    ── Added 2026-08-11 by Fable after TWO live incidents nine minutes apart ──
+
+    ``hermes update`` defaults to branch "main" (see ``_cmd_update_check``,
+    ``branch: str = "main"``) REGARDLESS of the branch the checkout is on. On the
+    fleet host this tree runs on ``broker-cutover-20260805``; boardd and the CLI
+    live on two diverged branches, so a silent checkout of main is not an update,
+    it is an unplanned migration.
+
+    2026-08-11T04:40:00Z  update ran -> autostashed live edits, checked out main,
+                          fast-forwarded. ``hermes kanban`` immediately failed rc=1:
+                          main's boardd shim tried to open the fleet kanban.db
+                          directly, a path that is read-only for this user. The board
+                          went unreadable with 9 worker seats live.
+    2026-08-11T04:49:14Z  it happened AGAIN, re-stashing the just-restored edits.
+
+    Both times the working tree was recovered byte-identical from
+    ~/godmode-bus/backups/hermes-agent-uncommitted-20260811T0430Z.patch — but only
+    because a backup happened to exist.
+
+    This guard lives here, not in the ``~/.local/bin/hermes`` wrapper, because a
+    caller invoking ``venv/bin/hermes`` directly bypasses that wrapper entirely.
+    ``_stash_local_changes_if_needed`` is the last common chokepoint before anything
+    destructive happens on EVERY invocation path.
+
+    Deliberate override (Fable only, and only with the two-tree cutover plan in
+    hand):  HERMES_ALLOW_UPDATE=1 hermes update
+    """
+    if os.environ.get("HERMES_ALLOW_UPDATE") == "1":
+        return
+    branch = subprocess.run(
+        git_cmd + ["branch", "--show-current"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    # Empty branch = detached HEAD; leave that case to the normal code path.
+    if not branch or branch == "main":
+        return
+    raise SystemExit(
+        f"\n🔴 hermes update BLOCKED — this checkout is on '{branch}', not 'main'.\n\n"
+        f"  checkout: {cwd}\n\n"
+        "'hermes update' targets 'main' by default and would check it out, moving this\n"
+        "tree off the branch that runs the live fleet. That happened twice on\n"
+        "2026-08-11 (04:40:00Z and 04:49:14Z) and made the kanban board unreadable\n"
+        "while worker seats were live.\n\n"
+        "If you are a worker seat: you do not need this command. Do not use it.\n"
+        "If you are Fable and genuinely intend a branch move, get the cutover plan\n"
+        "first, then re-run with HERMES_ALLOW_UPDATE=1.\n"
+    )
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    _fleet_branch_guard(git_cmd, cwd)
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,

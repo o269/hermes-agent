@@ -184,6 +184,11 @@ def _iter_terminal_calls(
                     args = json.loads(fn.get("arguments") or "{}")
                 except (TypeError, ValueError):
                     continue
+                # json.loads succeeds on a double-encoded arguments field and
+                # returns a str (or list/int) rather than a dict. Without this
+                # guard a single such row aborts the entire scan.
+                if not isinstance(args, dict):
+                    continue
                 command = args.get("command")
                 if isinstance(command, str) and command.strip():
                     yield (call.get("id") or "", command)

@@ -78,6 +78,52 @@ def test_read_your_writes(db):
 
 
 
+@pytest.mark.requires_wal
+def test_dead_thread_read_conns_are_pruned(db):
+    """Short-lived reader threads must not leave fds in _read_conns forever.
+
+    The dashboard/TUI gateway keeps one long-lived SessionDB; without pruning,
+    every ephemeral worker thread that touches a recall/browse path leaked a
+    mode=ro connection (state.db + state.db-wal fds) until process exit.
+    """
+    opened = []
+    barrier = threading.Barrier(9)  # 8 workers + main release
+
+    def worker():
+        c = db._get_read_conn()
+        opened.append(c)
+        barrier.wait(timeout=5.0)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    barrier.wait(timeout=5.0)
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    assert len(opened) == 8
+    assert all(c is not None for c in opened)
+    # Connections stay registered until a subsequent open triggers prune.
+    assert len(db._read_conns) >= 8
+
+    # A new open on this thread must prune the 8 dead owners.
+    survivors_before = len(db._read_conns)
+    mine = db._get_read_conn()
+    assert mine is not None
+    # Dead owners closed; only live-thread conns remain (at least `mine`).
+    assert len(db._read_conns) < survivors_before
+    assert mine in db._read_conns
+    # Every surviving owner must still be alive.
+    for owner, conn in db._read_conn_owners:
+        assert owner.is_alive(), "pruned list still holds a dead thread"
+        assert conn in db._read_conns
+    # Closed connections must not remain in the strong set.
+    for c in opened:
+        if c is not mine:
+            assert c not in db._read_conns
+
+
 def test_non_wal_uses_locked_path(db):
     db._wal_active = False
     assert db._get_read_conn() is None

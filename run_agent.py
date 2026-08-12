@@ -2218,6 +2218,30 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                # Defence-in-depth: redact credentials before durable transcript
+                # writes. Mirrors _save_session_log (#19798, #19845) — the SQLite
+                # store is canonical and must not retain plaintext PATs/tokens
+                # that leaked through tool output or user paste.
+                content = self._redact_message_content(content)
+                if isinstance(_row_api_content, str):
+                    _row_api_content = redact_sensitive_text(_row_api_content)
+                if tool_calls_data:
+                    _redacted_calls = []
+                    for _tc in tool_calls_data:
+                        if not isinstance(_tc, dict):
+                            _redacted_calls.append(_tc)
+                            continue
+                        _tc = dict(_tc)
+                        if isinstance(_tc.get("arguments"), str):
+                            _tc["arguments"] = redact_sensitive_text(_tc["arguments"])
+                        _redacted_calls.append(_tc)
+                    tool_calls_data = _redacted_calls
+                _row_reasoning = msg.get("reasoning")
+                if isinstance(_row_reasoning, str):
+                    _row_reasoning = redact_sensitive_text(_row_reasoning)
+                _row_reasoning_content = msg.get("reasoning_content")
+                if isinstance(_row_reasoning_content, str):
+                    _row_reasoning_content = redact_sensitive_text(_row_reasoning_content)
                 _batch_rows.append({
                     "role": role,
                     "content": content,
@@ -2227,8 +2251,8 @@ class AIAgent:
                     "finish_reason": msg.get("finish_reason"),
                     # Reasoning/codex fields are role-gated (assistant-only)
                     # inside _insert_message_rows — pass through untouched.
-                    "reasoning": msg.get("reasoning"),
-                    "reasoning_content": msg.get("reasoning_content"),
+                    "reasoning": _row_reasoning,
+                    "reasoning_content": _row_reasoning_content,
                     "reasoning_details": msg.get("reasoning_details"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
