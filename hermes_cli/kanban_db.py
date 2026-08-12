@@ -3734,7 +3734,29 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def _assignment_actor(actor: Optional[str]) -> str:
+    """Return non-empty provenance for an assignment event.
+
+    Explicit caller attribution wins. Direct library callers that do not yet
+    pass it retain profile-level provenance when available, and otherwise get
+    an auditable ``unknown`` marker rather than a silent blank.
+    """
+    explicit = (actor or "").strip()
+    if explicit:
+        return explicit
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile:
+        return f"profile:{profile}"
+    return "unknown"
+
+
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3763,7 +3785,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        _append_event(
+            conn,
+            task_id,
+            "assigned",
+            {"assignee": profile, "actor": _assignment_actor(actor)},
+        )
         return True
 
 
@@ -5069,6 +5096,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    actor: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -5086,7 +5114,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, actor=actor)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
