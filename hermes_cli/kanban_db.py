@@ -9294,7 +9294,7 @@ def _operator_gateway_lock_owned(authority_root: Path) -> bool:
 
 def _continuation_operator_profiles(authority_root: Path) -> tuple[str, ...]:
     """Read the operator allowlist from the board's real Hermes root."""
-    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG, read_user_config_raw
 
     default = DEFAULT_CONFIG.get("kanban", {}).get(
         "continuation_operator_profiles", "default"
@@ -9303,9 +9303,7 @@ def _continuation_operator_profiles(authority_root: Path) -> tuple[str, ...]:
     config_path = authority_root / "config.yaml"
     if config_path.is_file():
         try:
-            import yaml
-
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data = read_user_config_raw(config_path)
             raw = (data.get("kanban") or {}).get(
                 "continuation_operator_profiles", default
             )
