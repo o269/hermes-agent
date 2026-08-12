@@ -209,6 +209,7 @@ print(json.dumps({
     return json.loads(result.stdout)
 
 
+@pytest.mark.live_system_guard_bypass  # terminates only its pytest-owned boardd child
 def test_dashboard_boardd_e2e_uses_private_namespace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
