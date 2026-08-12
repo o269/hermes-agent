@@ -3207,6 +3207,17 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_title_for_dedup(title: str) -> str:
+    """Canonical title form for open-duplicate comparison.
+
+    Casefolded with all whitespace runs collapsed, so ``"Fix login"``,
+    ``"fix  login"`` and ``"FIX LOGIN\n"`` all compare equal. Deliberately
+    conservative beyond that — no stemming or punctuation stripping — so
+    genuinely different work never false-merges.
+    """
+    return " ".join(str(title).casefold().split())
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3235,6 +3246,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    allow_open_duplicate: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3248,6 +3260,19 @@ def create_task(
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
     should not double-write.
+
+    Open-duplicate fence (default on): when a task with the same
+    normalized title (casefolded, whitespace collapsed) already exists in
+    a non-terminal status (anything but ``done``/``archived``), returns
+    the existing task's id instead of minting a duplicate card, and
+    appends a ``duplicate_open_task`` event to the existing task so the
+    suppressed mint is auditable. This stops the recurring "board mints a
+    second card for work that is already open" failure across every create
+    surface (CLI, agent tool, dashboard, swarm, decompose fan-out), which
+    all funnel through this function. Terminal tasks do not block
+    re-creation: re-opening finished work under the same title is
+    legitimate. Pass ``allow_open_duplicate=True`` to opt out for the rare
+    caller that genuinely wants a second open card with the same title.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3487,6 +3512,31 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Open-duplicate fence (see docstring). Runs inside the write
+                # txn so a concurrent creator cannot slip a same-title insert
+                # between our lookup and our own INSERT — the race the
+                # idempotency-key fast path above deliberately accepts. A
+                # non-terminal match returns the existing id and is recorded
+                # on the EXISTING task so the suppressed mint stays visible.
+                if not allow_open_duplicate:
+                    norm_title = _normalize_title_for_dedup(title)
+                    for dup in conn.execute(
+                        "SELECT id, title FROM tasks "
+                        "WHERE status NOT IN ('done', 'archived') "
+                        "ORDER BY created_at DESC"
+                    ):
+                        if _normalize_title_for_dedup(dup["title"] or "") == norm_title:
+                            _append_event(
+                                conn,
+                                dup["id"],
+                                "duplicate_open_task",
+                                {
+                                    "attempted_title": title.strip(),
+                                    "created_by": created_by,
+                                    "matched_task_id": dup["id"],
+                                },
+                            )
+                            return dup["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
