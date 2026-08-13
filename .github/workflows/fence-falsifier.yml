@@ -1,0 +1,69 @@
+name: Fence falsifier
+
+# Runs the must-fire falsifier harness (tests/fences/) as its own named check.
+#
+# Why a dedicated job rather than leaning on the sliced `tests` lane: this
+# suite answers a different question from the rest of the suite. Every other
+# test asks "does the code do X?"; this one asks "would we notice if the guard
+# stopped existing?" — it ablates each registered fence and asserts the
+# fixtures go RED, so an always-green fixture is a hard failure instead of a
+# silent pass. Giving it its own required check means a PR that deletes a fence
+# names the fence it deleted in the check title, rather than surfacing as one
+# red file inside a 1/8 slice.
+#
+# The suite is also collected by the normal sliced run (testpaths = tests);
+# that duplication is deliberate and costs seconds.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fence-falsifier-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  falsify:
+    name: Ablate every registered fence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pinned for the same reason as tests.yml: unpinned, setup-uv
+          # resolves "latest" from a raw.githubusercontent.com manifest on
+          # every job and a transient fetch failure fails the job.
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run fence falsifiers
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/fences -v --no-header
+        env:
+          # Same hermetic guard as tests.yml — no real API calls.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""

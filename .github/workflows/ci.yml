@@ -73,6 +73,14 @@ jobs:
     with:
       slice_count: 8
 
+  fence-falsifier:
+    name: Fence falsifier
+    needs: detect
+    # Same lane as `tests`: any Python change can delete a fence or rot a
+    # fixture into always-green, and both are what this suite exists to catch.
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/fence-falsifier.yml
+
   lint:
     name: Python lints
     needs: detect
@@ -273,6 +281,7 @@ jobs:
     needs:
       - detect
       - tests
+      - fence-falsifier
       - lint
       - js-tests
       - e2e-desktop
