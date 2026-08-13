@@ -211,6 +211,83 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5006, str(e))
 
 
+@method("session.for_task")
+def _(rid, params: dict) -> dict:
+    """Resolve a kanban card to its EXECUTING worker's openable session.
+
+    The sidebar deliberately deny-lists ``source=kanban`` rows in
+    ``session.list``, so a dispatcher worker's live session is invisible
+    there BY DESIGN (it is not a conversation the user started). This is
+    the kanban-aware open path instead: given a card id, return the
+    worker's session id + owning profile so a client can call
+    ``session.resume`` (which has no source filter) and watch the worker
+    live. Choosing a dedicated resolver over lifting the deny-list keeps
+    the resume picker clean while making every running card clickable.
+
+    Contract: ``{"session_id": null, "reason": ...}`` when the card has no
+    recorded worker session yet (pre-first-turn, legacy rows, or a crashed
+    worker that never created one).
+    """
+    task_id = str(params.get("task_id") or "").strip()
+    if not task_id:
+        return _err(rid, 4006, "task_id required")
+    board = str(params.get("board") or "").strip() or None
+    try:
+        from hermes_cli import kanban_db as _kdb
+
+        conn = _kdb.connect(board=board)
+        try:
+            row = conn.execute(
+                "SELECT worker_session_id, assignee, status, claim_lock "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        return _err(rid, 5006, f"board unavailable: {e}")
+    if row is None:
+        return _err(rid, 4004, f"unknown task {task_id}")
+    wsid = (row["worker_session_id"] or "").strip() or None
+    profile = (row["assignee"] or "").strip() or None
+    if not wsid:
+        return _ok(
+            rid,
+            {
+                "session_id": None,
+                "profile": profile,
+                "task_status": row["status"],
+                "reason": "no worker session recorded for this card yet",
+            },
+        )
+    # Existence probe in the owning profile's state.db so the client can
+    # distinguish "openable now" from "recorded but transcript unavailable
+    # on this host" (worker ran elsewhere / profile state.db missing).
+    openable = False
+    try:
+        profile_home = _profile_home(profile)
+        if profile_home is not None:
+            from hermes_state import SessionDB
+
+            _db = SessionDB(db_path=profile_home / "state.db")
+        else:
+            _db = _get_db()
+        if _db is not None and _db.get_session(wsid):
+            openable = True
+    except Exception:
+        openable = False
+    return _ok(
+        rid,
+        {
+            "session_id": wsid,
+            "profile": profile,
+            "task_status": row["status"],
+            "claim_lock": row["claim_lock"],
+            "openable": openable,
+        },
+    )
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.

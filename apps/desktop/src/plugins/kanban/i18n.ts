@@ -162,6 +162,10 @@ type KanbanMessages = {
   deleteTask: string
   close: string
   working: string
+  watchWorker: string
+  workerNotReady: (reason: string) => string
+  workerNotOnHost: string
+  workerOpenFailed: (message: string) => string
   // board switcher
   board: string
   newBoard: string
@@ -354,6 +358,11 @@ const en: KanbanMessages = {
   deleteTask: 'Delete task',
   close: 'Close',
   working: 'working',
+  watchWorker: 'Watch worker',
+  workerNotReady: reason =>
+    reason ? `Worker session not ready yet — ${reason}` : 'Worker session not ready yet',
+  workerNotOnHost: 'Worker transcript is not available on this machine',
+  workerOpenFailed: message => `Could not open worker session — ${message}`,
   board: 'Board',
   newBoard: 'New board',
   newBoardDots: 'New board…',
@@ -545,6 +554,11 @@ const ja: KanbanMessages = {
   deleteTask: 'タスクを削除',
   close: '閉じる',
   working: '作業中',
+  watchWorker: 'ワーカーを見る',
+  workerNotReady: reason =>
+    reason ? `ワーカーセッションはまだ準備できていません — ${reason}` : 'ワーカーセッションはまだ準備できていません',
+  workerNotOnHost: 'このマシンではワーカーのトランスクリプトを利用できません',
+  workerOpenFailed: message => `ワーカーセッションを開けませんでした — ${message}`,
   board: 'ボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
@@ -734,6 +748,11 @@ const zh: KanbanMessages = {
   deleteTask: '删除任务',
   close: '关闭',
   working: '进行中',
+  watchWorker: '查看工作单元',
+  workerNotReady: reason =>
+    reason ? `工作单元会话尚未就绪 — ${reason}` : '工作单元会话尚未就绪',
+  workerNotOnHost: '此机器上无法查看工作单元对话记录',
+  workerOpenFailed: message => `无法打开工作单元会话 — ${message}`,
   board: '面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
@@ -922,6 +941,11 @@ const zhHant: KanbanMessages = {
   deleteTask: '刪除任務',
   close: '關閉',
   working: '進行中',
+  watchWorker: '查看工作單元',
+  workerNotReady: reason =>
+    reason ? `工作單元工作階段尚未就緒 — ${reason}` : '工作單元工作階段尚未就緒',
+  workerNotOnHost: '此機器上無法查看工作單元對話記錄',
+  workerOpenFailed: message => `無法開啟工作單元工作階段 — ${message}`,
   board: '面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
