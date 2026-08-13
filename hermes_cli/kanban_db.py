@@ -88,7 +88,7 @@ import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 from hermes_cli.kanban_assignment_policy import (
     LaneEligibilityPolicy,
@@ -3503,6 +3503,126 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_task_title(title: str) -> str:
+    """Return the conservative identity form used by create de-duplication.
+
+    NFKC folds compatibility-equivalent Unicode, whitespace runs collapse, and
+    case differences disappear. Punctuation and control tags stay significant,
+    so ``[REVIEW] Fix X`` and ``[LAND] Fix X`` remain different work.
+    """
+    normalized = unicodedata.normalize("NFKC", str(title or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+def _normalize_task_scope(
+    *,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return the board-local scope paired with a normalized title.
+
+    Tenant + dependency-parent set identify the workflow namespace. A
+    first-class project is the location scope; otherwise workspace kind/path
+    are. Creator, assignee, body, status, priority, session, and idempotency key
+    are deliberately excluded so cross-creator retries cannot re-mint work.
+    """
+    tenant_scope = str(tenant).strip() if tenant is not None else ""
+    parent_scope = tuple(sorted({str(parent).strip() for parent in parents if parent}))
+    if project_id:
+        location_scope = ("project", str(project_id).strip())
+    else:
+        normalized_path = ""
+        if workspace_path:
+            normalized_path = os.path.normpath(str(workspace_path).strip())
+        location_scope = (
+            "workspace",
+            str(workspace_kind or "scratch").strip().casefold(),
+            normalized_path,
+        )
+    return tenant_scope, parent_scope, location_scope
+
+
+def _find_open_title_scope_duplicate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[Optional[str], tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Return the oldest open task with the same normalized title + scope."""
+    normalized_title = _normalize_task_title(title)
+    target_scope = _normalize_task_scope(
+        tenant=tenant,
+        parents=parents,
+        project_id=project_id,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    rows = conn.execute(
+        "SELECT id, title, tenant, project_id, workspace_kind, workspace_path "
+        "FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        if _normalize_task_title(row["title"] or "") != normalized_title:
+            continue
+        parent_rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (row["id"],),
+        ).fetchall()
+        candidate_scope = _normalize_task_scope(
+            tenant=row["tenant"],
+            parents=(parent["parent_id"] for parent in parent_rows),
+            project_id=row["project_id"],
+            workspace_kind=row["workspace_kind"] or "scratch",
+            workspace_path=row["workspace_path"],
+        )
+        if candidate_scope == target_scope:
+            return str(row["id"]), target_scope
+    return None, target_scope
+
+
+def _record_create_dedup(
+    conn: sqlite3.Connection,
+    *,
+    existing_task_id: str,
+    reason: str,
+    title: str,
+    scope: tuple[str, tuple[str, ...], tuple[str, ...]],
+    attempted_by: Optional[str],
+    idempotency_key_supplied: bool,
+) -> None:
+    """Durably expose every suppressed create re-mint on the existing card."""
+    tenant_scope, parent_scope, location_scope = scope
+    payload = {
+        "existing_task_id": existing_task_id,
+        "reason": reason,
+        "normalized_title": _normalize_task_title(title),
+        "scope": {
+            "tenant": tenant_scope,
+            "parents": list(parent_scope),
+            "location": list(location_scope),
+        },
+        "attempted_by": attempted_by,
+        "idempotency_key_supplied": idempotency_key_supplied,
+    }
+    _append_event(conn, existing_task_id, "create_deduplicated", payload)
+    _log.warning(
+        "kanban create re-mint suppressed existing_task_id=%s reason=%s "
+        "normalized_title=%r scope=%r",
+        existing_task_id,
+        reason,
+        payload["normalized_title"],
+        payload["scope"],
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3542,8 +3662,10 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate. Independently, an open task with the same
+    conservative normalized title + scope (board, tenant, parent set, and
+    project/workspace identity) wins even when the retry supplies a fresh key.
+    Both paths append ``create_deduplicated`` to the existing task timeline.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3741,21 +3863,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3783,6 +3890,59 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Both idempotency-key and title+scope checks live under the
+                # same BEGIN IMMEDIATE as the insert. Concurrent creators can
+                # no longer both observe absence and mint two open cards.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        existing_id = str(row["id"])
+                        _, scope = _find_open_title_scope_duplicate(
+                            conn,
+                            title=title,
+                            tenant=tenant,
+                            parents=parents,
+                            project_id=project_id,
+                            workspace_kind=workspace_kind,
+                            workspace_path=workspace_path,
+                        )
+                        _record_create_dedup(
+                            conn,
+                            existing_task_id=existing_id,
+                            reason="idempotency_key",
+                            title=title,
+                            scope=scope,
+                            attempted_by=created_by,
+                            idempotency_key_supplied=True,
+                        )
+                        return existing_id
+
+                duplicate_id, scope = _find_open_title_scope_duplicate(
+                    conn,
+                    title=title,
+                    tenant=tenant,
+                    parents=parents,
+                    project_id=project_id,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                )
+                if duplicate_id is not None:
+                    _record_create_dedup(
+                        conn,
+                        existing_task_id=duplicate_id,
+                        reason="normalized_title_scope",
+                        title=title,
+                        scope=scope,
+                        attempted_by=created_by,
+                        idempotency_key_supplied=bool(idempotency_key),
+                    )
+                    return duplicate_id
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4979,20 +5139,29 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     # Active-PR custody blocks ordinary claims. A valid owner-bound Fable marker
     # opens exactly one claim and is consumed atomically with the new run.
+    prelock_pr_states: dict[str, Optional[str]] = {}
     active_prs = _active_pr_custody(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+        pr_states=prelock_pr_states,
     )
     resume_marker = _next_resume_marker(conn, task_id) if active_prs else None
     if active_prs and resume_marker is None:
         _append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
         return None
     with write_txn(conn):
+        # Do not reuse the pre-lock GitHub result. A PR can be reopened between
+        # the first check and BEGIN IMMEDIATE; carrying the CLOSED/MERGED cache
+        # into this transaction would then claim a card whose live PR has
+        # regained custody. Re-query under the single-writer lock immediately
+        # before the ready -> running CAS. Lookup errors remain fail-closed.
+        claim_pr_states: dict[str, Optional[str]] = {}
         fresh_active_prs = _active_pr_custody(
             conn,
             task_id,
             cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+            pr_states=claim_pr_states,
         )
         if fresh_active_prs:
             fresh_marker = _next_resume_marker(conn, task_id)
@@ -8032,6 +8201,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_REWORK_TITLE_RE = re.compile(
+    r"(?:^|[\s\[\](:-])(?:REWORK|FIX)(?=$|[\s\]\):_-])",
+    re.IGNORECASE,
+)
+
+
 def _canonical_pr_urls_from_text(body: str) -> tuple[str, ...]:
     """Return ordered, de-duplicated canonical GitHub PR URLs in ``body``."""
     urls: list[str] = []
@@ -8139,6 +8314,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    brief_path_blocked: list[str] = field(default_factory=list)
+    """Remote-host cards blocked this tick by brief-path-guard (rc 4)."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -8310,6 +8487,8 @@ _DISPOSITION_EVENT_DETAIL_KEYS = (
     "source_comment_id",
     "source_status",
     "window_seconds",
+    "guard_rc",
+    "guard_state",
 )
 
 
@@ -9713,10 +9892,105 @@ def _active_pr_custody(
     task_id: str,
     *,
     cutoff: int,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
 ) -> tuple[str, ...]:
-    """Ordered canonical PR URLs this card actually owns inside the window."""
+    """Ordered PR URLs that still guard this card after live-state checks."""
     owned, _ = _active_pr_candidates(conn, task_id, cutoff=cutoff)
-    return tuple(str(record["canonical_url"]) for record in owned)
+    guarding = _guarding_active_pr_candidates(
+        conn,
+        task_id,
+        owned,
+        pr_states=pr_states,
+        allow_state_lookup=allow_state_lookup,
+    )
+    return tuple(str(record["canonical_url"]) for record in guarding)
+
+
+def _github_pull_state(pr_url: str) -> Optional[str]:
+    """Return GitHub's live PR state, or ``None`` when it cannot be verified.
+
+    ``None`` intentionally fails closed: a transient GitHub/``gh`` failure must
+    not turn the duplicate-author guard into a release-everything switch.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    state = proc.stdout.strip().upper()
+    return state if state in {"OPEN", "CLOSED", "MERGED"} else None
+
+
+def _title_marks_matching_pr_rework(title: str, pr_url: str) -> bool:
+    """Return true only for an explicit REWORK/FIX title naming this PR."""
+    if _RESPAWN_GUARD_REWORK_TITLE_RE.search(title or "") is None:
+        return False
+    match = _RESPAWN_GUARD_PR_URL_RE.fullmatch(pr_url)
+    if match is None:
+        return False
+    if pr_url in _canonical_pr_urls_from_text(title or ""):
+        return True
+    repo = re.escape(match.group("repo"))
+    number = re.escape(str(int(match.group("number"))))
+    if any(
+        pattern.search(title or "") is not None
+        for pattern in (
+            re.compile(rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*{number}\b", re.IGNORECASE),
+            re.compile(rf"\bPR\s*#?\s*{number}\b", re.IGNORECASE),
+        )
+    ):
+        return True
+    compound = re.compile(
+        rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*\d+"
+        rf"(?:\s*(?:\+|,|/|&|\band\b)\s*#\s*\d+)+",
+        re.IGNORECASE,
+    )
+    return any(
+        str(int(number))
+        in {str(int(value)) for value in re.findall(r"#\s*(\d+)", group.group(0))}
+        for group in compound.finditer(title or "")
+    )
+
+
+def _guarding_active_pr_candidates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owned: Sequence[Mapping[str, Any]],
+    *,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return owned PRs not released by either narrow exemption predicate."""
+    row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    title = str(row["title"] or "") if row is not None else ""
+    guarding: list[Mapping[str, Any]] = []
+    for record in owned:
+        pr_url = str(record["canonical_url"])
+        if _title_marks_matching_pr_rework(title, pr_url):
+            continue
+        if pr_states is not None and pr_url in pr_states:
+            state = pr_states[pr_url]
+        elif allow_state_lookup:
+            state = _github_pull_state(pr_url)
+            if pr_states is not None:
+                pr_states[pr_url] = state
+        else:
+            state = None
+        if state is not None and state != "OPEN":
+            continue
+        guarding.append(record)
+    return tuple(guarding)
 
 
 _RESUME_MARKER_KIND = "resume_marker"
@@ -10201,9 +10475,10 @@ def check_respawn_guard(
     # blocks respawn; a bare citation of another card's PR no longer freezes.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
-    if owned:
+    guarding = _guarding_active_pr_candidates(conn, task_id, owned)
+    if guarding:
         if detail_out is not None:
-            detail_out.update(_active_pr_guard_detail(owned, disowned))
+            detail_out.update(_active_pr_guard_detail(guarding, disowned))
         return "active_pr"
     if disowned:
         detail = _active_pr_guard_detail((), disowned)
@@ -10281,6 +10556,221 @@ def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
     except Exception:
         return False
     return bool(profile_exists(assignee))
+
+
+# ---------------------------------------------------------------------------
+# Cross-host brief-path guard (criterion 13 / t_3d64f74b)
+#
+# A brief that cites a godmode-bus path present on blitz and absent on the
+# remote host is how VPS2 workers silently work without the input they were
+# told to read. The checker lives at ~/godmode-bus/bin/brief-path-guard.sh
+# (rc 0 pass / 4 violation / 5 unverifiable). Dispatch is the only place that
+# knows card→host binding at spawn time, so it is the enforcement point.
+#
+# Policy (availability over a wedged board):
+#   rc 4 → do not spawn; card → blocked; violations as a comment
+#   rc 5 → spawn; UNVERIFIABLE lines as a warning comment
+#   rc 0 → spawn
+#   missing script / timeout / rc 1/2 / signal → spawn + warning comment
+# ---------------------------------------------------------------------------
+
+BRIEF_PATH_GUARD_ENV = "HERMES_BRIEF_PATH_GUARD"
+BRIEF_PATH_GUARD_TIMEOUT_SEC = 20
+BRIEF_PATH_GUARD_AUTHOR = "brief-path-guard"
+_BRIEF_PATH_GUARD_EVENT = "brief_path_guard"
+
+
+def _assignee_is_remote_host(assignee: Optional[str]) -> bool:
+    """True when the assignee names a non-blitz host lane (``vps2*``).
+
+    Matches ``brief-path-guard.sh --audit`` (``assignee LIKE 'vps2%'``).
+    """
+    return (assignee or "").strip().lower().startswith("vps2")
+
+
+def _brief_path_guard_script() -> Optional[Path]:
+    override = (os.environ.get(BRIEF_PATH_GUARD_ENV) or "").strip()
+    candidate = Path(override) if override else (
+        Path.home() / "godmode-bus" / "bin" / "brief-path-guard.sh"
+    )
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _brief_text_for_guard(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    parts = [row["title"] or "", row["body"] or ""]
+    return "\n".join(part for part in parts if part)
+
+
+def _brief_path_guard_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _latest_brief_path_guard_event(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == _BRIEF_PATH_GUARD_EVENT and isinstance(event.payload, dict):
+            return dict(event.payload)
+    return None
+
+
+def run_brief_path_guard(*, task_id: str, body: str) -> tuple[int, str]:
+    """Exec ``brief-path-guard.sh --stdin --host vps2``.
+
+    Returns ``(rc, combined_output)``. Uses ``--stdin`` with the dispatcher's
+    own brief text so the check is board-local (temp DBs, no sudo against
+    ``/var/lib/boardd``) and matches the bytes about to be dispatched.
+    """
+    script = _brief_path_guard_script()
+    if script is None:
+        return 2, "brief-path-guard missing; fail-open (availability over strictness)"
+    argv = [str(script), "--stdin", "--host", "vps2"]
+    try:
+        proc = subprocess.run(
+            argv,
+            input=body or "",
+            text=True,
+            capture_output=True,
+            timeout=BRIEF_PATH_GUARD_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = f"{exc.stdout or ''}{exc.stderr or ''}"
+        return 2, (
+            f"brief-path-guard timeout after {BRIEF_PATH_GUARD_TIMEOUT_SEC}s"
+            + (f"\n{out}" if out.strip() else "")
+        )
+    except Exception as exc:
+        return 2, f"brief-path-guard exec failed: {type(exc).__name__}: {exc}"
+    out = f"{proc.stdout or ''}{proc.stderr or ''}"
+    rc = int(proc.returncode)
+    if rc < 0:
+        return 2, f"brief-path-guard killed by signal {-rc}\n{out}".rstrip()
+    return rc, out.strip()
+
+
+def _record_brief_path_guard_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    rc: int,
+    body_sha256: str,
+    output: str,
+) -> None:
+    state = {0: "pass", 4: "violation", 5: "unverifiable"}.get(rc, "error")
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            _BRIEF_PATH_GUARD_EVENT,
+            {
+                "rc": rc,
+                "state": state,
+                "body_sha256": body_sha256,
+                "output": (output or "")[:2000],
+            },
+        )
+
+
+def _comment_brief_path_guard(conn: sqlite3.Connection, task_id: str, body: str) -> None:
+    text = (body or "").strip()
+    if not text:
+        return
+    try:
+        add_comment(conn, task_id, BRIEF_PATH_GUARD_AUTHOR, text)
+    except Exception:
+        _log.debug("brief-path-guard: failed to comment on %s", task_id, exc_info=True)
+
+
+def _enforce_brief_path_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    *,
+    dry_run: bool,
+) -> Optional[tuple[str, str, dict[str, Any]]]:
+    """Run the remote-host brief guard. Return a stop disposition or None."""
+    if not _assignee_is_remote_host(assignee):
+        return None
+    brief = _brief_text_for_guard(conn, task_id)
+    body_hash = _brief_path_guard_hash(brief)
+    prior = _latest_brief_path_guard_event(conn, task_id)
+    if prior and prior.get("body_sha256") == body_hash:
+        if int(prior.get("rc") or 0) != 4:
+            return None
+        if not dry_run:
+            task = get_task(conn, task_id)
+            if task is not None and task.status == "ready":
+                block_task(
+                    conn,
+                    task_id,
+                    reason="brief-path-guard: remote worker cannot read cited bus path",
+                    kind="needs_input",
+                )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    rc, output = run_brief_path_guard(task_id=task_id, body=brief)
+    if not dry_run:
+        _record_brief_path_guard_event(
+            conn, task_id, rc=rc, body_sha256=body_hash, output=output
+        )
+
+    if rc == 4:
+        if not dry_run:
+            _comment_brief_path_guard(
+                conn,
+                task_id,
+                "VIOLATION: brief cites a blitz-only godmode-bus path the "
+                "remote worker cannot read. Card blocked; do not spawn.\n\n"
+                f"{output}\n\n"
+                "Fix: copy the file into ~/godmode-bus/vps2-outbox/ (bridge "
+                "push) or attach via boardd, and cite a path that exists on "
+                "the target host.",
+            )
+            block_task(
+                conn,
+                task_id,
+                reason="brief-path-guard: remote worker cannot read cited bus path",
+                kind="needs_input",
+            )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    if rc == 5 and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "UNVERIFIABLE brief-path-guard (non-fatal; leaving for remote "
+            f"claim / spawn):\n\n{output}",
+        )
+    elif rc not in (0, 4, 5) and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "brief-path-guard error (fail-open; leaving for remote claim / "
+            f"spawn): rc={rc}\n\n{output}",
+        )
+    return None
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10655,6 +11145,27 @@ def _dispatch_once_locked(
                 "held",
                 reason="lane_ineligible",
                 detail={"assignee": row_assignee, "policy_reason": lane_denial},
+                dry_run=dry_run,
+            )
+            continue
+
+        # Cross-host brief-path guard: a vps2* card whose brief cites a
+        # blitz-only godmode-bus path must not stay claimable. Run before
+        # the local-profile spawn check so remote lanes (claimed by
+        # vps2-dispatch, skipped here as nonspawnable) are still gated.
+        guard_stop = _enforce_brief_path_guard(
+            conn, row["id"], row_assignee, dry_run=dry_run
+        )
+        if guard_stop is not None:
+            outcome, reason, detail = guard_stop
+            result.brief_path_blocked.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                outcome,
+                reason=reason,
+                detail=detail,
                 dry_run=dry_run,
             )
             continue

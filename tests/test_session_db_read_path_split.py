@@ -8,7 +8,10 @@ per-thread read-only connection under WAL, never touch self._lock, and fall
 back to the legacy locked path when WAL or the read connection is missing.
 """
 
+import concurrent.futures
+import os
 import threading
+import time
 
 import pytest
 
@@ -213,3 +216,89 @@ def test_session_resume_reads_do_not_take_writer_lock(db):
         assert len(done["ancestor_prefix"]) == 2
     finally:
         db._lock.release()
+
+
+@pytest.mark.requires_wal
+def test_idle_read_connection_is_closed_then_reopened(db, monkeypatch):
+    import hermes_state as hs
+
+    conn = db._get_read_conn()
+    assert conn is not None
+    monkeypatch.setattr(hs, "_READ_CONN_IDLE_TIMEOUT_S", 0.0)
+    db._read_conn_last_used[conn] = time.monotonic() - 1
+    assert db._sweep_idle_read_conns() == 1
+    assert conn in db._read_conn_doomed
+
+    replacement = db._get_read_conn()
+    assert replacement is not None
+    assert replacement is not conn
+    assert conn not in db._read_conns
+    assert conn not in db._read_conn_last_used
+
+
+@pytest.mark.requires_wal
+def test_sweeper_is_singleton_and_tracks_live_db(db):
+    assert db._get_read_conn() is not None
+    import hermes_state as hs
+
+    thread = hs._read_conn_sweeper
+    assert thread is not None and thread.is_alive()
+    assert db in hs._live_session_dbs
+    hs._ensure_read_conn_sweeper()
+    assert hs._read_conn_sweeper is thread
+
+
+@pytest.mark.requires_wal
+def test_idle_sweep_bounds_real_fds_across_pool_thread_waves(db, monkeypatch):
+    """Reused pool threads replace doomed conns instead of accumulating SQLite FDs."""
+    if not os.path.isdir("/proc/self/fd"):
+        pytest.skip("Linux /proc fd proof")
+    import hermes_state as hs
+
+    monkeypatch.setattr(hs, "_READ_CONN_IDLE_TIMEOUT_S", 0.0)
+    barrier = threading.Barrier(9)
+
+    def open_and_wait(barrier):
+        conn = db._get_read_conn()
+        assert conn is not None
+        barrier.wait(timeout=5)
+
+    db_targets = {str(db.db_path), str(db.db_path) + "-wal", str(db.db_path) + "-shm"}
+
+    def db_fd_count():
+        count = 0
+        for name in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{name}")
+            except OSError:
+                continue
+            if target in db_targets:
+                count += 1
+        return count
+
+    before = db_fd_count()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(open_and_wait, barrier) for _ in range(8)]
+        barrier.wait(timeout=5)
+        for future in futures:
+            future.result(timeout=5)
+        opened = db_fd_count()
+        assert opened > before
+        assert db._sweep_idle_read_conns() >= 8
+        second_barrier = threading.Barrier(9)
+        futures = [pool.submit(open_and_wait, second_barrier) for _ in range(8)]
+        second_barrier.wait(timeout=5)
+        for future in futures:
+            future.result(timeout=5)
+        second_wave = db_fd_count()
+        assert second_wave <= opened
+
+
+@pytest.mark.requires_wal
+def test_close_drains_idle_tracking(db):
+    assert db._get_read_conn() is not None
+    db.close()
+    assert db._read_conns == set()
+    assert db._read_conn_owners == []
+    assert db._read_conn_last_used == {}
+    assert db._read_conn_doomed == set()
