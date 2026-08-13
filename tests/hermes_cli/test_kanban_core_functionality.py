@@ -96,6 +96,18 @@ def test_normalized_title_scope_dedup_beats_fresh_idempotency_key(
 def test_title_scope_dedup_does_not_collapse_legitimately_distinct_work(
     kanban_home,
 ):
+    """Must-NOT-fire: every axis of the identity key still separates work.
+
+    The ``distinct_workspace`` axis is deliberately KEPT and strengthened
+    rather than dropped when ``workspace_path`` left the scope for
+    dispatcher-owned kinds. Two ``dir`` tasks pointed at two different
+    checkouts are genuinely different work, and ``dir`` is the one kind whose
+    ``workspace_path`` the dispatcher hands back unchanged from
+    ``resolve_workspace`` — so it is still a sound identity component. The
+    original assertion only compared a ``dir`` card against a ``scratch`` card,
+    which the workspace *kind* alone already separates; the pair below makes
+    the path itself load-bearing.
+    """
     with kb.connect() as conn:
         parent_a = kb.create_task(conn, title="parent A")
         parent_b = kb.create_task(conn, title="parent B")
@@ -121,6 +133,16 @@ def test_title_scope_dedup_does_not_collapse_legitimately_distinct_work(
             workspace_kind="dir",
             workspace_path="/srv/other-project",
         )
+        # The load-bearing half: dir-vs-dir, same title/tenant/parents, only
+        # the caller-owned path differs. This is what the fence must never
+        # collapse, and it is why ``dir`` keeps its path in the scope.
+        distinct_workspace_second_dir = kb.create_task(
+            conn,
+            title="run release",
+            tenant="tenant-a",
+            workspace_kind="dir",
+            workspace_path="/srv/third-project",
+        )
 
     assert len({
         base,
@@ -129,7 +151,31 @@ def test_title_scope_dedup_does_not_collapse_legitimately_distinct_work(
         distinct_parent_a,
         distinct_parent_b,
         distinct_workspace,
-    }) == 6
+        distinct_workspace_second_dir,
+    }) == 7
+
+
+def test_dir_workspace_path_scope_is_tilde_insensitive(kanban_home):
+    """``resolve_workspace`` stores the expanduser()'d path for dir tasks, so
+    ``~/repo`` and its expansion must be one identity, not two."""
+    home = Path(os.path.expanduser("~"))
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="tilde scoped work",
+            workspace_kind="dir",
+            workspace_path="~/some-repo",
+        )
+        second = kb.create_task(
+            conn,
+            title="tilde scoped work",
+            workspace_kind="dir",
+            workspace_path=str(home / "some-repo"),
+        )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert second == first
+    assert count == 1
 
 
 def test_title_scope_dedup_only_blocks_open_tasks(kanban_home):
@@ -172,6 +218,244 @@ def test_title_scope_dedup_is_atomic_across_concurrent_creators(kanban_home):
     assert len(set(ids)) == 1
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Open-duplicate fence: mutable-key defect, ported must-fire coverage,
+# swarm-collision must-NOT-fire, and the allow_open_duplicate escape hatch.
+# ---------------------------------------------------------------------------
+
+
+def test_fence_still_fires_after_dispatcher_rewrites_workspace_path(kanban_home):
+    """THE regression this change exists for.
+
+    ``dispatch_ready`` resolves a scratch task's workspace at claim time and
+    persists ``<board-root>/workspaces/<task-id>`` back onto the row via
+    ``set_workspace_path``. That value is keyed on the task's own id, so while
+    ``workspace_path`` was part of the create identity key the fence stopped
+    matching the moment the original card started running — inert against
+    exactly the case it exists for: a duplicate minted while the original is
+    already in flight. On the live fleet board 3,101 of 4,438 scratch rows
+    carry such a rewritten path.
+    """
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="Re-mint me while running",
+            tenant="tenant-a",
+            created_by="dispatcher",
+        )
+        assert kb.get_task(conn, original).workspace_path in (None, "")
+
+        # Pre-claim the fence already worked; prove that first so the test
+        # cannot silently pass by the fence being broken in both states.
+        pre_claim = kb.create_task(
+            conn,
+            title="Re-mint me while running",
+            tenant="tenant-a",
+            created_by="auto-minter",
+        )
+        assert pre_claim == original
+
+        # Now simulate the claim: the dispatcher rewrites the path in place.
+        minted_path = kb.workspaces_root() / original
+        kb.set_workspace_path(conn, original, str(minted_path))
+        assert kb.get_task(conn, original).workspace_path == str(minted_path)
+
+        post_claim = kb.create_task(
+            conn,
+            title="Re-mint me while running",
+            tenant="tenant-a",
+            created_by="auto-minter",
+        )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        events = [
+            event
+            for event in kb.list_events(conn, original)
+            if event.kind == "create_deduplicated"
+        ]
+
+    assert post_claim == original, (
+        "the fence must still match a card whose workspace_path the dispatcher "
+        "rewrote to a per-task-id directory"
+    )
+    assert count == 1
+    assert len(events) == 2
+    assert events[-1].payload["scope"]["location"] == ["workspace", "scratch", ""]
+
+
+def test_fence_still_fires_after_worktree_path_rewrite(kanban_home):
+    """Same defect, ``worktree`` flavour: the dispatcher persists
+    ``<repo>/.worktrees/<task-id>``, equally per-task-unique."""
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="Worktree card",
+            workspace_kind="worktree",
+        )
+        kb.set_workspace_path(conn, original, f"/srv/repo/.worktrees/{original}")
+        repeat = kb.create_task(conn, title="worktree card", workspace_kind="worktree")
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert repeat == original
+    assert count == 1
+
+
+@pytest.mark.parametrize("open_status", ["ready", "todo", "running", "blocked", "triage"])
+def test_fence_blocks_duplicate_across_all_open_statuses(kanban_home, open_status):
+    """Ported from PR #83. A card open in ANY non-terminal status is still open
+    work — the duplicate must be suppressed no matter where the original sits.
+    Adapted to the title+scope key: #83 keyed on title alone, board-wide."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Open work item", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (open_status, first))
+
+        repeat = kb.create_task(conn, title="open work item", assignee="worker")
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        status = kb.get_task(conn, first).status
+
+    assert repeat == first
+    assert count == 1
+    assert status == open_status
+
+
+def test_fence_records_audit_event_on_existing_task(kanban_home):
+    """Ported from PR #83's audit assertion, mapped onto this lineage's
+    ``create_deduplicated`` event and its richer scope payload."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Fix login redirect", assignee="worker")
+        repeat = kb.create_task(
+            conn,
+            title="  fix   LOGIN redirect ",
+            assignee="worker",
+            created_by="auto-minter",
+        )
+        events = [
+            event
+            for event in kb.list_events(conn, first)
+            if event.kind == "create_deduplicated"
+        ]
+
+    assert repeat == first
+    assert events, "a suppressed mint must leave an audit event on the existing card"
+    payload = events[-1].payload or {}
+    assert payload["existing_task_id"] == first
+    assert payload["reason"] == "normalized_title_scope"
+    assert payload["normalized_title"] == "fix login redirect"
+    assert payload["attempted_by"] == "auto-minter"
+    assert payload["idempotency_key_supplied"] is False
+    assert payload["scope"]["parents"] == []
+
+
+def test_archived_task_does_not_block_recreation(kanban_home):
+    """Ported from PR #83: ``archived`` is terminal, so it must not freeze a
+    title. ``done`` is already covered by ``..._only_blocks_open_tasks``."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Weekly digest")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (first,))
+        replacement = kb.create_task(conn, title="Weekly digest")
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert replacement != first
+    assert count == 2
+
+
+def test_swarm_verifier_and_synthesizer_do_not_collapse_across_swarms(kanban_home):
+    """Must-NOT-fire regression lock.
+
+    ``create_swarm`` defaults ``verifier_title="Verify swarm outputs"`` and
+    ``synthesizer_title="Synthesize swarm outputs"``. Under a title-only,
+    board-wide fence (PR #83's semantics) two concurrent swarms would collapse
+    those cards into one another, leaving the second swarm with no verifier and
+    no synthesizer of its own — structurally ungated work, silently. The
+    parent-set component of this lineage's key is what prevents that, and this
+    test exists so nobody can quietly regress the key back to title-only.
+    """
+    from hermes_cli import kanban_swarm as ks
+
+    with kb.connect() as conn:
+        first = ks.create_swarm(
+            conn,
+            goal="First swarm goal",
+            workers=[ks.parse_worker_arg("alpha:do the alpha slice")],
+            verifier_assignee="verifier",
+            synthesizer_assignee="synthesizer",
+        )
+        second = ks.create_swarm(
+            conn,
+            goal="Second swarm goal",
+            workers=[ks.parse_worker_arg("beta:do the beta slice")],
+            verifier_assignee="verifier",
+            synthesizer_assignee="synthesizer",
+        )
+        verifier_titles = {
+            kb.get_task(conn, first.verifier_id).title,
+            kb.get_task(conn, second.verifier_id).title,
+        }
+
+    assert first.verifier_id != second.verifier_id, (
+        "two concurrent swarms must each own a verifier; collapsing them leaves "
+        "the second swarm ungated"
+    )
+    assert first.synthesizer_id != second.synthesizer_id
+    assert first.root_id != second.root_id
+    # The titles really are identical — the parent scope, not the title, is
+    # what keeps these apart.
+    assert verifier_titles == {"Verify swarm outputs"}
+
+
+def test_allow_open_duplicate_opt_out_still_mints(kanban_home):
+    """Ported from PR #83, where it shipped wired to zero callers. Here the
+    flag is reachable from ``hermes kanban create --allow-duplicate``."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Recurring sweep")
+        second = kb.create_task(conn, title="Recurring sweep", allow_open_duplicate=True)
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert second != first
+    assert count == 2
+
+
+def test_allow_open_duplicate_does_not_bypass_idempotency_key(kanban_home):
+    """The escape hatch relaxes the inferred fence, never the explicit contract
+    the caller opted into by supplying a key."""
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Keyed job", idempotency_key="k-1")
+        second = kb.create_task(
+            conn,
+            title="Keyed job",
+            idempotency_key="k-1",
+            allow_open_duplicate=True,
+        )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert second == first
+    assert count == 1
+
+
+def test_cli_create_allow_duplicate_flag_reaches_create_task(kanban_home):
+    """The opt-out is only worth having if an operator can reach it.
+
+    PR #83 added ``allow_open_duplicate`` wired to zero callers, which is why it
+    was never exercised. Drive it through the real CLI surface instead.
+    """
+    def _created_id(out: str) -> str:
+        assert out.startswith("Created "), out
+        return out.split()[1]
+
+    first = _created_id(run_slash('create "CLI fenced work"'))
+    fenced = _created_id(run_slash('create "CLI fenced work"'))
+    assert fenced == first, "a plain CLI re-create must hit the fence"
+
+    forced = _created_id(
+        run_slash('create "CLI fenced work" --allow-duplicate')
+    )
+    assert forced != first
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
 
 
 # ---------------------------------------------------------------------------
