@@ -225,8 +225,78 @@ def _mf_non_ready_open_card_still_blocks_re_mint() -> None:
     assert open_cards == 1, f"expected 1 open card, board holds {open_cards}"
 
 
+def _mf_re_mint_blocked_after_dispatcher_rewrites_workspace_path() -> None:
+    """The fence must survive the dispatcher mutating the card it is keyed on.
+
+    ``dispatch_ready`` resolves a scratch task's workspace at claim time and
+    persists ``<board-root>/workspaces/<task-id>`` back onto the row through
+    ``set_workspace_path``. That value is keyed on the task's OWN id, so while
+    ``workspace_path`` was part of the identity key the fence stopped matching
+    the instant the original started running — inert against exactly the case
+    it exists for. On the live fleet board 3,101 of 4,438 scratch rows carry
+    such a rewritten path.
+    """
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn, title="Re-mint me while running", tenant="tenant-a"
+        )
+        # Pre-claim the fence already worked; assert that first so this fixture
+        # cannot pass by the fence being broken in both directions.
+        pre_claim = kb.create_task(
+            conn, title="re-mint me while running", tenant="tenant-a"
+        )
+        assert pre_claim == original, (
+            f"pre-claim re-mint minted {pre_claim!r} instead of {original!r}"
+        )
+
+        minted_path = kb.workspaces_root() / original
+        kb.set_workspace_path(conn, original, str(minted_path))
+        claimed = kb.get_task(conn, original)
+        assert claimed is not None and claimed.workspace_path == str(minted_path)
+
+        post_claim = kb.create_task(
+            conn, title="re-mint me while running", tenant="tenant-a"
+        )
+        open_cards = _open_task_count(conn)
+
+    assert post_claim == original, (
+        f"post-claim re-mint minted {post_claim!r} instead of {original!r} — the "
+        "fence went inert once the dispatcher rewrote workspace_path"
+    )
+    assert open_cards == 1, f"expected 1 open card, board holds {open_cards}"
+
+
+def _mf_re_mint_blocked_after_worktree_path_rewrite() -> None:
+    """Same defect, ``worktree`` flavour: the dispatcher persists
+    ``<repo>/.worktrees/<task-id>``, equally per-task-unique."""
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn, title="Worktree card", tenant="t", workspace_kind="worktree"
+        )
+        kb.set_workspace_path(conn, original, f"/srv/repo/.worktrees/{original}")
+        repeated = kb.create_task(
+            conn, title="worktree card", tenant="t", workspace_kind="worktree"
+        )
+        open_cards = _open_task_count(conn)
+
+    assert repeated == original, (
+        f"re-mint against a claimed worktree card minted {repeated!r}, "
+        f"expected {original!r}"
+    )
+    assert open_cards == 1, f"expected 1 open card, board holds {open_cards}"
+
+
 def _mnf_distinct_work_all_mints() -> None:
-    """Different title, tenant, parent set, or workspace is different work."""
+    """Different title, tenant, parent set, or workspace is different work.
+
+    The workspace axis is deliberately KEPT — and strengthened — now that
+    ``workspace_path`` carries identity only for ``workspace_kind == "dir"``.
+    ``dir`` is the one kind whose path ``resolve_workspace`` hands back
+    unchanged, so two ``dir`` cards pointed at two different checkouts really
+    are different work. The original pair compared a ``dir`` card against a
+    default-``scratch`` card, which the workspace *kind* alone already
+    separates; ``two_dir_paths`` below makes the path itself load-bearing.
+    """
     with kb.connect() as conn:
         parent_a = kb.create_task(conn, title="parent A")
         parent_b = kb.create_task(conn, title="parent B")
@@ -248,6 +318,13 @@ def _mnf_distinct_work_all_mints() -> None:
             workspace_kind="dir",
             workspace_path="/srv/other-project",
         )
+        second_dir_path = kb.create_task(
+            conn,
+            title="run release",
+            tenant="tenant-a",
+            workspace_kind="dir",
+            workspace_path="/srv/third-project",
+        )
 
     minted = {
         base,
@@ -256,8 +333,82 @@ def _mnf_distinct_work_all_mints() -> None:
         under_parent_a,
         under_parent_b,
         other_workspace,
+        second_dir_path,
     }
-    assert len(minted) == 6, f"legitimate work collapsed: {sorted(minted)}"
+    assert len(minted) == 7, f"legitimate work collapsed: {sorted(minted)}"
+
+
+def _mnf_concurrent_swarms_keep_their_own_verifier_and_synthesizer() -> None:
+    """The over-fire that a title-only, board-wide key would cause.
+
+    ``create_swarm`` defaults ``verifier_title="Verify swarm outputs"`` and
+    ``synthesizer_title="Synthesize swarm outputs"``, so two concurrent swarms
+    carry byte-identical titles for those cards. Collapsing them would leave
+    swarm 2 with no verifier and no synthesizer of its own — structurally
+    ungated work, silently. The parent-set component of the key is what keeps
+    them apart; this fixture exists so the key cannot be quietly regressed to
+    title-only.
+    """
+    from hermes_cli import kanban_swarm as ks
+
+    with kb.connect() as conn:
+        first = ks.create_swarm(
+            conn,
+            goal="First swarm goal",
+            workers=[ks.parse_worker_arg("alpha:do the alpha slice")],
+            verifier_assignee="verifier",
+            synthesizer_assignee="synthesizer",
+        )
+        second = ks.create_swarm(
+            conn,
+            goal="Second swarm goal",
+            workers=[ks.parse_worker_arg("beta:do the beta slice")],
+            verifier_assignee="verifier",
+            synthesizer_assignee="synthesizer",
+        )
+        titles = {
+            kb.get_task(conn, first.verifier_id).title,
+            kb.get_task(conn, second.verifier_id).title,
+        }
+
+    assert first.verifier_id != second.verifier_id, (
+        "two concurrent swarms collapsed their verifier cards — swarm 2 is "
+        "left structurally ungated"
+    )
+    assert first.synthesizer_id != second.synthesizer_id, (
+        "two concurrent swarms collapsed their synthesizer cards"
+    )
+    assert first.root_id != second.root_id
+    # The titles really are identical: the parent scope, not the title, is
+    # what keeps these cards apart.
+    assert titles == {"Verify swarm outputs"}, titles
+
+
+def _mnf_allow_open_duplicate_opt_out_still_mints() -> None:
+    """A fence that can refuse card creation needs a reachable escape hatch.
+
+    Surfaced as ``hermes kanban create --allow-duplicate``. It relaxes the
+    inferred title+scope fence only — never the explicit ``idempotency_key``
+    contract the caller opted into.
+    """
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="Recurring sweep", tenant="t")
+        forced = kb.create_task(
+            conn, title="Recurring sweep", tenant="t", allow_open_duplicate=True
+        )
+
+        keyed = kb.create_task(conn, title="Keyed job", idempotency_key="k-1")
+        keyed_retry = kb.create_task(
+            conn,
+            title="Keyed job",
+            idempotency_key="k-1",
+            allow_open_duplicate=True,
+        )
+
+    assert forced != first, "allow_open_duplicate must still mint a second card"
+    assert keyed_retry == keyed, (
+        "allow_open_duplicate must not bypass an explicit idempotency_key"
+    )
 
 
 def _mnf_control_tag_prefixes_stay_distinct() -> None:
@@ -438,6 +589,12 @@ FENCES: tuple[FenceSpec, ...] = (
             "non_ready_open_card_still_blocks_re_mint": (
                 _mf_non_ready_open_card_still_blocks_re_mint
             ),
+            "re_mint_blocked_after_dispatcher_rewrites_workspace_path": (
+                _mf_re_mint_blocked_after_dispatcher_rewrites_workspace_path
+            ),
+            "re_mint_blocked_after_worktree_path_rewrite": (
+                _mf_re_mint_blocked_after_worktree_path_rewrite
+            ),
         },
         must_not_fire={
             "distinct_work_all_mints": _mnf_distinct_work_all_mints,
@@ -447,6 +604,12 @@ FENCES: tuple[FenceSpec, ...] = (
             ),
             "distinct_idempotency_keys_still_mint_distinct_work": (
                 _mnf_distinct_idempotency_keys_still_mint_distinct_work
+            ),
+            "concurrent_swarms_keep_their_own_verifier_and_synthesizer": (
+                _mnf_concurrent_swarms_keep_their_own_verifier_and_synthesizer
+            ),
+            "allow_open_duplicate_opt_out_still_mints": (
+                _mnf_allow_open_duplicate_opt_out_still_mints
             ),
         },
     ),
