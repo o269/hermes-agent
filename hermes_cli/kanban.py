@@ -352,8 +352,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--allow-duplicate", action="store_true",
                           dest="allow_open_duplicate",
                           help="Bypass the open-duplicate fence and mint a second card "
-                               "even when an equivalent one is already open (same "
-                               "normalized title, tenant, parents and workspace/project). "
+                               "even when an equivalent card is already open — same "
+                               "normalized title, tenant, parents and workspace/project. "
                                "Use when the fence is a false positive. Does not bypass "
                                "--idempotency-key.")
     p_create.add_argument("--max-runtime", default=None,

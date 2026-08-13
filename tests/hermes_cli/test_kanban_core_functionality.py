@@ -627,7 +627,7 @@ def test_read_worker_log_tail(kanban_home):
     log_dir.mkdir(parents=True, exist_ok=True)
     p = log_dir / "t_beef.log"
     # 10 lines
-    p.write_text("\n".join(f"line {i}" for i in range(10)))
+    p.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
     full = kb.read_worker_log("t_beef")
     assert full is not None and "line 0" in full
     tail = kb.read_worker_log("t_beef", tail_bytes=30)
@@ -1072,7 +1072,7 @@ def test_pid_alive_detects_zombie(kanban_home):
         time.sleep(0.3)
         # Verify /proc reports zombie state so the test is actually
         # exercising the zombie path and not some other liveness failure
-        with open(f"/proc/{pid}/status") as f:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
             state_line = next(
                 (l for l in f if l.startswith("State:")), ""
             )
