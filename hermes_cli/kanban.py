@@ -628,6 +628,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--applied-by",
+        default=None,
+        help="Close-on-apply actor; requires --apply-evidence and exactly one task id",
+    )
+    p_complete.add_argument(
+        "--apply-evidence",
+        default=None,
+        help="Observed install evidence recorded in the atomic APPLIED / CLOSED receipt",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -2215,6 +2225,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    applied_by = (getattr(args, "applied_by", None) or "").strip()
+    apply_evidence = (getattr(args, "apply_evidence", None) or "").strip()
+    if bool(applied_by) != bool(apply_evidence):
+        print(
+            "kanban: --applied-by and --apply-evidence must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+    if len(ids) > 1 and applied_by:
+        print(
+            "kanban: close-on-apply receipts are per-task; complete exactly one id",
+            file=sys.stderr,
+        )
+        return 2
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
@@ -2288,6 +2312,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                apply_receipt=(
+                    {"actor": applied_by, "evidence": apply_evidence}
+                    if applied_by
+                    else None
+                ),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

@@ -39,6 +39,37 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_run_slash_complete_close_on_apply_writes_atomic_receipt(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="apply reviewed patch")
+
+    out = kc.run_slash(
+        f"complete {task_id} --applied-by fable "
+        "--apply-evidence 'installed exact head abc123; marker present'"
+    )
+
+    assert f"Completed {task_id}" in out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+    assert task is not None and task.status == "done"
+    assert comments[-1].body == (
+        "APPLIED / CLOSED: installed exact head abc123; marker present"
+    )
+
+
+def test_run_slash_complete_close_on_apply_requires_both_bindings(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="incomplete apply receipt")
+
+    out = kc.run_slash(f"complete {task_id} --applied-by fable")
+
+    assert "must be supplied together" in out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "ready"
+
+
 def _arm_fable_gateway(kanban_home, monkeypatch):
     (kanban_home / "config.yaml").write_text(
         "kanban:\n  continuation_operator_profiles: fable\n",

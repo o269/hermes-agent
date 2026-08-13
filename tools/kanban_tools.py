@@ -631,10 +631,20 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    applied_by = args.get("applied_by")
+    apply_evidence = args.get("apply_evidence")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
         result = redact_sensitive_text(str(result), force=True)
+    if applied_by:
+        applied_by = redact_sensitive_text(str(applied_by), force=True).strip()
+    if apply_evidence:
+        apply_evidence = redact_sensitive_text(
+            str(apply_evidence), force=True
+        ).strip()
+    if bool(applied_by) != bool(apply_evidence):
+        return tool_error("applied_by and apply_evidence must be supplied together")
     if metadata is not None and isinstance(metadata, dict):
         meta_json = json.dumps(metadata)
         meta_json = redact_sensitive_text(meta_json, force=True)
@@ -751,6 +761,11 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    apply_receipt=(
+                        {"actor": applied_by, "evidence": apply_evidence}
+                        if applied_by
+                        else None
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1698,6 +1713,21 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "applied_by": {
+                "type": "string",
+                "description": (
+                    "Optional close-on-apply actor. Supply together with "
+                    "apply_evidence to atomically write the APPLIED / CLOSED "
+                    "audit comment and terminal transition."
+                ),
+            },
+            "apply_evidence": {
+                "type": "string",
+                "description": (
+                    "Observed install evidence (exact head, live marker, or "
+                    "equivalent falsifiable proof). Requires applied_by."
                 ),
             },
             "board": _board_schema_prop(),

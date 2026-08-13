@@ -5407,6 +5407,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    apply_receipt: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5430,6 +5431,12 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    ``apply_receipt`` is the close-on-apply fence. Installers pass the actor
+    and observed evidence to the same transaction that closes the card; Hermes
+    writes the audit comment and terminal transition together, so a successful
+    apply cannot leave the source card dispatchable. Empty receipts fail before
+    any state change.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -5437,6 +5444,16 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    normalized_apply_receipt: Optional[dict[str, str]] = None
+    if apply_receipt is not None:
+        if not isinstance(apply_receipt, Mapping):
+            raise ValueError("apply receipt must be an object")
+        actor = str(apply_receipt.get("actor") or "").strip()
+        evidence = str(apply_receipt.get("evidence") or "").strip()
+        if not actor or not evidence:
+            raise ValueError("apply receipt requires non-empty actor and evidence")
+        normalized_apply_receipt = {"actor": actor, "evidence": evidence}
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5506,6 +5523,36 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if normalized_apply_receipt is not None:
+            comment_body = f"APPLIED / CLOSED: {normalized_apply_receipt['evidence']}"
+            comment_cur = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    normalized_apply_receipt["actor"],
+                    comment_body,
+                    now,
+                ),
+            )
+            _record_task_pr_ownership(
+                conn,
+                task_id,
+                comment_body,
+                observed_at=now,
+                source_comment_id=int(comment_cur.lastrowid or 0),
+                declared=False,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "commented",
+                {
+                    "author": normalized_apply_receipt["actor"],
+                    "len": len(comment_body),
+                    "source": "close_on_apply",
+                },
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5547,6 +5594,8 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if normalized_apply_receipt is not None:
+            completed_payload["apply_receipt"] = normalized_apply_receipt
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via

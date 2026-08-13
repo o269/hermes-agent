@@ -141,6 +141,65 @@ def test_title_scope_dedup_only_blocks_open_tasks(kanban_home):
     assert replacement != completed
 
 
+def test_complete_after_apply_atomically_records_evidence_and_closes(kanban_home):
+    """Must-fire fixture: a successful apply cannot leave its card dispatchable."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Install reviewed board patch")
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Installed the reviewed patch",
+            apply_receipt={
+                "actor": "fable",
+                "evidence": "Installed PR #61 head 06981f4; marker grep passed.",
+            },
+        )
+
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task is not None and task.status == "done"
+    assert [(comment.author, comment.body) for comment in comments] == [
+        (
+            "fable",
+            "APPLIED / CLOSED: Installed PR #61 head 06981f4; marker grep passed.",
+        )
+    ]
+    completed = next(event for event in events if event.kind == "completed")
+    assert completed.payload is not None
+    assert completed.payload["apply_receipt"] == {
+        "actor": "fable",
+        "evidence": "Installed PR #61 head 06981f4; marker grep passed.",
+    }
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {"actor": "", "evidence": "marker present"},
+        {"actor": "fable", "evidence": ""},
+        {"actor": "fable", "evidence": "   "},
+    ],
+)
+def test_complete_after_apply_rejects_empty_receipt_without_partial_close(
+    kanban_home,
+    receipt,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Apply must fail closed")
+
+        with pytest.raises(ValueError, match="apply receipt"):
+            kb.complete_task(conn, task_id, apply_receipt=receipt)
+
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert task is not None and task.status == "ready"
+    assert comments == []
+
+
 def test_title_scope_dedup_is_atomic_across_concurrent_creators(kanban_home):
     barrier = threading.Barrier(2)
     ids: list[str] = []
