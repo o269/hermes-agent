@@ -24,6 +24,11 @@ def isolated_kanban_home(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    from hermes_cli import profiles
+    # Named profiles are spawnable; the control-plane name ``default`` is not.
+    monkeypatch.setattr(
+        profiles, "profile_exists", lambda name: str(name).strip().lower() != "default"
+    )
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test
@@ -48,17 +53,17 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
-            default_assignee="default",
+            default_assignee="worker",
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned
     assert len(res.spawned) == 1
     assert res.spawned[0][0] == task_id
-    assert res.spawned[0][1] == "default"
+    assert res.spawned[0][1] == "worker"
 
     with kb.connect_closing() as conn:
         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    assert row["assignee"] == "default"
+    assert row["assignee"] == "worker"
 
     # 'assigned' event emitted for the audit trail
     with kb.connect_closing() as conn:
@@ -68,7 +73,7 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         ))
     assert len(evs) == 1
     payload = json.loads(evs[0][1])
-    assert payload["assignee"] == "default"
+    assert payload["assignee"] == "worker"
     assert payload["source"] == "kanban.default_assignee"
 
 
@@ -83,13 +88,13 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee="default")
+        task_id = kb.create_task(conn, title="t1", assignee="alice")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="someother",
         )
     assert task_id not in res.auto_assigned_default
-    assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
+    assert any(s[0] == task_id and s[1] == "alice" for s in res.spawned)
 
 
