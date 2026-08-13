@@ -174,6 +174,132 @@ def test_title_scope_dedup_is_atomic_across_concurrent_creators(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
 
 
+def test_concern_key_refresh_reuses_one_open_control_card(kanban_home):
+    """Must-fire fixture: exact-head refreshes cannot mint a second concern card."""
+    with kb.connect() as conn:
+        canonical = kb.create_task(
+            conn,
+            title="[FABLE][LAND] Widget PR 61 at abc123",
+            body="CONCERN_KEY: widget#61:land\nPredicate: checks green at abc123",
+            created_by="fable",
+        )
+        refreshed = kb.create_task(
+            conn,
+            title="[FABLE][LAND] Widget PR 61 at def456",
+            body="concern_key: WIDGET#61:LAND\nPredicate: checks green at def456",
+            created_by="fable",
+        )
+
+        open_cards = conn.execute(
+            "SELECT id FROM tasks WHERE status NOT IN ('done', 'archived')"
+        ).fetchall()
+        events = kb.list_events(conn, canonical)
+
+    assert refreshed == canonical
+    assert [row["id"] for row in open_cards] == [canonical]
+    assert any(
+        event.kind == "create_deduplicated"
+        and event.payload
+        and event.payload.get("reason") == "concern_key"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "retired_alias",
+    ["fable-drain-steward", "FABLE-FLEET-DRAIN-STEWARD"],
+)
+def test_retired_drain_alias_cannot_create_new_inflow(kanban_home, retired_alias):
+    """Must-fire fixture: a stood-down creator alias cannot refill the board."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="retired Kanban creator alias"):
+            kb.create_task(
+                conn,
+                title="stale alias must not return",
+                created_by=retired_alias,
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_zombie_triage_requires_full_disposition_and_drains_alias_inflow(kanban_home):
+    """Must-fire fixture: triage is exact-set, auditable, and leaves zero aliases."""
+    with kb.connect() as conn:
+        folded = kb.create_task(conn, title="real work to preserve", created_by="fable")
+        archived = kb.create_task(conn, title="obsolete alias gate", created_by="fable")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by='fable-drain-steward' WHERE id=?",
+                (folded,),
+            )
+            conn.execute(
+                "UPDATE tasks SET created_by='fable-fleet-drain-steward' WHERE id=?",
+                (archived,),
+            )
+
+        with pytest.raises(ValueError, match="exactly cover"):
+            kb.triage_retired_creator_cards(
+                conn,
+                dispositions={
+                    folded: {"action": "fold", "reason": "preserve active work"},
+                },
+            )
+
+        result = kb.triage_retired_creator_cards(
+            conn,
+            dispositions={
+                folded: {"action": "fold", "reason": "preserve active work"},
+                archived: {"action": "archive", "reason": "stood-down alias gate"},
+            },
+        )
+
+        folded_task = kb.get_task(conn, folded)
+        archived_task = kb.get_task(conn, archived)
+        alias_open = conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE lower(created_by) IN (?, ?) "
+            "AND status NOT IN ('done', 'archived')",
+            ("fable-drain-steward", "fable-fleet-drain-steward"),
+        ).fetchone()[0]
+        folded_comments = kb.list_comments(conn, folded)
+        archived_comments = kb.list_comments(conn, archived)
+
+    assert result == {"folded": [folded], "archived": [archived]}
+    assert folded_task is not None and folded_task.status != "archived"
+    assert folded_task.created_by == "fable"
+    assert archived_task is not None and archived_task.status == "archived"
+    assert alias_open == 0
+    assert folded_comments[-1].body.startswith("ZOMBIE TRIAGE / FOLDED:")
+    assert archived_comments[-1].body.startswith("ZOMBIE TRIAGE / ARCHIVED:")
+
+
+def test_zombie_triage_cli_dry_run_is_non_mutating(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy control", created_by="fable")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by='fable-drain-steward' WHERE id=?",
+                (task_id,),
+            )
+
+    manifest = tmp_path / "triage.json"
+    manifest.write_text(
+        json.dumps({
+            task_id: {"action": "archive", "reason": "retired control card"},
+        }),
+        encoding="utf-8",
+    )
+
+    output = run_slash(f"zombie-triage {manifest} --dry-run --json")
+    assert json.loads(output) == {
+        "dry_run": True,
+        "folded": [],
+        "archived": [task_id],
+    }
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None and task.status != "archived"
+
+
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
