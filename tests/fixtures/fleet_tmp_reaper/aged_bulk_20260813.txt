@@ -11,9 +11,23 @@
 #           `sudo du -sB1 --one-file-system` over exactly this set — not a
 #           blanket du of /tmp (du is not reclaim)
 #
-# Two members (tmux-1000, org.chromium.Chromium.VJc8dO — 8 KiB combined) are
-# protected names, so the sweep must KEEP them and select the other 297.
-# The reclaim figure is therefore 297 dirs / 46.6 GiB.
+# 19 members are protected names, so the sweep must KEEP them and select the
+# other 280. The reclaim figure is therefore 280 dirs, not the full 46.6 GiB.
+#
+# Two of the 19 are OS-owned (tmux-1000, org.chromium.Chromium.VJc8dO — 8 KiB
+# combined). The other 17 are the disk-watchdog exclusions that the first cut of
+# this module dropped and that were restored after the 2026-08-13 incident:
+#
+#   hermes-results          the LIVE Hermes tool-result store (~1,101 files that
+#                           agents read back BY PATH). Its tree age says nothing
+#                           about whether it is in use; deleting it breaks
+#                           in-flight agents. This entry is the single most
+#                           important KEEP in the fixture.
+#   hermes_sandbox_*  (6)   live sandbox roots
+#   tmp.*             (8)   mktemp -d default prefix
+#   tsx-0, corepack-bin     toolchain caches
+#
+# Their presence here is the point: an age-only gate selected all 17.
 #
 # Of the 299, only 20 match the legacy prefix allowlist that gated candidacy at
 # godmode-bus/bin/tmp-reaper.sh line 105:
