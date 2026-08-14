@@ -349,6 +349,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--allow-duplicate", action="store_true",
+                          dest="allow_open_duplicate",
+                          help="Bypass the open-duplicate fence and mint a second card "
+                               "even when an equivalent card is already open — same "
+                               "normalized title, tenant, parents and workspace/project. "
+                               "Use when the fence is a false positive. Does not bypass "
+                               "--idempotency-key.")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -1560,6 +1567,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
+            allow_open_duplicate=bool(getattr(args, "allow_open_duplicate", False)),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
