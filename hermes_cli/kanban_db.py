@@ -3218,6 +3218,23 @@ def _normalize_task_title(title: str) -> str:
     return " ".join(normalized.split()).casefold()
 
 
+# Workspace kinds whose ``workspace_path`` is stable enough to carry identity.
+#
+# ``workspace_path`` is DISPATCHER-MUTABLE for every other kind. At claim time
+# ``dispatch_ready`` calls ``resolve_workspace`` and persists the result through
+# ``set_workspace_path``, which rewrites
+#   * ``scratch``  -> ``<board-root>/workspaces/<task-id>``
+#   * ``worktree`` -> ``<repo>/.worktrees/<task-id>``
+# Both are keyed on the task's OWN id, so the stored value becomes globally
+# unique the instant the card starts running. Feeding that into the create
+# identity key made the fence inert against the case it exists for: a re-mint
+# of work that is already in flight. ``dir`` is the one kind whose path is
+# caller-supplied and handed back unchanged by ``resolve_workspace``, so it
+# still legitimately distinguishes two same-titled cards pointed at two
+# different checkouts.
+_PATH_SCOPED_WORKSPACE_KINDS = frozenset({"dir"})
+
+
 def _normalize_task_scope(
     *,
     tenant: Optional[str],
@@ -3229,23 +3246,28 @@ def _normalize_task_scope(
     """Return the board-local scope paired with a normalized title.
 
     Tenant + dependency-parent set identify the workflow namespace. A
-    first-class project is the location scope; otherwise workspace kind/path
-    are. Creator, assignee, body, status, priority, session, and idempotency key
-    are deliberately excluded so cross-creator retries cannot re-mint work.
+    first-class project is the location scope; otherwise workspace kind (and,
+    for ``dir``, the caller-owned path) are. Creator, assignee, body, status,
+    priority, session, and idempotency key are deliberately excluded so
+    cross-creator retries cannot re-mint work — and so is the dispatcher-owned
+    ``workspace_path`` of every non-``dir`` kind, which mutates at claim time
+    (see ``_PATH_SCOPED_WORKSPACE_KINDS``).
     """
     tenant_scope = str(tenant).strip() if tenant is not None else ""
     parent_scope = tuple(sorted({str(parent).strip() for parent in parents if parent}))
     if project_id:
         location_scope = ("project", str(project_id).strip())
     else:
+        kind = str(workspace_kind or "scratch").strip().casefold()
         normalized_path = ""
-        if workspace_path:
-            normalized_path = os.path.normpath(str(workspace_path).strip())
-        location_scope = (
-            "workspace",
-            str(workspace_kind or "scratch").strip().casefold(),
-            normalized_path,
-        )
+        if workspace_path and kind in _PATH_SCOPED_WORKSPACE_KINDS:
+            # ``resolve_workspace`` stores the expanduser()'d form for dir
+            # tasks, so ``~/repo`` and ``/home/me/repo`` must compare equal or
+            # a claim would silently re-key the card here too.
+            normalized_path = os.path.normpath(
+                os.path.expanduser(str(workspace_path).strip())
+            )
+        location_scope = ("workspace", kind, normalized_path)
     return tenant_scope, parent_scope, location_scope
 
 
@@ -3259,7 +3281,16 @@ def _find_open_title_scope_duplicate(
     workspace_kind: str,
     workspace_path: Optional[str],
 ) -> tuple[Optional[str], tuple[str, tuple[str, ...], tuple[str, ...]]]:
-    """Return the oldest open task with the same normalized title + scope."""
+    """Return the oldest open task with the same normalized title + scope.
+
+    Runs inside ``BEGIN IMMEDIATE``, so the query count is deliberately bounded
+    at two regardless of board size: one narrow ``(id, title)`` sweep of the
+    open cards, then — only if some title actually matches — one joined fetch of
+    the scope columns plus parent links for just those candidates. The previous
+    shape issued a ``task_links`` lookup per title match and pulled six columns
+    for every open row, which put an unbounded N+1 inside an exclusive write
+    transaction.
+    """
     normalized_title = _normalize_task_title(title)
     target_scope = _normalize_task_scope(
         tenant=tenant,
@@ -3268,27 +3299,59 @@ def _find_open_title_scope_duplicate(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
     )
+    # NFKC + casefold cannot be expressed in SQL, so the title comparison stays
+    # in Python — but only two columns cross the boundary for the sweep.
+    candidate_ids = [
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id, title FROM tasks "
+            "WHERE status NOT IN ('done', 'archived') "
+            "ORDER BY created_at ASC, id ASC"
+        )
+        if _normalize_task_title(row["title"] or "") == normalized_title
+    ]
+    if not candidate_ids:
+        return None, target_scope
+
+    placeholders = ",".join("?" * len(candidate_ids))
     rows = conn.execute(
-        "SELECT id, title, tenant, project_id, workspace_kind, workspace_path "
-        "FROM tasks WHERE status NOT IN ('done', 'archived') "
-        "ORDER BY created_at ASC, id ASC"
+        "SELECT t.id AS id, t.tenant AS tenant, t.project_id AS project_id, "
+        "       t.workspace_kind AS workspace_kind, t.workspace_path AS workspace_path, "
+        "       l.parent_id AS parent_id "
+        "  FROM tasks t LEFT JOIN task_links l ON l.child_id = t.id "
+        f" WHERE t.id IN ({placeholders}) "
+        " ORDER BY t.created_at ASC, t.id ASC",
+        candidate_ids,
     ).fetchall()
+
+    scopes: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if _normalize_task_title(row["title"] or "") != normalized_title:
+        entry = scopes.setdefault(
+            str(row["id"]),
+            {
+                "tenant": row["tenant"],
+                "project_id": row["project_id"],
+                "workspace_kind": row["workspace_kind"] or "scratch",
+                "workspace_path": row["workspace_path"],
+                "parents": [],
+            },
+        )
+        if row["parent_id"]:
+            entry["parents"].append(row["parent_id"])
+
+    for candidate_id in candidate_ids:
+        entry = scopes.get(candidate_id)
+        if entry is None:
             continue
-        parent_rows = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-            (row["id"],),
-        ).fetchall()
         candidate_scope = _normalize_task_scope(
-            tenant=row["tenant"],
-            parents=(parent["parent_id"] for parent in parent_rows),
-            project_id=row["project_id"],
-            workspace_kind=row["workspace_kind"] or "scratch",
-            workspace_path=row["workspace_path"],
+            tenant=entry["tenant"],
+            parents=entry["parents"],
+            project_id=entry["project_id"],
+            workspace_kind=entry["workspace_kind"],
+            workspace_path=entry["workspace_path"],
         )
         if candidate_scope == target_scope:
-            return str(row["id"]), target_scope
+            return candidate_id, target_scope
     return None, target_scope
 
 
@@ -3355,6 +3418,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    allow_open_duplicate: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3370,6 +3434,18 @@ def create_task(
     conservative normalized title + scope (board, tenant, parent set, and
     project/workspace identity) wins even when the retry supplies a fresh key.
     Both paths append ``create_deduplicated`` to the existing task timeline.
+
+    The workspace half of that scope is the workspace *kind*, plus the path
+    only for ``dir`` tasks. ``scratch`` and ``worktree`` paths are rewritten to
+    a task-id-keyed directory by the dispatcher at claim time, so including
+    them would make a running card un-matchable — see
+    ``_PATH_SCOPED_WORKSPACE_KINDS``.
+
+    ``allow_open_duplicate=True`` bypasses the title+scope fence for the caller
+    that genuinely wants a second open card for equivalent work (surfaced as
+    ``hermes kanban create --allow-duplicate``). It is the escape hatch for a
+    false positive; it does NOT bypass the ``idempotency_key`` check, which
+    remains an explicit contract the caller opted into.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3606,9 +3682,11 @@ def create_task(
                     ).fetchone()
                     if row:
                         existing_id = str(row["id"])
-                        _, scope = _find_open_title_scope_duplicate(
-                            conn,
-                            title=title,
+                        # Scope is only needed for the audit payload here — the
+                        # key already decided the match. Computing it directly
+                        # avoids a second full open-card sweep on every keyed
+                        # retry, inside the exclusive write txn.
+                        scope = _normalize_task_scope(
                             tenant=tenant,
                             parents=parents,
                             project_id=project_id,
@@ -3626,15 +3704,25 @@ def create_task(
                         )
                         return existing_id
 
-                duplicate_id, scope = _find_open_title_scope_duplicate(
-                    conn,
-                    title=title,
-                    tenant=tenant,
-                    parents=parents,
-                    project_id=project_id,
-                    workspace_kind=workspace_kind,
-                    workspace_path=workspace_path,
-                )
+                duplicate_id = None
+                if allow_open_duplicate:
+                    scope = _normalize_task_scope(
+                        tenant=tenant,
+                        parents=parents,
+                        project_id=project_id,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                    )
+                else:
+                    duplicate_id, scope = _find_open_title_scope_duplicate(
+                        conn,
+                        title=title,
+                        tenant=tenant,
+                        parents=parents,
+                        project_id=project_id,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                    )
                 if duplicate_id is not None:
                     _record_create_dedup(
                         conn,

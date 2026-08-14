@@ -20,6 +20,7 @@ import copy
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -180,16 +181,22 @@ def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
             messages, "sys", approx_tokens=120_000, commit_fence=fence
         )
 
-    # Step 2: host-owned progress wait times out while summary is blocked.
-    result_msgs, _prompt = run_compress_context_with_progress_timeout(
-        worker=_worker,
-        messages=messages,
-        system_prompt_fallback="fallback",
-        idle_timeout_seconds=0.6,
-        total_ceiling_seconds=1.2,
-    )
-    assert summary_started.wait(timeout=5)
-    assert not release_summary.is_set()  # old worker STILL blocked
+    # Step 2: start the host-owned progress wait, prove the worker reached the
+    # blocked summary, then let the host time out. Running the host inline made
+    # this assertion race its 0.6s idle timeout on loaded CI runners: the host
+    # could cancel before the worker thread was scheduled at all.
+    with ThreadPoolExecutor(max_workers=1) as host_pool:
+        host_future = host_pool.submit(
+            run_compress_context_with_progress_timeout,
+            worker=_worker,
+            messages=messages,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.6,
+            total_ceiling_seconds=1.2,
+        )
+        assert summary_started.wait(timeout=5)
+        assert not release_summary.is_set()  # old worker STILL blocked
+        result_msgs, _prompt = host_future.result(timeout=5)
     assert result_msgs is messages
 
     # Step 3: a NEW compressor acquires the durable lock while the old
