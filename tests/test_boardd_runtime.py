@@ -923,7 +923,7 @@ def _unit_broker(
     )
 
 
-def test_corruption_recovery_registers_assignment_guard_udf(
+def test_corruption_recovery_reenters_canonical_schema_and_guard_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -936,37 +936,73 @@ def test_corruption_recovery_registers_assignment_guard_udf(
         encoding="utf-8",
     )
     db_path = root / "kanban.db"
-    seed = kb.connect(db_path)
+    # Model the first upgraded start of a legacy board: SCHEMA_SQL creates the
+    # task table, but the authority triggers are installed separately by the
+    # canonical migration path.
+    seed = sqlite3.connect(db_path)
     try:
-        task_id = kb.create_task(
-            seed,
-            title="[AUTHOR] recovered connection must stay fenced",
-            assignee="codex1",
-            initial_status="running",
+        seed.executescript(kb.SCHEMA_SQL)
+        assert seed.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_tasks_assignment_policy_%'"
+        ).fetchone()[0] == 0
+        task_id = "t_legacy_recovery_fence"
+        seed.execute(
+            "INSERT INTO tasks(id, title, assignee, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "[AUTHOR] recovered connection must stay fenced",
+                "codex1",
+                "running",
+                1,
+            ),
         )
     finally:
         seed.close()
-        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
 
     broker = _unit_broker(root)
+    canonical_open = broker._open_conn
+    open_calls = 0
 
     def simulated_corrupt_open() -> sqlite3.Connection:
-        raise sqlite3.DatabaseError("database disk image is malformed")
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls == 1:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return canonical_open()
 
     monkeypatch.setattr(broker, "_open_conn", simulated_corrupt_open)
     recovered = broker._open_conn_with_recovery()
     try:
+        assert open_calls == 2
         assert broker._assignment_policy_ready is True
         assert broker._assignment_authority_profiles == ["fable"]
-        # Must fail with the policy trigger. Without UDF registration this same
-        # statement raises OperationalError("no such function ...") instead.
-        with pytest.raises(sqlite3.IntegrityError, match="assignment policy"):
-            recovered.execute(
-                "UPDATE tasks SET assignee = 'fable' WHERE id = ?",
-                (task_id,),
-            )
+        assert recovered.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_tasks_assignment_policy_%'"
+        ).fetchone()[0] == 2
+        # The recovered canonical handle is the positive control: it carries
+        # the UDF and can perform a custody update that the policy permits.
+        recovered.execute(
+            "UPDATE tasks SET claim_lock = 'canonical:claim' WHERE id = ?",
+            (task_id,),
+        )
+        raw = sqlite3.connect(db_path)
+        try:
+            with pytest.raises(
+                sqlite3.OperationalError,
+                match="kanban_assignment_guard",
+            ):
+                raw.execute(
+                    "UPDATE tasks SET claim_lock = 'raw:steal' WHERE id = ?",
+                    (task_id,),
+                )
+        finally:
+            raw.close()
     finally:
         recovered.close()
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
 
 
 def test_client_total_deadline_rejects_trickled_response():

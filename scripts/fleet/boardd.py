@@ -747,32 +747,28 @@ class Broker:
                        "REINDEX recovery on a raw handle", exc)
             raw = sqlite3.connect(self.db_realpath, isolation_level=None,
                                   timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0)
-            raw.row_factory = sqlite3.Row
-            # Durable assignment/custody triggers survive REINDEX. Register the
-            # connection-local UDF before any recovered handle can execute a
-            # statement that fires them; otherwise recovery returns a write-dead
-            # connection with "no such function: kanban_assignment_guard".
-            import hermes_cli.kanban_db as k  # noqa: WPS433
-            k._register_assignment_policy_guard(raw)
-            raw.execute("PRAGMA busy_timeout=%d" % DEFAULT_BUSY_TIMEOUT_MS)
-            raw.execute("REINDEX")
-            chk = raw.execute("PRAGMA integrity_check").fetchone()[0]
-            if chk != "ok":
+            try:
+                raw.execute("PRAGMA busy_timeout=%d" % DEFAULT_BUSY_TIMEOUT_MS)
+                raw.execute("REINDEX")
+                chk = raw.execute("PRAGMA integrity_check").fetchone()[0]
+                if chk != "ok":
+                    _log.error("boardd: REINDEX did not recover (integrity=%s); a "
+                               "file-level restore is required (see runbook)", chk)
+                    raise
+            finally:
                 raw.close()
-                _log.error("boardd: REINDEX did not recover (integrity=%s); a "
-                           "file-level restore is required (see runbook)", chk)
-                raise
-            _log.warning("boardd: in-place REINDEX recovered the board")
-            raw.execute("PRAGMA journal_mode=WAL")
-            raw.execute("PRAGMA synchronous=FULL")
-            raw.execute("PRAGMA foreign_keys=ON")
-            raw.executescript(self._load_schema_sql())
-            raw.execute(APPLIED_OPS_DDL)
-            raw.execute(COMMITTED_TXNS_DDL)
-            if self.import_schema:
-                self._assignment_authority_profiles = list(k._authority_profiles(raw))
-                self._assignment_policy_ready = True
-            return raw
+
+            # REINDEX repairs the storage object only. Re-enter the normal open
+            # path so a legacy board receives the same additive migrations,
+            # connection-local UDF, and durable assignment/custody triggers as
+            # every non-recovery startup. Returning the raw repair handle would
+            # otherwise let a pre-trigger board report policy-ready while still
+            # accepting unfenced custody writes.
+            _log.warning(
+                "boardd: in-place REINDEX recovered the board; re-opening through "
+                "the canonical schema path"
+            )
+            return self._open_conn()
 
     # ---- DB thread --------------------------------------------------------- #
     def _db_thread(self) -> None:
