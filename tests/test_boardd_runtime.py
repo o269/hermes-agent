@@ -923,6 +923,52 @@ def _unit_broker(
     )
 
 
+def test_corruption_recovery_registers_assignment_guard_udf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text(
+        "kanban:\n  authority_profiles: fable\n",
+        encoding="utf-8",
+    )
+    db_path = root / "kanban.db"
+    seed = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            seed,
+            title="[AUTHOR] recovered connection must stay fenced",
+            assignee="codex1",
+            initial_status="running",
+        )
+    finally:
+        seed.close()
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    broker = _unit_broker(root)
+
+    def simulated_corrupt_open() -> sqlite3.Connection:
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(broker, "_open_conn", simulated_corrupt_open)
+    recovered = broker._open_conn_with_recovery()
+    try:
+        assert broker._assignment_policy_ready is True
+        assert broker._assignment_authority_profiles == ["fable"]
+        # Must fail with the policy trigger. Without UDF registration this same
+        # statement raises OperationalError("no such function ...") instead.
+        with pytest.raises(sqlite3.IntegrityError, match="assignment policy"):
+            recovered.execute(
+                "UPDATE tasks SET assignee = 'fable' WHERE id = ?",
+                (task_id,),
+            )
+    finally:
+        recovered.close()
+
+
 def test_client_total_deadline_rejects_trickled_response():
     client_sock, server_sock = socket.socketpair()
     client = Client(retry_deadline_s=1, read_timeout_s=1, total_timeout_s=0.15)

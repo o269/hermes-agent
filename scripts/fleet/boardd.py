@@ -748,6 +748,12 @@ class Broker:
             raw = sqlite3.connect(self.db_realpath, isolation_level=None,
                                   timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0)
             raw.row_factory = sqlite3.Row
+            # Durable assignment/custody triggers survive REINDEX. Register the
+            # connection-local UDF before any recovered handle can execute a
+            # statement that fires them; otherwise recovery returns a write-dead
+            # connection with "no such function: kanban_assignment_guard".
+            import hermes_cli.kanban_db as k  # noqa: WPS433
+            k._register_assignment_policy_guard(raw)
             raw.execute("PRAGMA busy_timeout=%d" % DEFAULT_BUSY_TIMEOUT_MS)
             raw.execute("REINDEX")
             chk = raw.execute("PRAGMA integrity_check").fetchone()[0]
@@ -763,6 +769,9 @@ class Broker:
             raw.executescript(self._load_schema_sql())
             raw.execute(APPLIED_OPS_DDL)
             raw.execute(COMMITTED_TXNS_DDL)
+            if self.import_schema:
+                self._assignment_authority_profiles = list(k._authority_profiles(raw))
+                self._assignment_policy_ready = True
             return raw
 
     # ---- DB thread --------------------------------------------------------- #

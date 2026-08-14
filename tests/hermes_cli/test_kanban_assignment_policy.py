@@ -497,6 +497,21 @@ def test_executor_and_parking_language_are_not_false_nonspawnable_contracts(
 
 
 @pytest.mark.parametrize(
+    "title,expected_nonspawnable",
+    (
+        ("[AUTHOR] docs: document the production install runbook", False),
+        ("[TEST] add a regression test for live apply ordering", False),
+        ("Production install", True),
+    ),
+)
+def test_executor_title_short_circuits_live_action_classifier(
+    title: str,
+    expected_nonspawnable: bool,
+):
+    assert is_nonspawnable_contract(title) is expected_nonspawnable
+
+
+@pytest.mark.parametrize(
     "title,body",
     (
         ("[FABLE][APPROVAL] release decision", ""),
@@ -1134,6 +1149,38 @@ def test_lane_policy_rejects_config_that_weakens_24_hour_boundary(tmp_path: Path
         )
 
 
+def test_board_policy_expands_env_and_honors_managed_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / ".hermes"
+    receipts = root / "lane-health"
+    receipts.mkdir(parents=True)
+    monkeypatch.setenv("TEST_LANE_RECEIPTS", str(receipts))
+    (root / "config.yaml").write_text(
+        "kanban:\n"
+        "  authority_profiles: ''\n"
+        '  lane_health_receipts_dir: "${TEST_LANE_RECEIPTS}"\n',
+        encoding="utf-8",
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "kanban:\n  authority_profiles: fable\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    db_path = root / "kanban.db"
+    conn = kb.connect(db_path)
+    try:
+        assert kb.assignment_authority_profiles(conn) == ("fable",)
+        assert kb.lane_eligibility_policy(conn).receipt_dir == receipts.resolve()
+    finally:
+        conn.close()
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+
 def test_typed_create_reassign_and_raw_sql_share_lane_guard(lane_guarded_board):
     conn, receipts, _config_path, _db_path = lane_guarded_board
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
@@ -1177,6 +1224,39 @@ def test_typed_create_reassign_and_raw_sql_share_lane_guard(lane_guarded_board):
         initial_status="blocked",
     )
     assert _must_get(conn, authority_id).assignee == "fable"
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    (
+        ("claim_lock", "'raw:steal'"),
+        ("claim_expires", "1234567890"),
+        ("worker_pid", "424242"),
+        ("current_run_id", "NULL"),
+    ),
+)
+def test_raw_sql_cannot_mutate_custody_columns(
+    lane_guarded_board,
+    column: str,
+    value: str,
+):
+    conn, _receipts, _config_path, db_path = lane_guarded_board
+    task_id = kb.create_task(
+        conn,
+        title="[AUTHOR] custody boundary patch",
+        assignee="codex1",
+    )
+
+    # Registered connections are the positive control: canonical writers carry
+    # the UDF and can execute a custody-column statement that policy permits.
+    conn.execute(f"UPDATE tasks SET {column} = {value} WHERE id = ?", (task_id,))
+
+    raw = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="kanban_assignment_guard"):
+            raw.execute(f"UPDATE tasks SET {column} = {value} WHERE id = ?", (task_id,))
+    finally:
+        raw.close()
 
 
 def test_stale_ready_lane_is_fenced_before_claim_or_spawn(lane_guarded_board):

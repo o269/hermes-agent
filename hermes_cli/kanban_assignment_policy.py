@@ -391,7 +391,10 @@ def is_nonspawnable_contract(
     if (
         _AUTHORITY_TITLE_MARKER_RE.search(title_text)
         or _APPROVAL_AUTHORITY_RE.search(title_text)
-        or _LIVE_AUTHORITY_ACTION_RE.search(title_text)
+        or (
+            _LIVE_AUTHORITY_ACTION_RE.search(title_text)
+            and not card_is_executor
+        )
     ):
         return True
 

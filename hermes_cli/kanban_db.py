@@ -1537,7 +1537,8 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_update
-BEFORE UPDATE OF title, body, assignee, status ON tasks
+BEFORE UPDATE OF title, body, assignee, status,
+                 claim_lock, claim_expires, worker_pid, current_run_id ON tasks
 WHEN kanban_assignment_guard(
     NEW.id,
     NEW.title,
@@ -1576,12 +1577,13 @@ def _configured_kanban_policy(
         raise AssignmentPolicyConfigError("assignment authority root is unresolved")
     config_path = authority_root / "config.yaml"
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.managed_scope import apply_managed_overlay
 
-        payload = read_user_config_raw(config_path)
+        payload = _expand_env_vars(read_user_config_raw(config_path))
     except Exception as exc:
-        # The canonical raw reader preserves parser and I/O failures. Collapse
-        # every such failure into this boundary's stable fail-closed error.
+        # Collapse parser, I/O, and expansion failures into this boundary's
+        # stable fail-closed error.
         raise AssignmentPolicyConfigError(
             f"cannot read assignment authority config at {config_path}"
         ) from exc
@@ -1591,6 +1593,11 @@ def _configured_kanban_policy(
         raise AssignmentPolicyConfigError(
             f"invalid assignment authority config at {config_path}: root must be a mapping"
         )
+    # This is a behavioral read bound to the opened board, so it cannot use the
+    # invoking profile's load_config() path. Apply the same env expansion and
+    # administrator-pinned overlay as the canonical loader before consulting
+    # policy keys; managed values win at the leaf.
+    payload = apply_managed_overlay(payload)
     configured = payload.get("kanban")
     if configured is None:
         configured = {}
