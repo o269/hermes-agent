@@ -88,8 +88,13 @@ import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
+from hermes_cli.kanban_assignment_policy import (
+    LaneEligibilityPolicy,
+    assignment_guard_reason as _pure_assignment_guard_reason,
+    lane_eligibility_policy_from_config,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -1506,6 +1511,301 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+_ASSIGNMENT_POLICY_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_insert
+BEFORE INSERT ON tasks
+WHEN kanban_assignment_guard(
+    NEW.id,
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_assignment_policy_update
+BEFORE UPDATE OF title, body, assignee, status,
+                 claim_lock, claim_expires, worker_pid, current_run_id ON tasks
+WHEN kanban_assignment_guard(
+    NEW.id,
+    NEW.title,
+    NEW.body,
+    NEW.assignee,
+    NEW.status,
+    OLD.title,
+    OLD.body,
+    OLD.assignee,
+    OLD.status,
+    EXISTS (
+        SELECT 1
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = NEW.id
+           AND p.status NOT IN ('done', 'archived')
+    )
+) != ''
+BEGIN
+    SELECT RAISE(ABORT, 'kanban assignment policy violation');
+END;
+"""
+
+
+class AssignmentPolicyConfigError(RuntimeError):
+    """Authority-profile config could not be resolved safely for this board."""
+
+
+def _configured_kanban_policy(
+    conn: sqlite3.Connection,
+) -> tuple[Path, dict[str, object]]:
+    """Read canonical Kanban policy config bound to ``conn``'s board."""
+
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        raise AssignmentPolicyConfigError("assignment authority root is unresolved")
+    config_path = authority_root / "config.yaml"
+    try:
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        payload = _expand_env_vars(read_user_config_raw(config_path))
+    except Exception as exc:
+        # Collapse parser, I/O, and expansion failures into this boundary's
+        # stable fail-closed error.
+        raise AssignmentPolicyConfigError(
+            f"cannot read assignment authority config at {config_path}"
+        ) from exc
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: root must be a mapping"
+        )
+    # This is a behavioral read bound to the opened board, so it cannot use the
+    # invoking profile's load_config() path. Apply the same env expansion and
+    # administrator-pinned overlay as the canonical loader before consulting
+    # policy keys; managed values win at the leaf.
+    payload = apply_managed_overlay(payload)
+    configured = payload.get("kanban")
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise AssignmentPolicyConfigError(
+            f"invalid assignment authority config at {config_path}: kanban must be a mapping"
+        )
+
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    defaults = DEFAULT_CONFIG.get("kanban")
+    merged: dict[str, object] = dict(defaults) if isinstance(defaults, dict) else {}
+    merged.update(configured)
+    return authority_root, merged
+
+
+def _configured_board_profiles(
+    conn: sqlite3.Connection,
+    key: str,
+    default: object,
+) -> tuple[str, ...]:
+    """Read a profile allowlist from the config bound to ``conn``'s board.
+
+    Never trust the invoking lane's ``HERMES_HOME`` for a cross-profile board
+    policy. The opened SQLite path resolves the canonical root. A present but
+    malformed config is an enforcement error, never an empty allowlist that
+    disables the fence.
+    """
+
+    _authority_root, kanban_config = _configured_kanban_policy(conn)
+    raw = kanban_config.get(key, default)
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        raise AssignmentPolicyConfigError(
+            f"invalid {key}: expected comma string or list"
+        )
+    return tuple(
+        dict.fromkeys(
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        )
+    )
+
+
+def _authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    kanban_defaults = DEFAULT_CONFIG.get("kanban")
+    default = (
+        kanban_defaults.get("authority_profiles", "")
+        if isinstance(kanban_defaults, dict)
+        else ""
+    )
+    return _configured_board_profiles(conn, "authority_profiles", default)
+
+
+def assignment_authority_profiles(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Return the explicit non-spawnable authority allowlist for this board."""
+
+    return _authority_profiles(conn)
+
+
+def lane_eligibility_policy(conn: sqlite3.Connection) -> LaneEligibilityPolicy:
+    """Return the fail-closed lane policy bound to this board connection."""
+
+    authority_root, kanban_config = _configured_kanban_policy(conn)
+    try:
+        return lane_eligibility_policy_from_config(
+            kanban_config,
+            authority_root=authority_root,
+        )
+    except ValueError as exc:
+        raise AssignmentPolicyConfigError(str(exc)) from exc
+
+
+def _assignment_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+    status: Optional[str],
+    has_open_parent: bool,
+    task_id: Optional[str] = None,
+    old_title: Optional[str] = None,
+    old_body: Optional[str] = None,
+    old_assignee: Optional[str] = None,
+    old_status: Optional[str] = None,
+) -> Optional[str]:
+    authorities = _authority_profiles(conn)
+    return _pure_assignment_guard_reason(
+        title=title,
+        body=body,
+        assignee=assignee,
+        status=status,
+        authority_profiles=authorities,
+        has_open_parent=has_open_parent,
+        task_id=task_id,
+        old_title=old_title,
+        old_body=old_body,
+        old_assignee=old_assignee,
+        old_status=old_status,
+        lane_policy=lane_eligibility_policy(conn),
+    )
+
+
+def _task_has_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    )
+
+
+def _parents_have_open_task(
+    conn: sqlite3.Connection, parents: Sequence[str]
+) -> bool:
+    if not parents:
+        return False
+    placeholders = ",".join("?" * len(parents))
+    return bool(
+        conn.execute(
+            f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+            "AND status NOT IN ('done', 'archived') LIMIT 1",
+            tuple(parents),
+        ).fetchone()
+    )
+
+
+def _register_assignment_policy_guard(conn: sqlite3.Connection) -> None:
+    """Install the per-connection UDF used by persistent SQLite triggers."""
+
+    def guard(
+        task_id: Optional[str],
+        title: Optional[str],
+        body: Optional[str],
+        assignee: Optional[str],
+        status: Optional[str],
+        old_title: Optional[str],
+        old_body: Optional[str],
+        old_assignee: Optional[str],
+        old_status: Optional[str],
+        has_open_parent: object,
+    ) -> str:
+        return _assignment_guard_reason(
+            conn,
+            title=title,
+            body=body,
+            assignee=assignee,
+            status=status,
+            has_open_parent=bool(has_open_parent),
+            task_id=task_id,
+            old_title=old_title,
+            old_body=old_body,
+            old_assignee=old_assignee,
+            old_status=old_status,
+        ) or ""
+
+    conn.create_function("kanban_assignment_guard", 10, guard)
+
+
+def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
+    # Trigger definitions evolve with the policy. Replace them in one SQLite
+    # write transaction: other connections see either the prior complete fence
+    # or the new complete fence, never the DROP/CREATE gap. Install first so a
+    # malformed/unreadable config on first initialization leaves a durable
+    # fail-closed fence; raw connections do not register the UDF and therefore
+    # cannot write through these triggers.
+    replace_sql = (
+        "BEGIN IMMEDIATE;"
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+        "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+        + _ASSIGNMENT_POLICY_TRIGGERS_SQL
+        + "COMMIT;"
+    )
+    try:
+        conn.executescript(replace_sql)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+    if _authority_profiles(conn) or lane_eligibility_policy(conn).enabled:
+        return
+
+    # Valid empty authority and lane-health policies intentionally disable the
+    # fence. Drop both triggers atomically only after configuration parsed
+    # successfully, preserving legacy raw-SQL compatibility for installations
+    # not opted in.
+    try:
+        conn.executescript(
+            "BEGIN IMMEDIATE;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_insert;"
+            "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
+            "COMMIT;"
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -2250,6 +2550,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
@@ -2281,6 +2582,7 @@ def connect(
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
+            _register_assignment_policy_guard(conn)
             with _INIT_LOCK:
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
@@ -2311,6 +2613,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _install_assignment_policy_triggers(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -3207,6 +3510,189 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_task_title(title: str) -> str:
+    """Return the conservative identity form used by create de-duplication.
+
+    NFKC folds compatibility-equivalent Unicode, whitespace runs collapse, and
+    case differences disappear. Punctuation and control tags stay significant,
+    so ``[REVIEW] Fix X`` and ``[LAND] Fix X`` remain different work.
+    """
+    normalized = unicodedata.normalize("NFKC", str(title or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+# Workspace kinds whose ``workspace_path`` is stable enough to carry identity.
+#
+# ``workspace_path`` is DISPATCHER-MUTABLE for every other kind. At claim time
+# ``dispatch_ready`` calls ``resolve_workspace`` and persists the result through
+# ``set_workspace_path``, which rewrites
+#   * ``scratch``  -> ``<board-root>/workspaces/<task-id>``
+#   * ``worktree`` -> ``<repo>/.worktrees/<task-id>``
+# Both are keyed on the task's OWN id, so the stored value becomes globally
+# unique the instant the card starts running. Feeding that into the create
+# identity key made the fence inert against the case it exists for: a re-mint
+# of work that is already in flight. ``dir`` is the one kind whose path is
+# caller-supplied and handed back unchanged by ``resolve_workspace``, so it
+# still legitimately distinguishes two same-titled cards pointed at two
+# different checkouts.
+_PATH_SCOPED_WORKSPACE_KINDS = frozenset({"dir"})
+
+
+def _normalize_task_scope(
+    *,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return the board-local scope paired with a normalized title.
+
+    Tenant + dependency-parent set identify the workflow namespace. A
+    first-class project is the location scope; otherwise workspace kind (and,
+    for ``dir``, the caller-owned path) are. Creator, assignee, body, status,
+    priority, session, and idempotency key are deliberately excluded so
+    cross-creator retries cannot re-mint work — and so is the dispatcher-owned
+    ``workspace_path`` of every non-``dir`` kind, which mutates at claim time
+    (see ``_PATH_SCOPED_WORKSPACE_KINDS``).
+    """
+    tenant_scope = str(tenant).strip() if tenant is not None else ""
+    parent_scope = tuple(sorted({str(parent).strip() for parent in parents if parent}))
+    if project_id:
+        location_scope = ("project", str(project_id).strip())
+    else:
+        kind = str(workspace_kind or "scratch").strip().casefold()
+        normalized_path = ""
+        if workspace_path and kind in _PATH_SCOPED_WORKSPACE_KINDS:
+            # ``resolve_workspace`` stores the expanduser()'d form for dir
+            # tasks, so ``~/repo`` and ``/home/me/repo`` must compare equal or
+            # a claim would silently re-key the card here too.
+            normalized_path = os.path.normpath(
+                os.path.expanduser(str(workspace_path).strip())
+            )
+        location_scope = ("workspace", kind, normalized_path)
+    return tenant_scope, parent_scope, location_scope
+
+
+def _find_open_title_scope_duplicate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    tenant: Optional[str],
+    parents: Iterable[str],
+    project_id: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[Optional[str], tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Return the oldest open task with the same normalized title + scope.
+
+    Runs inside ``BEGIN IMMEDIATE``, so the query count is deliberately bounded
+    at two regardless of board size: one narrow ``(id, title)`` sweep of the
+    open cards, then — only if some title actually matches — one joined fetch of
+    the scope columns plus parent links for just those candidates. The previous
+    shape issued a ``task_links`` lookup per title match and pulled six columns
+    for every open row, which put an unbounded N+1 inside an exclusive write
+    transaction.
+    """
+    normalized_title = _normalize_task_title(title)
+    target_scope = _normalize_task_scope(
+        tenant=tenant,
+        parents=parents,
+        project_id=project_id,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    # NFKC + casefold cannot be expressed in SQL, so the title comparison stays
+    # in Python — but only two columns cross the boundary for the sweep.
+    candidate_ids = [
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id, title FROM tasks "
+            "WHERE status NOT IN ('done', 'archived') "
+            "ORDER BY created_at ASC, id ASC"
+        )
+        if _normalize_task_title(row["title"] or "") == normalized_title
+    ]
+    if not candidate_ids:
+        return None, target_scope
+
+    placeholders = ",".join("?" * len(candidate_ids))
+    rows = conn.execute(
+        "SELECT t.id AS id, t.tenant AS tenant, t.project_id AS project_id, "
+        "       t.workspace_kind AS workspace_kind, t.workspace_path AS workspace_path, "
+        "       l.parent_id AS parent_id "
+        "  FROM tasks t LEFT JOIN task_links l ON l.child_id = t.id "
+        f" WHERE t.id IN ({placeholders}) "
+        " ORDER BY t.created_at ASC, t.id ASC",
+        candidate_ids,
+    ).fetchall()
+
+    scopes: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = scopes.setdefault(
+            str(row["id"]),
+            {
+                "tenant": row["tenant"],
+                "project_id": row["project_id"],
+                "workspace_kind": row["workspace_kind"] or "scratch",
+                "workspace_path": row["workspace_path"],
+                "parents": [],
+            },
+        )
+        if row["parent_id"]:
+            entry["parents"].append(row["parent_id"])
+
+    for candidate_id in candidate_ids:
+        entry = scopes.get(candidate_id)
+        if entry is None:
+            continue
+        candidate_scope = _normalize_task_scope(
+            tenant=entry["tenant"],
+            parents=entry["parents"],
+            project_id=entry["project_id"],
+            workspace_kind=entry["workspace_kind"],
+            workspace_path=entry["workspace_path"],
+        )
+        if candidate_scope == target_scope:
+            return candidate_id, target_scope
+    return None, target_scope
+
+
+def _record_create_dedup(
+    conn: sqlite3.Connection,
+    *,
+    existing_task_id: str,
+    reason: str,
+    title: str,
+    scope: tuple[str, tuple[str, ...], tuple[str, ...]],
+    attempted_by: Optional[str],
+    idempotency_key_supplied: bool,
+) -> None:
+    """Durably expose every suppressed create re-mint on the existing card."""
+    tenant_scope, parent_scope, location_scope = scope
+    payload = {
+        "existing_task_id": existing_task_id,
+        "reason": reason,
+        "normalized_title": _normalize_task_title(title),
+        "scope": {
+            "tenant": tenant_scope,
+            "parents": list(parent_scope),
+            "location": list(location_scope),
+        },
+        "attempted_by": attempted_by,
+        "idempotency_key_supplied": idempotency_key_supplied,
+    }
+    _append_event(conn, existing_task_id, "create_deduplicated", payload)
+    _log.warning(
+        "kanban create re-mint suppressed existing_task_id=%s reason=%s "
+        "normalized_title=%r scope=%r",
+        existing_task_id,
+        reason,
+        payload["normalized_title"],
+        payload["scope"],
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3235,6 +3721,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    allow_open_duplicate: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3246,8 +3733,22 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate. Independently, an open task with the same
+    conservative normalized title + scope (board, tenant, parent set, and
+    project/workspace identity) wins even when the retry supplies a fresh key.
+    Both paths append ``create_deduplicated`` to the existing task timeline.
+
+    The workspace half of that scope is the workspace *kind*, plus the path
+    only for ``dir`` tasks. ``scratch`` and ``worktree`` paths are rewritten to
+    a task-id-keyed directory by the dispatcher at claim time, so including
+    them would make a running card un-matchable — see
+    ``_PATH_SCOPED_WORKSPACE_KINDS``.
+
+    ``allow_open_duplicate=True`` bypasses the title+scope fence for the caller
+    that genuinely wants a second open card for equivalent work (surfaced as
+    ``hermes kanban create --allow-duplicate``). It is the escape hatch for a
+    false positive; it does NOT bypass the ``idempotency_key`` check, which
+    remains an explicit contract the caller opted into.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3445,21 +3946,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3487,6 +3973,71 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Both idempotency-key and title+scope checks live under the
+                # same BEGIN IMMEDIATE as the insert. Concurrent creators can
+                # no longer both observe absence and mint two open cards.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        existing_id = str(row["id"])
+                        # Scope is only needed for the audit payload here — the
+                        # key already decided the match. Computing it directly
+                        # avoids a second full open-card sweep on every keyed
+                        # retry, inside the exclusive write txn.
+                        scope = _normalize_task_scope(
+                            tenant=tenant,
+                            parents=parents,
+                            project_id=project_id,
+                            workspace_kind=workspace_kind,
+                            workspace_path=workspace_path,
+                        )
+                        _record_create_dedup(
+                            conn,
+                            existing_task_id=existing_id,
+                            reason="idempotency_key",
+                            title=title,
+                            scope=scope,
+                            attempted_by=created_by,
+                            idempotency_key_supplied=True,
+                        )
+                        return existing_id
+
+                duplicate_id = None
+                if allow_open_duplicate:
+                    scope = _normalize_task_scope(
+                        tenant=tenant,
+                        parents=parents,
+                        project_id=project_id,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                    )
+                else:
+                    duplicate_id, scope = _find_open_title_scope_duplicate(
+                        conn,
+                        title=title,
+                        tenant=tenant,
+                        parents=parents,
+                        project_id=project_id,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                    )
+                if duplicate_id is not None:
+                    _record_create_dedup(
+                        conn,
+                        existing_task_id=duplicate_id,
+                        reason="normalized_title_scope",
+                        title=title,
+                        scope=scope,
+                        attempted_by=created_by,
+                        idempotency_key_supplied=bool(idempotency_key),
+                    )
+                    return duplicate_id
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3537,6 +4088,31 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Stage parent links before the task insert (inside this same
+                # transaction) so the INSERT trigger can distinguish a real
+                # dependency-held authority parking state from an orphaned
+                # executor card. ``task_links`` intentionally has no FK; a
+                # failed task insert rolls these rows back atomically.
+                for pid in parents:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (pid, task_id),
+                    )
+
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=title.strip(),
+                    body=body,
+                    assignee=assignee,
+                    status=task_status,
+                    has_open_parent=_parents_have_open_task(conn, parents),
+                    task_id=task_id,
+                )
+                if assignment_denial is not None:
+                    raise ValueError(
+                        f"kanban assignment policy: {assignment_denial}"
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3575,11 +4151,6 @@ def create_task(
                         session_id,
                     ),
                 )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
-                    )
                 _append_event(
                     conn,
                     task_id,
@@ -3734,7 +4305,29 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def _assignment_actor(actor: Optional[str]) -> str:
+    """Return non-empty provenance for an assignment event.
+
+    Explicit caller attribution wins. Direct library callers that do not yet
+    pass it retain profile-level provenance when available, and otherwise get
+    an auditable ``unknown`` marker rather than a silent blank.
+    """
+    explicit = (actor or "").strip()
+    if explicit:
+        return explicit
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile:
+        return f"profile:{profile}"
+    return "unknown"
+
+
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3743,7 +4336,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT title, body, status, claim_lock, assignee "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3752,6 +4347,17 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=row["title"],
+            body=row["body"],
+            assignee=profile,
+            status=row["status"],
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -3763,7 +4369,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        _append_event(
+            conn,
+            task_id,
+            "assigned",
+            {"assignee": profile, "actor": _assignment_actor(actor)},
+        )
         return True
 
 
@@ -4514,7 +5125,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, assignee, consecutive_failures, max_retries "
+            "SELECT id, title, body, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4538,6 +5149,20 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                assignment_denial = _assignment_guard_reason(
+                    conn,
+                    title=row["title"],
+                    body=row["body"],
+                    assignee=row["assignee"],
+                    status="ready",
+                    has_open_parent=False,
+                    task_id=task_id,
+                )
+                if assignment_denial is not None:
+                    # Keep dependency-held authority work safely parked. The
+                    # operator/bridge must first route executor work to a
+                    # spawnable lane (or leave authority work non-dispatching).
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4586,25 +5211,52 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "ready":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            # Fail closed for legacy rows imported before policy activation.
+            return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     # Active-PR custody blocks ordinary claims. A valid owner-bound Fable marker
     # opens exactly one claim and is consumed atomically with the new run.
+    prelock_pr_states: dict[str, Optional[str]] = {}
     active_prs = _active_pr_custody(
         conn,
         task_id,
         cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+        pr_states=prelock_pr_states,
     )
     resume_marker = _next_resume_marker(conn, task_id) if active_prs else None
     if active_prs and resume_marker is None:
         _append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
         return None
     with write_txn(conn):
+        # Do not reuse the pre-lock GitHub result. A PR can be reopened between
+        # the first check and BEGIN IMMEDIATE; carrying the CLOSED/MERGED cache
+        # into this transaction would then claim a card whose live PR has
+        # regained custody. Re-query under the single-writer lock immediately
+        # before the ready -> running CAS. Lookup errors remain fail-closed.
+        claim_pr_states: dict[str, Optional[str]] = {}
         fresh_active_prs = _active_pr_custody(
             conn,
             task_id,
             cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+            pr_states=claim_pr_states,
         )
         if fresh_active_prs:
             fresh_marker = _next_resume_marker(conn, task_id)
@@ -4761,6 +5413,23 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    policy_row = conn.execute(
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if policy_row is not None and policy_row["status"] == "review":
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=policy_row["title"],
+            body=policy_row["body"],
+            assignee=policy_row["assignee"],
+            status="running",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5069,6 +5738,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    actor: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -5086,7 +5756,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, actor=actor)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -6270,7 +6940,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT title, body, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6298,6 +6969,18 @@ def promote_task(
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
+
+    assignment_denial = _assignment_guard_reason(
+        conn,
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+        status="ready",
+        has_open_parent=_task_has_open_parent(conn, task_id),
+        task_id=task_id,
+    )
+    if assignment_denial is not None:
+        return False, f"kanban assignment policy: {assignment_denial}"
 
     if dry_run:
         return True, None
@@ -6333,10 +7016,37 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT title, body, assignee, current_run_id FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
+        if stale is None:
+            return False
+        # Re-gate on parent completion before flipping 'blocked' back to
+        # 'ready'. Unconditionally setting status='ready' here bypasses the
+        # parent-completion invariant (the dispatcher trusts that column);
+        # if parents are still in progress the task must wait in 'todo'
+        # until recompute_ready picks it up. RCA: Bug 2 at
+        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=stale["title"],
+            body=stale["body"],
+            assignee=stale["assignee"],
+            status=new_status,
+            has_open_parent=bool(undone_parents),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            return False
+        if stale["current_run_id"]:
             conn.execute(
                 """
                 UPDATE task_runs
@@ -6348,19 +7058,6 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -6681,6 +7378,21 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        effective_title = title.strip() if title is not None else existing["title"]
+        effective_body = body if body is not None else existing["body"]
+        effective_assignee = assignee if assignee is not None else existing["assignee"]
+        assignment_denial = _assignment_guard_reason(
+            conn,
+            title=effective_title,
+            body=effective_body,
+            assignee=effective_assignee,
+            status="todo",
+            has_open_parent=_task_has_open_parent(conn, task_id),
+            task_id=task_id,
+        )
+        if assignment_denial is not None:
+            raise ValueError(f"kanban assignment policy: {assignment_denial}")
+
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -6908,15 +7620,15 @@ def decompose_triage_task(
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
-    _seen = 0
+    _topological_order: list[int] = []
     while _queue:
         _node = _queue.pop()
-        _seen += 1
+        _topological_order.append(_node)
         for _nb in _adj[_node]:
             _in_deg[_nb] -= 1
             if _in_deg[_nb] == 0:
                 _queue.append(_nb)
-    if _seen != len(children):
+    if len(_topological_order) != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
     # We do the full decomposition in a SINGLE write_txn so it's
@@ -6946,12 +7658,22 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Allocate every id and stage sibling dependency intents before any
+        # child INSERT. The transaction hides the partial graph from readers;
+        # topological insertion ensures each referenced parent row exists when
+        # the assignment-policy trigger checks a parked authority executor.
+        child_ids = [_new_task_id() for _child in children]
         for idx, child in enumerate(children):
-            new_id = _new_task_id()
+            for p_idx in child.get("parents") or []:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (child_ids[p_idx], child_ids[idx]),
+                )
+
+        for idx in _topological_order:
+            child = children[idx]
+            new_id = child_ids[idx]
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
@@ -6998,18 +7720,13 @@ def decompose_triage_task(
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
-            child_ids.append(new_id)
 
-        # Link children to their sibling parents (within the decomposed graph).
+        # Emit link events only after every child row exists. The dependency
+        # edges themselves were staged before insertion for trigger visibility.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
-                conn.execute(
-                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                    "VALUES (?, ?)",
-                    (parent_id, child_id),
-                )
                 _append_event(
                     conn, child_id, "linked",
                     {"parent": parent_id, "child": child_id},
@@ -7070,13 +7787,47 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+_ARCHIVE_IDENTITY_FIELDS = ("title", "body", "created_by", "idempotency_key")
+
+
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_identity: Optional[dict[str, str]] = None,
+    recompute_dependents: bool = True,
+) -> bool:
+    """Archive a task, optionally guarded by its complete immutable identity."""
+    guard_sql = ""
+    guard_params: list[object] = []
+    if expected_identity is not None:
+        if set(expected_identity) != set(_ARCHIVE_IDENTITY_FIELDS):
+            raise ValueError(
+                "expected_identity must contain exactly: "
+                + ", ".join(_ARCHIVE_IDENTITY_FIELDS)
+            )
+        guard_sql = (
+            " AND title IS ? AND body IS ?"
+            " AND created_by IS ? AND idempotency_key IS ?"
+        )
+        guard_params = [expected_identity[field] for field in _ARCHIVE_IDENTITY_FIELDS]
+    if not recompute_dependents:
+        if expected_identity is None:
+            raise ValueError(
+                "recompute_dependents=False requires an expected_identity guard"
+            )
+        guard_sql += (
+            " AND NOT EXISTS ("
+            "SELECT 1 FROM task_links "
+            "WHERE parent_id = tasks.id OR child_id = tasks.id"
+            ")"
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'" + guard_sql,
+            (task_id, *guard_params),
         )
         if cur.rowcount != 1:
             return False
@@ -7092,7 +7843,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
+    if recompute_dependents:
+        recompute_ready(conn)
     return True
 
 
@@ -7570,6 +8322,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_REWORK_TITLE_RE = re.compile(
+    r"(?:^|[\s\[\](:-])(?:REWORK|FIX)(?=$|[\s\]\):_-])",
+    re.IGNORECASE,
+)
+
+
 def _canonical_pr_urls_from_text(body: str) -> tuple[str, ...]:
     """Return ordered, de-duplicated canonical GitHub PR URLs in ``body``."""
     urls: list[str] = []
@@ -7659,6 +8417,12 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_lane_ineligible: list[tuple[str, str, str]] = field(default_factory=list)
+    """Ready tasks fenced before claim as ``(task_id, assignee, reason)``.
+
+    This is a hard no-spawn outcome backed by the same assignment policy used
+    by typed APIs and SQLite triggers; reasons include the lane name so daemon
+    and CLI receipts are actionable without another board query."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -7671,6 +8435,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    brief_path_blocked: list[str] = field(default_factory=list)
+    """Remote-host cards blocked this tick by brief-path-guard (rc 4)."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -7842,6 +8608,8 @@ _DISPOSITION_EVENT_DETAIL_KEYS = (
     "source_comment_id",
     "source_status",
     "window_seconds",
+    "guard_rc",
+    "guard_state",
 )
 
 
@@ -9245,10 +10013,105 @@ def _active_pr_custody(
     task_id: str,
     *,
     cutoff: int,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
 ) -> tuple[str, ...]:
-    """Ordered canonical PR URLs this card actually owns inside the window."""
+    """Ordered PR URLs that still guard this card after live-state checks."""
     owned, _ = _active_pr_candidates(conn, task_id, cutoff=cutoff)
-    return tuple(str(record["canonical_url"]) for record in owned)
+    guarding = _guarding_active_pr_candidates(
+        conn,
+        task_id,
+        owned,
+        pr_states=pr_states,
+        allow_state_lookup=allow_state_lookup,
+    )
+    return tuple(str(record["canonical_url"]) for record in guarding)
+
+
+def _github_pull_state(pr_url: str) -> Optional[str]:
+    """Return GitHub's live PR state, or ``None`` when it cannot be verified.
+
+    ``None`` intentionally fails closed: a transient GitHub/``gh`` failure must
+    not turn the duplicate-author guard into a release-everything switch.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    state = proc.stdout.strip().upper()
+    return state if state in {"OPEN", "CLOSED", "MERGED"} else None
+
+
+def _title_marks_matching_pr_rework(title: str, pr_url: str) -> bool:
+    """Return true only for an explicit REWORK/FIX title naming this PR."""
+    if _RESPAWN_GUARD_REWORK_TITLE_RE.search(title or "") is None:
+        return False
+    match = _RESPAWN_GUARD_PR_URL_RE.fullmatch(pr_url)
+    if match is None:
+        return False
+    if pr_url in _canonical_pr_urls_from_text(title or ""):
+        return True
+    repo = re.escape(match.group("repo"))
+    number = re.escape(str(int(match.group("number"))))
+    if any(
+        pattern.search(title or "") is not None
+        for pattern in (
+            re.compile(rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*{number}\b", re.IGNORECASE),
+            re.compile(rf"\bPR\s*#?\s*{number}\b", re.IGNORECASE),
+        )
+    ):
+        return True
+    compound = re.compile(
+        rf"(?<![A-Za-z0-9_.-]){repo}\s*#\s*\d+"
+        rf"(?:\s*(?:\+|,|/|&|\band\b)\s*#\s*\d+)+",
+        re.IGNORECASE,
+    )
+    return any(
+        str(int(number))
+        in {str(int(value)) for value in re.findall(r"#\s*(\d+)", group.group(0))}
+        for group in compound.finditer(title or "")
+    )
+
+
+def _guarding_active_pr_candidates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owned: Sequence[Mapping[str, Any]],
+    *,
+    pr_states: Optional[MutableMapping[str, Optional[str]]] = None,
+    allow_state_lookup: bool = True,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return owned PRs not released by either narrow exemption predicate."""
+    row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    title = str(row["title"] or "") if row is not None else ""
+    guarding: list[Mapping[str, Any]] = []
+    for record in owned:
+        pr_url = str(record["canonical_url"])
+        if _title_marks_matching_pr_rework(title, pr_url):
+            continue
+        if pr_states is not None and pr_url in pr_states:
+            state = pr_states[pr_url]
+        elif allow_state_lookup:
+            state = _github_pull_state(pr_url)
+            if pr_states is not None:
+                pr_states[pr_url] = state
+        else:
+            state = None
+        if state is not None and state != "OPEN":
+            continue
+        guarding.append(record)
+    return tuple(guarding)
 
 
 _RESUME_MARKER_KIND = "resume_marker"
@@ -9733,9 +10596,10 @@ def check_respawn_guard(
     # blocks respawn; a bare citation of another card's PR no longer freezes.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
-    if owned:
+    guarding = _guarding_active_pr_candidates(conn, task_id, owned)
+    if guarding:
         if detail_out is not None:
-            detail_out.update(_active_pr_guard_detail(owned, disowned))
+            detail_out.update(_active_pr_guard_detail(guarding, disowned))
         return "active_pr"
     if disowned:
         detail = _active_pr_guard_detail((), disowned)
@@ -9790,14 +10654,244 @@ def record_respawn_guard_decision(
 
 
 def _assignee_has_spawn_target(assignee: Optional[str]) -> bool:
-    """Preserve the local-lineage profile predicate behind one dispatch hook."""
+    """Return whether an assignee names a concrete local worker profile.
+
+    ``default`` is the base control-plane profile, not a dispatcher worker.
+    Unknown profiles and partial installs fail closed so a typo or degraded
+    profile registry cannot fall through to a metered base-config process.
+    """
     if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        canonical = normalize_profile_name(assignee)
+    except Exception:
+        canonical = str(assignee).strip().casefold()
+        if not canonical:
+            return False
+    if canonical == "default":
         return False
     try:
         from hermes_cli.profiles import profile_exists
     except Exception:
-        return True
+        return False
     return bool(profile_exists(assignee))
+
+
+# ---------------------------------------------------------------------------
+# Cross-host brief-path guard (criterion 13 / t_3d64f74b)
+#
+# A brief that cites a godmode-bus path present on blitz and absent on the
+# remote host is how VPS2 workers silently work without the input they were
+# told to read. The checker lives at ~/godmode-bus/bin/brief-path-guard.sh
+# (rc 0 pass / 4 violation / 5 unverifiable). Dispatch is the only place that
+# knows card→host binding at spawn time, so it is the enforcement point.
+#
+# Policy (availability over a wedged board):
+#   rc 4 → do not spawn; card → blocked; violations as a comment
+#   rc 5 → spawn; UNVERIFIABLE lines as a warning comment
+#   rc 0 → spawn
+#   missing script / timeout / rc 1/2 / signal → spawn + warning comment
+# ---------------------------------------------------------------------------
+
+BRIEF_PATH_GUARD_ENV = "HERMES_BRIEF_PATH_GUARD"
+BRIEF_PATH_GUARD_TIMEOUT_SEC = 20
+BRIEF_PATH_GUARD_AUTHOR = "brief-path-guard"
+_BRIEF_PATH_GUARD_EVENT = "brief_path_guard"
+
+
+def _assignee_is_remote_host(assignee: Optional[str]) -> bool:
+    """True when the assignee names a non-blitz host lane (``vps2*``).
+
+    Matches ``brief-path-guard.sh --audit`` (``assignee LIKE 'vps2%'``).
+    """
+    return (assignee or "").strip().lower().startswith("vps2")
+
+
+def _brief_path_guard_script() -> Optional[Path]:
+    override = (os.environ.get(BRIEF_PATH_GUARD_ENV) or "").strip()
+    candidate = Path(override) if override else (
+        Path.home() / "godmode-bus" / "bin" / "brief-path-guard.sh"
+    )
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _brief_text_for_guard(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    parts = [row["title"] or "", row["body"] or ""]
+    return "\n".join(part for part in parts if part)
+
+
+def _brief_path_guard_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _latest_brief_path_guard_event(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == _BRIEF_PATH_GUARD_EVENT and isinstance(event.payload, dict):
+            return dict(event.payload)
+    return None
+
+
+def run_brief_path_guard(*, task_id: str, body: str) -> tuple[int, str]:
+    """Exec ``brief-path-guard.sh --stdin --host vps2``.
+
+    Returns ``(rc, combined_output)``. Uses ``--stdin`` with the dispatcher's
+    own brief text so the check is board-local (temp DBs, no sudo against
+    ``/var/lib/boardd``) and matches the bytes about to be dispatched.
+    """
+    script = _brief_path_guard_script()
+    if script is None:
+        return 2, "brief-path-guard missing; fail-open (availability over strictness)"
+    argv = [str(script), "--stdin", "--host", "vps2"]
+    try:
+        proc = subprocess.run(
+            argv,
+            input=body or "",
+            text=True,
+            capture_output=True,
+            timeout=BRIEF_PATH_GUARD_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = f"{exc.stdout or ''}{exc.stderr or ''}"
+        return 2, (
+            f"brief-path-guard timeout after {BRIEF_PATH_GUARD_TIMEOUT_SEC}s"
+            + (f"\n{out}" if out.strip() else "")
+        )
+    except Exception as exc:
+        return 2, f"brief-path-guard exec failed: {type(exc).__name__}: {exc}"
+    out = f"{proc.stdout or ''}{proc.stderr or ''}"
+    rc = int(proc.returncode)
+    if rc < 0:
+        return 2, f"brief-path-guard killed by signal {-rc}\n{out}".rstrip()
+    return rc, out.strip()
+
+
+def _record_brief_path_guard_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    rc: int,
+    body_sha256: str,
+    output: str,
+) -> None:
+    state = {0: "pass", 4: "violation", 5: "unverifiable"}.get(rc, "error")
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            _BRIEF_PATH_GUARD_EVENT,
+            {
+                "rc": rc,
+                "state": state,
+                "body_sha256": body_sha256,
+                "output": (output or "")[:2000],
+            },
+        )
+
+
+def _comment_brief_path_guard(conn: sqlite3.Connection, task_id: str, body: str) -> None:
+    text = (body or "").strip()
+    if not text:
+        return
+    try:
+        add_comment(conn, task_id, BRIEF_PATH_GUARD_AUTHOR, text)
+    except Exception:
+        _log.debug("brief-path-guard: failed to comment on %s", task_id, exc_info=True)
+
+
+def _enforce_brief_path_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    *,
+    dry_run: bool,
+) -> Optional[tuple[str, str, dict[str, Any]]]:
+    """Run the remote-host brief guard. Return a stop disposition or None."""
+    if not _assignee_is_remote_host(assignee):
+        return None
+    brief = _brief_text_for_guard(conn, task_id)
+    body_hash = _brief_path_guard_hash(brief)
+    prior = _latest_brief_path_guard_event(conn, task_id)
+    if prior and prior.get("body_sha256") == body_hash:
+        if int(prior.get("rc") or 0) != 4:
+            return None
+        if not dry_run:
+            task = get_task(conn, task_id)
+            if task is not None and task.status == "ready":
+                block_task(
+                    conn,
+                    task_id,
+                    reason="brief-path-guard: remote worker cannot read cited bus path",
+                    kind="needs_input",
+                )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    rc, output = run_brief_path_guard(task_id=task_id, body=brief)
+    if not dry_run:
+        _record_brief_path_guard_event(
+            conn, task_id, rc=rc, body_sha256=body_hash, output=output
+        )
+
+    if rc == 4:
+        if not dry_run:
+            _comment_brief_path_guard(
+                conn,
+                task_id,
+                "VIOLATION: brief cites a blitz-only godmode-bus path the "
+                "remote worker cannot read. Card blocked; do not spawn.\n\n"
+                f"{output}\n\n"
+                "Fix: copy the file into ~/godmode-bus/vps2-outbox/ (bridge "
+                "push) or attach via boardd, and cite a path that exists on "
+                "the target host.",
+            )
+            block_task(
+                conn,
+                task_id,
+                reason="brief-path-guard: remote worker cannot read cited bus path",
+                kind="needs_input",
+            )
+        return (
+            "skipped",
+            "brief_path_guard",
+            {
+                "assignee": assignee,
+                "guard_rc": 4,
+                "guard_state": "violation",
+            },
+        )
+    if rc == 5 and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "UNVERIFIABLE brief-path-guard (non-fatal; leaving for remote "
+            f"claim / spawn):\n\n{output}",
+        )
+    elif rc not in (0, 4, 5) and not dry_run:
+        _comment_brief_path_guard(
+            conn,
+            task_id,
+            "brief-path-guard error (fail-open; leaving for remote claim / "
+            f"spawn): rc={rc}\n\n{output}",
+        )
+    return None
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10059,20 +11153,13 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Resolve through the same fail-closed predicate as explicit assignees.
+    # Bare ``default`` and missing profiles must never mint a base-config
+    # worker as an implicit fallback.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    _default_assignee_resolved = bool(
+        _default_assignee and _assignee_has_spawn_target(_default_assignee)
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             _record_ready_disposition(
@@ -10152,6 +11239,57 @@ def _dispatch_once_locked(
                     dry_run=dry_run,
                 )
                 continue
+        candidate_task = get_task(conn, row["id"])
+        if candidate_task is None:
+            continue
+        lane_denial = _assignment_guard_reason(
+            conn,
+            title=candidate_task.title,
+            body=candidate_task.body,
+            assignee=row_assignee,
+            status="ready",
+            has_open_parent=_task_has_open_parent(conn, row["id"]),
+            task_id=row["id"],
+            old_title=candidate_task.title,
+            old_body=candidate_task.body,
+            old_assignee=candidate_task.assignee,
+            old_status=candidate_task.status,
+        )
+        if lane_denial:
+            result.skipped_lane_ineligible.append(
+                (row["id"], row_assignee, lane_denial)
+            )
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="lane_ineligible",
+                detail={"assignee": row_assignee, "policy_reason": lane_denial},
+                dry_run=dry_run,
+            )
+            continue
+
+        # Cross-host brief-path guard: a vps2* card whose brief cites a
+        # blitz-only godmode-bus path must not stay claimable. Run before
+        # the local-profile spawn check so remote lanes (claimed by
+        # vps2-dispatch, skipped here as nonspawnable) are still gated.
+        guard_stop = _enforce_brief_path_guard(
+            conn, row["id"], row_assignee, dry_run=dry_run
+        )
+        if guard_stop is not None:
+            outcome, reason, detail = guard_stop
+            result.brief_path_blocked.append(row["id"])
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                outcome,
+                reason=reason,
+                detail=detail,
+                dry_run=dry_run,
+            )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -10408,11 +11546,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_has_spawn_target(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
@@ -10853,6 +11987,11 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    if profile_arg == "default":
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no spawn target "
+            "(fail-closed; default never spawns a kanban worker)"
+        )
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -10875,12 +12014,11 @@ def _default_spawn(
     from hermes_cli.profiles import resolve_profile_env
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Kanban spawn refused: assignee profile {profile_arg!r} "
+            "is unresolvable"
+        ) from exc
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
