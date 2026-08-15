@@ -3083,6 +3083,74 @@ def test_prune_revalidates_candidate_instead_of_trusting_cutover_marker(
     assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
 
 
+def test_prune_holds_candidate_custody_through_intent_and_plaintext_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    _sqlite_backup(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    marker_sha = _sha(stage / "rollback" / "CANDIDATE-CUTOVER.json")
+    bundle = stage / "rollback" / "rollback-source-bundle.tar.gz"
+    source_bundle = stage / "rollback" / "source-bundle"
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    original_prepare = cold._prepare_source_bundle_prune
+    swapped = False
+    write_reservation_held = False
+
+    def prepare_then_swap(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal swapped, write_reservation_held
+        prepared = original_prepare(*args, **kwargs)
+        contender = sqlite3.connect(db_path, timeout=0)
+        try:
+            try:
+                contender.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                assert "locked" in str(exc).lower()
+                write_reservation_held = True
+            else:
+                contender.execute("ROLLBACK")
+        finally:
+            contender.close()
+        os.replace(db_path, displaced_post_retention)
+        os.replace(pre_retention, db_path)
+        swapped = True
+        return prepared
+
+    monkeypatch.setattr(cold, "_prepare_source_bundle_prune", prepare_then_swap)
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        )
+
+    assert swapped is True
+    assert write_reservation_held is True
+    assert bundle.exists()
+    assert source_bundle.exists()
+    assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
+    assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNED.json").exists()
+
+
 def test_every_installed_fts_root_is_rebuilt_and_reverified_after_commit(
     tmp_path: Path,
 ) -> None:

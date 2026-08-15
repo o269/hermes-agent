@@ -3277,6 +3277,78 @@ def _verify_post_commit_candidate(
     }
 
 
+def _assert_prune_candidate_path_custody(
+    conn: sqlite3.Connection,
+    source: Path,
+    manifest: dict[str, Any],
+    retention: dict[str, Any],
+) -> None:
+    """Prove the locked descriptor still owns the receipt-bound pathname."""
+
+    if not conn.in_transaction:
+        raise ColdArchiveError(
+            "source-bundle prune candidate custody requires BEGIN IMMEDIATE"
+        )
+    expected = retention.get("post_commit_candidate")
+    if not isinstance(expected, dict) or expected.get("verified") is not True:
+        raise ColdArchiveError("source-bundle prune lacks candidate binding")
+    try:
+        info = source.stat()
+    except OSError as exc:
+        raise ColdArchiveError(
+            "candidate path identity changed during source-bundle prune"
+        ) from exc
+    _validate_candidate_path_identity(source, manifest)
+    if (
+        str(source) != expected.get("path")
+        or info.st_dev != expected.get("device")
+        or info.st_ino != expected.get("inode")
+    ):
+        raise ColdArchiveError(
+            "candidate path identity changed during source-bundle prune"
+        )
+
+
+@contextmanager
+def _hold_prune_candidate_custody(
+    source: Path,
+    manifest: dict[str, Any],
+    retention: dict[str, Any],
+) -> Iterator[Callable[[], None]]:
+    """Hold one SQLite write reservation and pathname proof through prune."""
+
+    conn = _connect_candidate(source)
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.DatabaseError as exc:
+            raise ColdArchiveError(
+                "could not reserve candidate writes for source-bundle prune"
+            ) from exc
+
+        def assert_bound() -> None:
+            _assert_prune_candidate_path_custody(conn, source, manifest, retention)
+
+        assert_bound()
+        expected = retention.get("post_commit_candidate")
+        if _logical_snapshot_sha256(conn) != expected.get("post_logical_sha256"):
+            raise ColdArchiveError(
+                "candidate logical state changed before source-bundle prune"
+            )
+        try:
+            yield assert_bound
+            assert_bound()
+            if _logical_snapshot_sha256(conn) != expected.get("post_logical_sha256"):
+                raise ColdArchiveError(
+                    "candidate logical state changed during source-bundle prune"
+                )
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
 def _retention_receipt_payload(
     stage: StageArtifacts,
     manifest: dict[str, Any],
@@ -3966,9 +4038,13 @@ def _prepare_source_bundle_prune(
 
 
 def _delete_private_source_bundle(
-    stage: StageArtifacts, prepared: dict[str, Any]
+    stage: StageArtifacts,
+    prepared: dict[str, Any],
+    *,
+    assert_candidate_bound: Callable[[], None],
 ) -> list[str]:
     deleted: list[str] = []
+    assert_candidate_bound()
     bundle_root = stage.rollback_dir / "source-bundle"
     raw_members = prepared.get("source_bundle_members")
     if not isinstance(raw_members, list):
@@ -3998,6 +4074,7 @@ def _delete_private_source_bundle(
                 raise ColdArchiveError(
                     "source-bundle member changed after prune intent"
                 )
+            assert_candidate_bound()
             private.unlink()
             deleted.append(str(private))
         private_root.rmdir()
@@ -4007,9 +4084,11 @@ def _delete_private_source_bundle(
         private_tar = _require_private_file(clear_tar)
         if sha256_path(private_tar) != prepared.get("rollback_bundle_sha256"):
             raise ColdArchiveError("rollback bundle changed after prune intent")
+        assert_candidate_bound()
         private_tar.unlink()
         deleted.append(str(private_tar))
     _fsync_directory(stage.rollback_dir)
+    assert_candidate_bound()
     return deleted
 
 
@@ -4161,28 +4240,49 @@ def prune_source_bundle_after_retention(
             raise ColdArchiveError("plaintext source bundle reappeared after prune")
         _require_private_file(stage.rollback_encrypted_path)
         return {**existing_pruned, "replayed": True}
-    prepared = _prepare_source_bundle_prune(
-        stage,
-        rollback_bundle_sha256=bundle_sha,
-        cutover_marker_sha256=approved_cutover_marker_sha256,
-    )
-    deleted = _delete_private_source_bundle(stage, prepared)
-    receipt = {
-        "operation": "hermes-source-bundle-pruned",
-        "pruned": True,
-        "pruned_at": utc_iso(current),
-        "pruned_at_epoch": current,
-        "cutover_epoch": cutover,
-        "minimum_retention_seconds": retention,
-        "rollback_bundle_sha256": bundle_sha,
-        "approved_cutover_marker_sha256": approved_cutover_marker_sha256,
-        "prepared_prune_sha256": sha256_path(stage.source_bundle_prune_prepared_path),
-        "deleted_local_plaintext_paths": deleted,
-        "remote_objects_deleted": False,
-        "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
-        "remote_authority": producer.get("remote_authority"),
-    }
-    _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
+    prepared_preexisting = stage.source_bundle_prune_prepared_path.exists()
+    with _hold_prune_candidate_custody(
+        source, manifest, retention_state
+    ) as assert_candidate_bound:
+        try:
+            prepared = _prepare_source_bundle_prune(
+                stage,
+                rollback_bundle_sha256=bundle_sha,
+                cutover_marker_sha256=approved_cutover_marker_sha256,
+            )
+            assert_candidate_bound()
+        except BaseException:
+            if (
+                not prepared_preexisting
+                and stage.source_bundle_prune_prepared_path.exists()
+            ):
+                _require_private_file(stage.source_bundle_prune_prepared_path).unlink()
+                _fsync_directory(stage.source_bundle_prune_prepared_path.parent)
+            raise
+        deleted = _delete_private_source_bundle(
+            stage,
+            prepared,
+            assert_candidate_bound=assert_candidate_bound,
+        )
+        receipt = {
+            "operation": "hermes-source-bundle-pruned",
+            "pruned": True,
+            "pruned_at": utc_iso(current),
+            "pruned_at_epoch": current,
+            "cutover_epoch": cutover,
+            "minimum_retention_seconds": retention,
+            "rollback_bundle_sha256": bundle_sha,
+            "approved_cutover_marker_sha256": approved_cutover_marker_sha256,
+            "prepared_prune_sha256": sha256_path(
+                stage.source_bundle_prune_prepared_path
+            ),
+            "deleted_local_plaintext_paths": deleted,
+            "remote_objects_deleted": False,
+            "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
+            "remote_authority": producer.get("remote_authority"),
+        }
+        _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
+        assert_candidate_bound()
     return receipt
 
 
