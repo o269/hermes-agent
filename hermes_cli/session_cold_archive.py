@@ -3237,6 +3237,33 @@ def _retention_receipt_payload(
     }
 
 
+def _publish_retention_receipt(
+    source: Path,
+    stage: StageArtifacts,
+    manifest: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish success only if the pathname still binds the verified post-state."""
+
+    report = receipt.get("retention")
+    if not isinstance(report, dict):
+        raise ColdArchiveError("retention receipt has no candidate post-state")
+    expected = report.get("post_commit_candidate")
+    if not isinstance(expected, dict) or expected.get("verified") is not True:
+        raise ColdArchiveError("retention receipt has no verified candidate binding")
+    _exclusive_write_json(stage.retention_receipt_path, receipt)
+    verified = _verify_post_commit_candidate(source, manifest, report)
+    if verified != expected:
+        raise ColdArchiveError(
+            "published retention receipt candidate binding no longer matches"
+        )
+    return {
+        **receipt,
+        "receipt_path": str(stage.retention_receipt_path),
+        "receipt_sha256": sha256_path(stage.retention_receipt_path),
+    }
+
+
 def _recover_committed_prepared_apply(
     source: Path,
     stage: StageArtifacts,
@@ -3290,12 +3317,7 @@ def _recover_committed_prepared_apply(
         report=report,
         recovered_from_prepared=True,
     )
-    _exclusive_write_json(stage.retention_receipt_path, receipt)
-    return {
-        **receipt,
-        "receipt_path": str(stage.retention_receipt_path),
-        "receipt_sha256": sha256_path(stage.retention_receipt_path),
-    }
+    return _publish_retention_receipt(source, stage, manifest, receipt)
 
 
 def _validate_final_retention_receipt(
@@ -3494,12 +3516,7 @@ def run_cold_archive_pass(
                 custody=custody,
                 report=report,
             )
-            _exclusive_write_json(stage.retention_receipt_path, receipt)
-            return {
-                **receipt,
-                "receipt_path": str(stage.retention_receipt_path),
-                "receipt_sha256": sha256_path(stage.retention_receipt_path),
-            }
+            return _publish_retention_receipt(source, stage, manifest, receipt)
 
         age_recipient_bytes: bytes | None = None
         if not manifest_only:
@@ -3654,6 +3671,35 @@ def _producer_has_verified_rollback_remote(
     return False
 
 
+def _load_stage_candidate_verification_manifest(
+    stage: StageArtifacts,
+) -> dict[str, Any]:
+    """Load the stage manifest plus restricted IDs needed for candidate binding."""
+
+    manifest = _load_private_json(stage.manifest_path)
+    if manifest.get("archive_manifest_version") != _ARCHIVE_VERSION:
+        raise ColdArchiveError("unsupported Gate-B manifest version at cutover")
+    if _manifest_digest(manifest) != manifest.get("manifest_sha256"):
+        raise ColdArchiveError("Gate-B manifest digest mismatch at cutover")
+    _validate_manifest_cold_age_policy(manifest)
+    ids_payload = _load_private_json(stage.restricted_ids_path)
+    raw_ids = ids_payload.get("selected_ids")
+    if not isinstance(raw_ids, list) or any(
+        not isinstance(value, str) for value in raw_ids
+    ):
+        raise ColdArchiveError("restricted selected IDs are invalid at cutover")
+    if len(raw_ids) != len(set(raw_ids)):
+        raise ColdArchiveError("restricted selected IDs contain duplicates at cutover")
+    ids = sorted(raw_ids)
+    if _ids_digest(ids) != manifest.get("selected_ids_sha256") or len(ids) != int(
+        manifest.get("counts", {}).get("selected_sessions", -1)
+    ):
+        raise ColdArchiveError(
+            "restricted selected IDs do not match the manifest at cutover"
+        )
+    return {**manifest, "_restricted_selected_ids": ids}
+
+
 def record_candidate_cutover(
     stage_root: Path,
     *,
@@ -3676,6 +3722,8 @@ def record_candidate_cutover(
     retention_receipt = _load_private_json(stage.retention_receipt_path)
     prepared = _load_private_json(stage.apply_prepared_path)
     producer_sha = sha256_path(stage.producer_receipt_path)
+    manifest_file_sha = sha256_path(stage.manifest_path)
+    manifest = _load_stage_candidate_verification_manifest(stage)
     retention = retention_receipt.get("retention")
     if (
         policy.get("operation") != "hermes-source-bundle-retention-policy"
@@ -3696,10 +3744,28 @@ def record_candidate_cutover(
         != retention_receipt.get("gate_b_manifest_sha256")
         or policy.get("gate_b_manifest_sha256")
         != producer.get("gate_b_manifest_sha256")
+        or producer.get("manifest_file_sha256") != manifest_file_sha
+        or retention_receipt.get("approved_manifest_file_sha256") != manifest_file_sha
+        or producer.get("gate_b_manifest_sha256") != manifest.get("manifest_sha256")
+        or retention_receipt.get("gate_b_manifest_sha256")
+        != manifest.get("manifest_sha256")
     ):
         raise ColdArchiveError(
             "verified applied retention receipt is required at cutover"
         )
+    post_commit = retention.get("post_commit_candidate")
+    source_db = producer.get("source_db")
+    if (
+        not isinstance(source_db, str)
+        or not source_db
+        or not Path(source_db).is_absolute()
+        or not isinstance(post_commit, dict)
+        or post_commit.get("path") != source_db
+    ):
+        raise ColdArchiveError(
+            "retention receipt does not bind the producer candidate path"
+        )
+    source = Path(source_db)
     bundle = _require_private_file(stage.rollback_bundle_path)
     bundle_sha = sha256_path(bundle)
     if policy.get("rollback_bundle_sha256") != bundle_sha:
@@ -3713,6 +3779,11 @@ def record_candidate_cutover(
         rclone_exe=rclone_exe,
         runner=rclone_runner,
     )
+    cutover_candidate = _verify_post_commit_candidate(source, manifest, retention)
+    if cutover_candidate != post_commit:
+        raise ColdArchiveError(
+            "cutover candidate no longer matches the retention receipt"
+        )
     if existing_marker is not None:
         existing_cutover = _finite_epoch(
             existing_marker.get("cutover_epoch"), "recorded cutover time"

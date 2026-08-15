@@ -2898,6 +2898,74 @@ def test_post_commit_reopen_rejects_candidate_namespace_swap_before_success_rece
     assert not (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
 
 
+def test_receipt_publication_rebinds_candidate_after_post_commit_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    shutil.copy2(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    original_write = cold._exclusive_write_json
+    swapped = False
+
+    def publish_then_swap(path: Path, payload: dict[str, Any]) -> Path:
+        nonlocal swapped
+        result = original_write(path, payload)
+        if path.name == "COLD-ARCHIVE-RETENTION-RECEIPT.json" and not swapped:
+            swapped = True
+            os.replace(db_path, displaced_post_retention)
+            os.replace(pre_retention, db_path)
+        return result
+
+    monkeypatch.setattr(cold, "_exclusive_write_json", publish_then_swap)
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        _apply(db_path, stage, config, producer, fake)
+
+    assert swapped is True
+    assert (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+    assert _readonly_rows(displaced_post_retention, "SELECT id FROM sessions") == []
+
+
+def test_cutover_reopens_candidate_and_rejects_post_receipt_namespace_swap(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    shutil.copy2(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    os.replace(db_path, displaced_post_retention)
+    os.replace(pre_retention, db_path)
+
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        cold.record_candidate_cutover(
+            stage,
+            candidate_health_confirmed=True,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=NOW + DAY,
+        )
+
+    assert not (stage / "rollback" / "CANDIDATE-CUTOVER.json").exists()
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+    assert _readonly_rows(displaced_post_retention, "SELECT id FROM sessions") == []
+
+
 def test_every_installed_fts_root_is_rebuilt_and_reverified_after_commit(
     tmp_path: Path,
 ) -> None:
