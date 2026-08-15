@@ -2693,6 +2693,10 @@ def test_apply_reverifies_every_remote_object_before_delete(
 def test_supported_rclone_directory_check_verifies_one_real_local_object(
     tmp_path: Path,
 ) -> None:
+    rclone_exe = shutil.which("rclone")
+    if rclone_exe is None:
+        pytest.skip("real rclone integration requires the optional rclone binary")
+
     local_dir = tmp_path / "local"
     local_dir.mkdir(mode=0o700)
     source = local_dir / "packet.age"
@@ -2708,7 +2712,7 @@ def test_supported_rclone_directory_check_verifies_one_real_local_object(
         remote_root=f"archive:{remote_dir}",
         rclone_config=config,
         namespace="one-object",
-        rclone_exe="rclone",
+        rclone_exe=rclone_exe,
     )
 
     assert len(reports) == 1
@@ -2721,6 +2725,35 @@ def test_supported_rclone_directory_check_verifies_one_real_local_object(
         "approved_config_sha256": _sha(config),
     }
     assert (remote_dir / "one-object" / source.name).read_bytes() == source.read_bytes()
+
+
+def test_rclone_single_object_check_uses_bounded_directory_operands(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "packet.age"
+    config = tmp_path / "rclone.conf"
+
+    command = cold._rclone_check_single_object_command(
+        rclone_exe="rclone",
+        local=source,
+        remote_object="archive:approved/root/packet.age",
+        config=config,
+    )
+
+    assert command == [
+        "rclone",
+        "check",
+        str(tmp_path),
+        "archive:approved/root",
+        "--checksum",
+        "--one-way",
+        "--include",
+        "/packet.age",
+        "--max-depth",
+        "1",
+        "--config",
+        str(config),
+    ]
 
 
 def test_apply_rejects_substitute_nonempty_board_and_changed_rclone_authority(
