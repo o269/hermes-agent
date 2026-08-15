@@ -132,6 +132,58 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_close_on_apply_tool_path(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "installed reviewed patch",
+        "applied_by": "fable",
+        "apply_evidence": "exact head abc123; live marker present",
+    })
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        comments = kb.list_comments(conn, worker_env)
+        events = kb.list_events(conn, worker_env)
+        assert task is not None and task.status == "done"
+        assert [comment.body for comment in comments] == [
+            "APPLIED / CLOSED: exact head abc123; live marker present"
+        ]
+        applied_closed = [event for event in events if event.kind == "applied_closed"]
+        assert len(applied_closed) == 1
+        assert applied_closed[0].payload == {
+            "actor": "fable",
+            "evidence": "exact head abc123; live marker present",
+        }
+        completed = next(event for event in events if event.kind == "completed")
+        assert completed.payload is not None
+        assert completed.payload["apply_receipt"]["actor"] == "fable"
+    finally:
+        conn.close()
+
+
+def test_complete_close_on_apply_tool_rejects_half_receipt(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "installed reviewed patch",
+        "applied_by": "fable",
+    })
+    assert "must be supplied together" in json.loads(out)["error"]
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status != "done"
+        assert kb.list_comments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
