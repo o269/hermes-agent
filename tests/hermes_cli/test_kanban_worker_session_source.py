@@ -22,6 +22,8 @@ def db(tmp_path, monkeypatch):
 
 def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     """The dispatcher tags the worker's env so its session is a `kanban` row."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profiles" / "worker").mkdir(parents=True)
     from hermes_cli import kanban_db as kb
 
     captured = {}
@@ -41,7 +43,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         id="t_b21733fb",
         title="ship it",
         body=None,
-        assignee="default",
+        assignee="worker",
         status="in_progress",
         priority=0,
         created_by=None,

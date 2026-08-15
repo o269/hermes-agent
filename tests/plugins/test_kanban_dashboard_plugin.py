@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,42 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_dashboard_create_and_reassign_share_authority_fence(
+    client,
+    kanban_home,
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  authority_profiles: fable\n",
+        encoding="utf-8",
+    )
+
+    rejected_create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "[AUTHOR] dashboard source-code patch",
+            "body": "Implement the change and open a PR.",
+            "assignee": "fable",
+        },
+    )
+    assert rejected_create.status_code == 400
+    assert "kanban assignment policy" in rejected_create.json()["detail"]
+
+    ordinary = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "[AUTHOR] dashboard source-code patch",
+            "body": "Implement the change and open a PR.",
+            "assignee": "engineer",
+        },
+    ).json()["task"]
+    rejected_reassign = client.patch(
+        f"/api/plugins/kanban/tasks/{ordinary['id']}",
+        json={"assignee": "fable"},
+    )
+    assert rejected_reassign.status_code == 409
+    assert "kanban assignment policy" in rejected_reassign.json()["detail"]
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -398,6 +435,54 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Bulk actions
 # ---------------------------------------------------------------------------
+
+
+def test_dashboard_assignment_callers_record_dashboard_actor(client):
+    task_ids = []
+    for title in ("patch", "bulk", "bulk-reassign", "endpoint-reassign"):
+        task = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": title, "assignee": "before"},
+        ).json()["task"]
+        task_ids.append(task["id"])
+
+    patch_response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_ids[0]}",
+        json={"assignee": "after-patch"},
+    )
+    bulk_response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_ids[1]], "assignee": "after-bulk"},
+    )
+    bulk_reassign_response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_ids[2]],
+            "assignee": "after-bulk-reassign",
+            "reclaim_first": True,
+        },
+    )
+    endpoint_response = client.post(
+        f"/api/plugins/kanban/tasks/{task_ids[3]}/reassign",
+        json={"profile": "after-endpoint", "reclaim_first": False},
+    )
+
+    assert patch_response.status_code == 200, patch_response.text
+    assert bulk_response.status_code == 200, bulk_response.text
+    assert bulk_reassign_response.status_code == 200, bulk_reassign_response.text
+    assert endpoint_response.status_code == 200, endpoint_response.text
+
+    with kb.connect() as conn:
+        for task_id in task_ids:
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'assigned' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert event is not None
+            assert json.loads(event["payload"])["actor"] == (
+                "caller:kanban-dashboard"
+            )
 
 
 def test_bulk_status_ready(client):

@@ -372,6 +372,14 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # Keep the fixture independent of developer-machine credentials.
+        # load_pool("anthropic") normally discovers a Claude Code singleton
+        # outside HERMES_HOME; if one exists, a nominally one-entry rotation
+        # test silently gains a second credential and exercises another path.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: None,
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -542,4 +550,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-

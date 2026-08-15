@@ -48,6 +48,9 @@ from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
 
+_MIN_FANOUT_TASKS = 2
+_MAX_FANOUT_TASKS = kb.MAX_DECOMPOSITION_CHILDREN
+
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
@@ -82,8 +85,8 @@ Rules:
     PARALLEL. Tasks with parents wait until every parent completes.
   - Prefer parallelism. If two tasks can be done independently, give
     them no parents so the dispatcher fans them out at once.
-  - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
-    cram everything into 1 task.
+  - Use 2-6 tasks for normal work. The hard safety maximum is 15 tasks;
+    never exceed it. Don't create tiny tasks or cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
@@ -355,6 +358,7 @@ def _normalize_assignee_choice(
 def decompose_task(
     task_id: str,
     *,
+    idempotency_key: Optional[str] = None,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
 ) -> DecomposeOutcome:
@@ -364,14 +368,54 @@ def decompose_task(
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+    Every decomposition requires a caller-stable idempotency key.
     """
+    idempotency_key = str(idempotency_key or "").strip()
+    if not idempotency_key:
+        logger.warning(
+            "decompose: blocked task=%s reason=missing_idempotency_key",
+            task_id,
+        )
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "decomposition idempotency key is required; task left unchanged",
+        )
+
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        repeated = (
+            kb.decomposition_result_for_key(conn, task_id, idempotency_key)
+            if task is not None
+            else None
+        )
+        hold_reason = (
+            kb.decomposition_hold_reason(conn, task_id) if task is not None else None
+        )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
+    if repeated is not None:
+        return DecomposeOutcome(
+            task_id,
+            True,
+            "idempotent no-op: decomposition key already applied",
+            fanout=bool(repeated),
+            child_ids=repeated,
+        )
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if hold_reason is not None:
+        logger.warning(
+            "decompose: blocked task=%s reason=%s",
+            task_id,
+            hold_reason,
+        )
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"control-plane hold: {hold_reason}; task left unchanged",
         )
 
     cfg = _load_config()
@@ -468,6 +512,21 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
         )
+    if not _MIN_FANOUT_TASKS <= len(raw_tasks) <= _MAX_FANOUT_TASKS:
+        logger.warning(
+            "decompose: blocked task=%s reason=fanout_cap requested_children=%d "
+            "allowed=%d-%d",
+            task_id,
+            len(raw_tasks),
+            _MIN_FANOUT_TASKS,
+            _MAX_FANOUT_TASKS,
+        )
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "decomposer returned fanout=true with "
+            f"{len(raw_tasks)} tasks; expected {_MIN_FANOUT_TASKS}-{_MAX_FANOUT_TASKS}",
+        )
 
     # Rewrite invalid assignees to the default fallback. Never leave a
     # task with assignee=None — the user explicitly does not want that.
@@ -520,6 +579,7 @@ def decompose_task(
                 task_id,
                 root_assignee=orchestrator,
                 children=children,
+                idempotency_key=idempotency_key,
                 author=audit_author,
                 auto_promote=auto_promote,
             )

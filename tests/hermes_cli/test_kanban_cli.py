@@ -232,6 +232,26 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 # reclaim + reassign CLI smoke tests
 # ---------------------------------------------------------------------------
 
+
+def test_run_slash_assign_and_reassign_record_cli_actor(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="attribute cli", assignee="before")
+
+    assert "Assigned" in kc.run_slash(f"assign {task_id} middle")
+    assert "Reassigned" in kc.run_slash(f"reassign {task_id} after")
+
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'assigned' ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    assert [json.loads(event["payload"]) for event in events] == [
+        {"actor": "caller:kanban-cli", "assignee": "middle"},
+        {"actor": "caller:kanban-cli", "assignee": "after"},
+    ]
+
+
 def test_run_slash_reclaim_running_task(kanban_home):
     import re
     import time

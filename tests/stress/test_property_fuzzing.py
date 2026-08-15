@@ -218,7 +218,7 @@ def random_op(rng, conn, kb, task_pool):
         # Reassignment isn't a direct API; simulate via assign_task
         new_a = rng.choice(["w1", "w2", "w3", None])
         try:
-            kb.assign_task(conn, tid, new_a)
+            kb.assign_task(conn, tid, new_a, actor="caller:property-fuzzer")
             return {"op": "reassign", "tid": tid, "to": new_a}
         except Exception as e:
             return {"op": "reassign", "tid": tid, "err": str(e)[:50]}

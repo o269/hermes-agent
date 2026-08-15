@@ -242,6 +242,31 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Authority-lane assignment policy
+
+Set `kanban.authority_profiles` to a comma-separated list such as `fable` to
+reserve those profiles for non-spawnable authority, live-action, and operator-
+custody cards. Executor-shaped work may wait on an authority profile only while
+dependency-held or under an explicit parking contract; it cannot become
+`ready`, `review`, or `running` there. Leave the setting empty (the default) to
+preserve legacy assignment behavior.
+
+Every supported assignment-writing surface converges on the same
+`hermes_cli.kanban_db` policy boundary:
+
+| Surface | Canonical assignment mutation |
+|---|---|
+| `hermes kanban create` / `assign` | `kanban_db.create_task` / `assign_task` |
+| `kanban_create` worker tool | `kanban_db.create_task` |
+| Dashboard create / single / bulk reassignment | `kanban_db.create_task` / `assign_task` |
+| `boardd` create / assign RPC | `kanban_db.create_task` / `assign_task` |
+| Internal reclaim/rebind | `kanban_db.reassign_task` |
+
+The one deliberate bypass is direct SQL used by privileged migration/repair
+code. Canonical connections still install the same assignment guard as SQLite
+`INSERT`/`UPDATE` triggers, so an unregistered writer fails closed. Do not treat
+raw SQL as a supported application assignment API.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -272,9 +297,9 @@ dispatcher auto-promotes it once the parent finishes). It never routes to
 `triage`.
 
 If you unblock a task and it later shows up in **`triage`**, the unblock is not
-what put it there. A subsequent *re-block for the same reason* did: after a task
-is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
-times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
+what put it there. A subsequent re-block did: after a task is blocked → unblocked
+→ re-blocked `BLOCK_RECURRENCE_LIMIT` times (default `2`), even when the reported
+reason or block kind changes, the unblock-loop breaker stops sending it back to `blocked`
 — where a cron would just keep unblocking it — and routes it to `triage` for a
 human decision. This is a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
@@ -293,7 +318,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated truly-blocked re-blocks auto-escalate to `triage`, even when the reason or kind changes. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -753,6 +778,7 @@ All commands are also available as a slash command in the interactive CLI and in
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_spawn_per_tick` | `4` | Hard per-tick burst fence: caps NEW worker spawns within a single dispatcher tick (ready and review spawns share the budget). Unlike `max_spawn`/`max_in_progress` (live-concurrency caps), this stops a fast-draining queue from respawning unboundedly in one tick and exhausting a provider's quota. Held tasks stay `ready` and retry next tick. Set to `0` to disable. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
@@ -996,7 +1022,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
-| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
+| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked `BLOCK_RECURRENCE_LIMIT` times (default 2), regardless of whether its reported reason or block kind changed. Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
 

@@ -462,6 +462,25 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_authority_executor_hits_shared_assignment_fence(
+    worker_env,
+    tmp_path,
+):
+    from tools import kanban_tools as kt
+
+    config_path = tmp_path / ".hermes" / "config.yaml"
+    config_path.write_text("kanban:\n  authority_profiles: fable\n", encoding="utf-8")
+
+    out = kt._handle_create({
+        "title": "[AUTHOR] tool source-code patch",
+        "body": "Implement the change and open a PR.",
+        "assignee": "fable",
+    })
+    result = json.loads(out)
+
+    assert "kanban assignment policy" in result["error"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
