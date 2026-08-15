@@ -51,6 +51,8 @@ _ROLLBACK_MEMBER_NAMES = {
     "-shm": "state.db-shm",
     "-journal": "state.db-journal",
 }
+_PRUNE_SOURCE_BUNDLE_QUARANTINE = ".source-bundle.prune-quarantine"
+_PRUNE_ROLLBACK_BUNDLE_QUARANTINE = ".rollback-source-bundle.tar.gz.prune-quarantine"
 _REQUIRED_FTS_OBJECTS = frozenset({
     "messages_fts",
     "messages_fts_insert",
@@ -4037,15 +4039,7 @@ def _prepare_source_bundle_prune(
     return prepared
 
 
-def _delete_private_source_bundle(
-    stage: StageArtifacts,
-    prepared: dict[str, Any],
-    *,
-    assert_candidate_bound: Callable[[], None],
-) -> list[str]:
-    deleted: list[str] = []
-    assert_candidate_bound()
-    bundle_root = stage.rollback_dir / "source-bundle"
+def _prune_member_reports(prepared: dict[str, Any]) -> dict[str, dict[str, Any]]:
     raw_members = prepared.get("source_bundle_members")
     if not isinstance(raw_members, list):
         raise ColdArchiveError("prepared source-bundle member list is invalid")
@@ -4055,41 +4049,139 @@ def _delete_private_source_bundle(
             r"[A-Za-z0-9._-]+", str(report.get("name") or "")
         ):
             raise ColdArchiveError("prepared source-bundle member is invalid")
-        expected[str(report["name"])] = report
-    if bundle_root.exists():
-        private_root = _require_private_dir(bundle_root)
-        current_names = {child.name for child in private_root.iterdir()}
-        if not current_names.issubset(expected):
-            raise ColdArchiveError(
-                "unexpected member appeared during source-bundle prune"
-            )
-        for name, report in expected.items():
-            child = private_root / name
-            if not child.exists():
-                continue
-            private = _require_private_file(child)
-            if private.stat().st_size != report.get("bytes") or sha256_path(
-                private
-            ) != report.get("sha256"):
-                raise ColdArchiveError(
-                    "source-bundle member changed after prune intent"
-                )
-            assert_candidate_bound()
-            private.unlink()
-            deleted.append(str(private))
-        private_root.rmdir()
-        deleted.append(str(private_root))
+        name = str(report["name"])
+        if name in expected:
+            raise ColdArchiveError("prepared source-bundle member is duplicated")
+        expected[name] = report
+    if not expected:
+        raise ColdArchiveError("prepared source-bundle member list is empty")
+    return expected
+
+
+def _prune_quarantine_paths(stage: StageArtifacts) -> tuple[Path, Path]:
+    return (
+        _safe_immediate_child(stage.rollback_dir, _PRUNE_SOURCE_BUNDLE_QUARANTINE),
+        _safe_immediate_child(stage.rollback_dir, _PRUNE_ROLLBACK_BUNDLE_QUARANTINE),
+    )
+
+
+def _path_lexists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _verify_prune_source_tree(
+    root: Path,
+    prepared: dict[str, Any],
+    *,
+    allow_missing: bool = False,
+) -> None:
+    expected = _prune_member_reports(prepared)
+    private_root = _require_private_dir(root)
+    current_names = {child.name for child in private_root.iterdir()}
+    if not current_names.issubset(expected) or (
+        not allow_missing and current_names != set(expected)
+    ):
+        raise ColdArchiveError("source-bundle staging members are inconsistent")
+    for name in current_names:
+        report = expected[name]
+        private = _require_private_file(private_root / name)
+        if private.stat().st_size != report.get("bytes") or sha256_path(
+            private
+        ) != report.get("sha256"):
+            raise ColdArchiveError("source-bundle member changed during prune staging")
+
+
+def _verify_prune_tar(path: Path, prepared: dict[str, Any]) -> None:
+    private_tar = _require_private_file(path)
+    if sha256_path(private_tar) != prepared.get("rollback_bundle_sha256"):
+        raise ColdArchiveError("rollback bundle changed during prune staging")
+
+
+def _restore_prune_plaintext(stage: StageArtifacts, prepared: dict[str, Any]) -> None:
+    """Restore quarantine names without clobber and prove the original bytes."""
+
+    bundle_root = stage.rollback_dir / "source-bundle"
     clear_tar = stage.rollback_bundle_path
-    if clear_tar.exists():
-        private_tar = _require_private_file(clear_tar)
-        if sha256_path(private_tar) != prepared.get("rollback_bundle_sha256"):
-            raise ColdArchiveError("rollback bundle changed after prune intent")
-        assert_candidate_bound()
-        private_tar.unlink()
-        deleted.append(str(private_tar))
+    staged_root, staged_tar = _prune_quarantine_paths(stage)
+    root_staged = _path_lexists(staged_root)
+    tar_staged = _path_lexists(staged_tar)
+    root_live = _path_lexists(bundle_root)
+    tar_live = _path_lexists(clear_tar)
+    if (root_staged and root_live) or (tar_staged and tar_live):
+        raise ColdArchiveError("prune recovery refuses to clobber plaintext")
+    if not root_staged and not root_live:
+        raise ColdArchiveError("source-bundle directory is missing during recovery")
+    if not tar_staged and not tar_live:
+        raise ColdArchiveError("rollback bundle is missing during recovery")
+    _verify_prune_source_tree(staged_root if root_staged else bundle_root, prepared)
+    _verify_prune_tar(staged_tar if tar_staged else clear_tar, prepared)
+    if root_staged:
+        os.replace(staged_root, bundle_root)
+    if tar_staged:
+        os.replace(staged_tar, clear_tar)
+    _fsync_directory(stage.rollback_dir)
+    _verify_prune_source_tree(bundle_root, prepared)
+    _verify_prune_tar(clear_tar, prepared)
+
+
+def _stage_prune_plaintext(
+    stage: StageArtifacts,
+    prepared: dict[str, Any],
+    *,
+    assert_candidate_bound: Callable[[], None],
+) -> list[str]:
+    """Atomically quarantine both plaintext authorities for reversible prune."""
+
+    bundle_root = stage.rollback_dir / "source-bundle"
+    clear_tar = stage.rollback_bundle_path
+    staged_root, staged_tar = _prune_quarantine_paths(stage)
+    if _path_lexists(staged_root) or _path_lexists(staged_tar):
+        _restore_prune_plaintext(stage, prepared)
+    _verify_prune_source_tree(bundle_root, prepared)
+    _verify_prune_tar(clear_tar, prepared)
+    assert_candidate_bound()
+    os.replace(bundle_root, staged_root)
     _fsync_directory(stage.rollback_dir)
     assert_candidate_bound()
-    return deleted
+    os.replace(clear_tar, staged_tar)
+    _fsync_directory(stage.rollback_dir)
+    assert_candidate_bound()
+    _verify_prune_source_tree(staged_root, prepared)
+    _verify_prune_tar(staged_tar, prepared)
+    expected = _prune_member_reports(prepared)
+    return [
+        *(str(bundle_root / name) for name in sorted(expected)),
+        str(bundle_root),
+        str(clear_tar),
+    ]
+
+
+def _remove_prune_authority_artifacts(stage: StageArtifacts) -> None:
+    for path in (
+        stage.source_bundle_pruned_path,
+        stage.source_bundle_prune_prepared_path,
+    ):
+        if _path_lexists(path):
+            _require_private_file(path).unlink()
+    _fsync_directory(stage.rollback_dir)
+
+
+def _permanently_delete_staged_plaintext(
+    stage: StageArtifacts, prepared: dict[str, Any]
+) -> None:
+    """Finalize an already receipt-authorized prune, safely resumable after crash."""
+
+    staged_root, staged_tar = _prune_quarantine_paths(stage)
+    if _path_lexists(staged_root):
+        _verify_prune_source_tree(staged_root, prepared, allow_missing=True)
+        private_root = _require_private_dir(staged_root)
+        for child in list(private_root.iterdir()):
+            _require_private_file(child).unlink()
+        private_root.rmdir()
+    if _path_lexists(staged_tar):
+        _verify_prune_tar(staged_tar, prepared)
+        _require_private_file(staged_tar).unlink()
+    _fsync_directory(stage.rollback_dir)
 
 
 def prune_source_bundle_after_retention(
@@ -4239,50 +4331,67 @@ def prune_source_bundle_after_retention(
         ).exists() or stage.rollback_bundle_path.exists():
             raise ColdArchiveError("plaintext source bundle reappeared after prune")
         _require_private_file(stage.rollback_encrypted_path)
+        _permanently_delete_staged_plaintext(stage, prepared)
         return {**existing_pruned, "replayed": True}
     prepared_preexisting = stage.source_bundle_prune_prepared_path.exists()
-    with _hold_prune_candidate_custody(
-        source, manifest, retention_state
-    ) as assert_candidate_bound:
-        try:
+    prepared: dict[str, Any] | None = None
+    try:
+        with _hold_prune_candidate_custody(
+            source, manifest, retention_state
+        ) as assert_candidate_bound:
             prepared = _prepare_source_bundle_prune(
                 stage,
                 rollback_bundle_sha256=bundle_sha,
                 cutover_marker_sha256=approved_cutover_marker_sha256,
             )
             assert_candidate_bound()
-        except BaseException:
-            if (
-                not prepared_preexisting
-                and stage.source_bundle_prune_prepared_path.exists()
-            ):
-                _require_private_file(stage.source_bundle_prune_prepared_path).unlink()
-                _fsync_directory(stage.source_bundle_prune_prepared_path.parent)
-            raise
-        deleted = _delete_private_source_bundle(
-            stage,
-            prepared,
-            assert_candidate_bound=assert_candidate_bound,
-        )
-        receipt = {
-            "operation": "hermes-source-bundle-pruned",
-            "pruned": True,
-            "pruned_at": utc_iso(current),
-            "pruned_at_epoch": current,
-            "cutover_epoch": cutover,
-            "minimum_retention_seconds": retention,
-            "rollback_bundle_sha256": bundle_sha,
-            "approved_cutover_marker_sha256": approved_cutover_marker_sha256,
-            "prepared_prune_sha256": sha256_path(
+            deleted = _stage_prune_plaintext(
+                stage,
+                prepared,
+                assert_candidate_bound=assert_candidate_bound,
+            )
+            receipt = {
+                "operation": "hermes-source-bundle-pruned",
+                "pruned": True,
+                "pruned_at": utc_iso(current),
+                "pruned_at_epoch": current,
+                "cutover_epoch": cutover,
+                "minimum_retention_seconds": retention,
+                "rollback_bundle_sha256": bundle_sha,
+                "approved_cutover_marker_sha256": approved_cutover_marker_sha256,
+                "prepared_prune_sha256": sha256_path(
+                    stage.source_bundle_prune_prepared_path
+                ),
+                "deleted_local_plaintext_paths": deleted,
+                "remote_objects_deleted": False,
+                "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
+                "remote_authority": producer.get("remote_authority"),
+            }
+            _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
+            assert_candidate_bound()
+    except BaseException as failure:
+        if prepared is None:
+            if not prepared_preexisting and _path_lexists(
                 stage.source_bundle_prune_prepared_path
-            ),
-            "deleted_local_plaintext_paths": deleted,
-            "remote_objects_deleted": False,
-            "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
-            "remote_authority": producer.get("remote_authority"),
-        }
-        _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
-        assert_candidate_bound()
+            ):
+                _remove_prune_authority_artifacts(stage)
+            raise
+        recovery_failures: list[str] = []
+        try:
+            _restore_prune_plaintext(stage, prepared)
+        except BaseException as exc:
+            recovery_failures.append(f"plaintext restore failed: {exc}")
+        try:
+            _remove_prune_authority_artifacts(stage)
+        except BaseException as exc:
+            recovery_failures.append(f"authority cleanup failed: {exc}")
+        if recovery_failures:
+            raise ColdArchiveError(
+                f"source-bundle prune failed ({failure}); "
+                + "; ".join(recovery_failures)
+            ) from failure
+        raise
+    _permanently_delete_staged_plaintext(stage, prepared)
     return receipt
 
 

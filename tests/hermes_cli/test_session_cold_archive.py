@@ -2275,8 +2275,12 @@ def test_cutover_rejects_producer_only_stage(tmp_path: Path) -> None:
         )
 
 
-def test_prune_receipt_failure_recovers_from_prepared_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "failure_name",
+    ["SOURCE-BUNDLE-PRUNE-PREPARED.json", "SOURCE-BUNDLE-PRUNED.json"],
+)
+def test_prune_authority_publication_failure_restores_plaintext_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_name: str
 ) -> None:
     db_path = tmp_path / "candidate.db"
     db = _build_archive_candidate(db_path)
@@ -2299,12 +2303,13 @@ def test_prune_receipt_failure_recovers_from_prepared_intent(
     original = cold._exclusive_write_json
 
     def fail_final(path: Path, payload: dict[str, Any]) -> Path:
-        if path.name == "SOURCE-BUNDLE-PRUNED.json":
-            raise OSError("forced final receipt failure")
-        return original(path, payload)
+        result = original(path, payload)
+        if path.name == failure_name:
+            raise OSError("forced authority receipt failure")
+        return result
 
     monkeypatch.setattr(cold, "_exclusive_write_json", fail_final)
-    with pytest.raises(OSError, match="forced final receipt failure"):
+    with pytest.raises(OSError, match="forced authority receipt failure"):
         cold.prune_source_bundle_after_retention(
             stage,
             candidate_health_confirmed=True,
@@ -2313,8 +2318,10 @@ def test_prune_receipt_failure_recovers_from_prepared_intent(
             rclone_runner=fake,
             now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
         )
-    assert (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
-    assert not (stage / "rollback" / "rollback-source-bundle.tar.gz").exists()
+    assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
+    assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNED.json").exists()
+    assert (stage / "rollback" / "rollback-source-bundle.tar.gz").exists()
+    assert (stage / "rollback" / "source-bundle").exists()
     monkeypatch.setattr(cold, "_exclusive_write_json", original)
     recovered = cold.prune_source_bundle_after_retention(
         stage,
@@ -3149,6 +3156,149 @@ def test_prune_holds_candidate_custody_through_intent_and_plaintext_delete(
     assert source_bundle.exists()
     assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
     assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNED.json").exists()
+
+
+def test_prune_final_receipt_rebind_failure_restores_plaintext_and_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    _sqlite_backup(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    rollback = stage / "rollback"
+    marker_sha = _sha(rollback / "CANDIDATE-CUTOVER.json")
+    bundle = rollback / "rollback-source-bundle.tar.gz"
+    source_bundle = rollback / "source-bundle"
+    bundle_before = bundle.stat()
+    bundle_sha_before = _sha(bundle)
+    source_bundle_before = source_bundle.stat()
+    members_before = {
+        child.name: (child.stat().st_dev, child.stat().st_ino, _sha(child))
+        for child in source_bundle.iterdir()
+    }
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    original_write = cold._exclusive_write_json
+    swapped = False
+
+    def publish_pruned_then_swap(path: Path, payload: dict[str, Any]) -> Path:
+        nonlocal swapped
+        result = original_write(path, payload)
+        if path.name == "SOURCE-BUNDLE-PRUNED.json" and not swapped:
+            swapped = True
+            _replace_database_from_backup(
+                db_path, pre_retention, displaced_post_retention
+            )
+        return result
+
+    monkeypatch.setattr(cold, "_exclusive_write_json", publish_pruned_then_swap)
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        )
+
+    assert swapped is True
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+    assert bundle.exists()
+    assert source_bundle.exists()
+    assert (bundle.stat().st_dev, bundle.stat().st_ino, _sha(bundle)) == (
+        bundle_before.st_dev,
+        bundle_before.st_ino,
+        bundle_sha_before,
+    )
+    assert (source_bundle.stat().st_dev, source_bundle.stat().st_ino) == (
+        source_bundle_before.st_dev,
+        source_bundle_before.st_ino,
+    )
+    assert {
+        child.name: (child.stat().st_dev, child.stat().st_ino, _sha(child))
+        for child in source_bundle.iterdir()
+    } == members_before
+    assert not (rollback / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
+    assert not (rollback / "SOURCE-BUNDLE-PRUNED.json").exists()
+    assert not (rollback / ".source-bundle.prune-quarantine").exists()
+    assert not (rollback / ".rollback-source-bundle.tar.gz.prune-quarantine").exists()
+
+
+def test_prune_replay_finishes_receipt_authorized_quarantine_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    rollback = stage / "rollback"
+    marker_sha = _sha(rollback / "CANDIDATE-CUTOVER.json")
+    original_delete = cold._permanently_delete_staged_plaintext
+
+    def fail_authorized_cleanup(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("forced quarantine cleanup failure")
+
+    monkeypatch.setattr(
+        cold, "_permanently_delete_staged_plaintext", fail_authorized_cleanup
+    )
+    with pytest.raises(OSError, match="forced quarantine cleanup failure"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        )
+
+    assert (rollback / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
+    assert (rollback / "SOURCE-BUNDLE-PRUNED.json").exists()
+    assert (rollback / ".source-bundle.prune-quarantine").exists()
+    assert (rollback / ".rollback-source-bundle.tar.gz.prune-quarantine").exists()
+    assert not (rollback / "source-bundle").exists()
+    assert not (rollback / "rollback-source-bundle.tar.gz").exists()
+
+    monkeypatch.setattr(cold, "_permanently_delete_staged_plaintext", original_delete)
+    replay = cold.prune_source_bundle_after_retention(
+        stage,
+        candidate_health_confirmed=True,
+        approved_cutover_marker_sha256=marker_sha,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+    )
+    assert replay["pruned"] is True
+    assert replay["replayed"] is True
+    assert not (rollback / ".source-bundle.prune-quarantine").exists()
+    assert not (rollback / ".rollback-source-bundle.tar.gz.prune-quarantine").exists()
 
 
 def test_every_installed_fts_root_is_rebuilt_and_reverified_after_commit(
