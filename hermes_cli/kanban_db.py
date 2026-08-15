@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -1423,6 +1425,8 @@ CREATE TABLE IF NOT EXISTS workspace_cleanup_reservations (
     run_id              INTEGER,
     claim_lock          TEXT,
     claim_expires       INTEGER,
+    source_dev          INTEGER,
+    source_ino          INTEGER,
     reserved_at         INTEGER NOT NULL,
     renamed_path        TEXT,
     attempts            INTEGER NOT NULL DEFAULT 0,
@@ -1453,7 +1457,26 @@ BEGIN
         claim_lock, claim_expires, reserved_at
     ) VALUES (
         NEW.id, lower(hex(randomblob(16))), NEW.workspace_path, 'pending',
-        OLD.worker_pid, OLD.current_run_id, OLD.claim_lock, OLD.claim_expires,
+        COALESCE(OLD.worker_pid, (
+            SELECT worker_pid FROM task_runs
+            WHERE task_id = OLD.id AND ended_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        )),
+        COALESCE(OLD.current_run_id, (
+            SELECT id FROM task_runs
+            WHERE task_id = OLD.id AND ended_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        )),
+        COALESCE(OLD.claim_lock, (
+            SELECT claim_lock FROM task_runs
+            WHERE task_id = OLD.id AND ended_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        )),
+        COALESCE(OLD.claim_expires, (
+            SELECT claim_expires FROM task_runs
+            WHERE task_id = OLD.id AND ended_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        )),
         CAST(strftime('%s', 'now') AS INTEGER)
     )
     ON CONFLICT(task_id) DO UPDATE SET
@@ -1464,6 +1487,8 @@ BEGIN
         run_id = excluded.run_id,
         claim_lock = excluded.claim_lock,
         claim_expires = excluded.claim_expires,
+        source_dev = NULL,
+        source_ino = NULL,
         reserved_at = excluded.reserved_at,
         renamed_path = NULL,
         attempts = 0,
@@ -6543,7 +6568,15 @@ def _ensure_workspace_cleanup_reservation(
             "(task_id, token, workspace_path, state, worker_pid, run_id, "
             "claim_lock, claim_expires, reserved_at) "
             "SELECT id, lower(hex(randomblob(16))), workspace_path, 'pending', "
-            "worker_pid, current_run_id, claim_lock, claim_expires, ? FROM tasks "
+            "COALESCE(worker_pid, (SELECT worker_pid FROM task_runs "
+            "WHERE task_id = tasks.id AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+            "COALESCE(current_run_id, (SELECT id FROM task_runs "
+            "WHERE task_id = tasks.id AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+            "COALESCE(claim_lock, (SELECT claim_lock FROM task_runs "
+            "WHERE task_id = tasks.id AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+            "COALESCE(claim_expires, (SELECT claim_expires FROM task_runs "
+            "WHERE task_id = tasks.id AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+            "? FROM tasks "
             "WHERE id = ? AND status IN ('done', 'archived', 'failed', 'cancelled') "
             "AND workspace_kind = 'scratch' AND workspace_path IS NOT NULL "
             "AND length(trim(workspace_path)) > 0",
@@ -6569,14 +6602,26 @@ def _reserve_workspace_cleanup_in_txn(
         "INSERT OR IGNORE INTO workspace_cleanup_reservations "
         "(task_id, token, workspace_path, state, worker_pid, run_id, "
         "claim_lock, claim_expires, reserved_at) "
-        "VALUES (?, lower(hex(randomblob(16))), ?, 'pending', ?, ?, ?, ?, ?)",
+        "VALUES (?, lower(hex(randomblob(16))), ?, 'pending', "
+        "COALESCE(?, (SELECT worker_pid FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+        "COALESCE(?, (SELECT id FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+        "COALESCE(?, (SELECT claim_lock FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), "
+        "COALESCE(?, (SELECT claim_expires FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NULL ORDER BY id DESC LIMIT 1)), ?)",
         (
             task_id,
             workspace_path,
             worker_pid,
+            task_id,
             run_id,
+            task_id,
             claim_lock,
+            task_id,
             claim_expires,
+            task_id,
             int(time.time()),
         ),
     )
@@ -6626,6 +6671,158 @@ def _cleanup_quarantine_path(task_id: str, token: str, source: Path) -> Path:
     return source.parent / f".hermes-cleanup-{token}"
 
 
+class WorkspaceCleanupIdentityError(RuntimeError):
+    """A pathname no longer resolves to the inode authorized for cleanup."""
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _cleanup_dir_open_flags() -> int:
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not directory or not nofollow:
+        raise WorkspaceCleanupIdentityError(
+            "platform lacks O_DIRECTORY/O_NOFOLLOW cleanup primitives"
+        )
+    return os.O_RDONLY | directory | nofollow
+
+
+def _open_cleanup_dir(path: Path) -> tuple[int, int, os.stat_result]:
+    """Open ``path`` without following any symlink in its ancestry."""
+    flags = _cleanup_dir_open_flags()
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise WorkspaceCleanupIdentityError(
+            f"cleanup path must be absolute and normalized: {path}"
+        )
+
+    # Opening the parent pathname in one call would protect only its final
+    # component with O_NOFOLLOW. Walk from the filesystem root through dir_fds
+    # so an intermediate symlink cannot redirect cleanup into another tree.
+    parent_fd = os.open(path.anchor, flags)
+    try:
+        for component in path.parent.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise WorkspaceCleanupIdentityError(
+                        f"cleanup ancestry is not a plain directory: {path.parent}"
+                    ) from exc
+                raise
+            os.close(parent_fd)
+            parent_fd = next_fd
+    except Exception:
+        os.close(parent_fd)
+        raise
+    try:
+        try:
+            child_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise WorkspaceCleanupIdentityError(
+                    f"cleanup target is not a plain directory: {path}"
+                ) from exc
+            raise
+    except Exception:
+        os.close(parent_fd)
+        raise
+    try:
+        opened = os.fstat(child_fd)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(named.st_mode) or not _same_inode(opened, named):
+            raise WorkspaceCleanupIdentityError(
+                f"directory identity changed while opening {path}"
+            )
+        return parent_fd, child_fd, opened
+    except Exception:
+        os.close(child_fd)
+        os.close(parent_fd)
+        raise
+
+
+def _bind_workspace_cleanup_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    token: str,
+    identity: os.stat_result,
+) -> bool:
+    """Persist the source inode before rename; refuse a conflicting binding."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE workspace_cleanup_reservations "
+            "SET source_dev = COALESCE(source_dev, ?), "
+            "source_ino = COALESCE(source_ino, ?) "
+            "WHERE task_id = ? AND token = ? AND state = 'pending' "
+            "AND (source_dev IS NULL OR source_dev = ?) "
+            "AND (source_ino IS NULL OR source_ino = ?)",
+            (
+                int(identity.st_dev), int(identity.st_ino), task_id, token,
+                int(identity.st_dev), int(identity.st_ino),
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def _empty_cleanup_dir_fd(directory_fd: int) -> None:
+    """Delete descendants through directory fds; never follow a symlink."""
+    flags = _cleanup_dir_open_flags()
+    for name in os.listdir(directory_fd):
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(before.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if not _same_inode(before, opened):
+                    raise WorkspaceCleanupIdentityError(
+                        f"child directory identity changed before open: {name}"
+                    )
+                _empty_cleanup_dir_fd(child_fd)
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                if not _same_inode(opened, current):
+                    raise WorkspaceCleanupIdentityError(
+                        f"child directory identity changed before removal: {name}"
+                    )
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _secure_empty_cleanup_quarantine(
+    path: Path,
+    *,
+    expected_dev: int,
+    expected_ino: int,
+) -> None:
+    """Empty only the inode named by the reservation, retaining its tombstone.
+
+    The empty quarantine directory is deliberately retained. POSIX has no
+    portable conditional-rmdir-by-open-fd primitive; removing it by pathname
+    after verification would recreate the same final-component TOCTOU this
+    fence exists to eliminate.
+    """
+    parent_fd, directory_fd, opened = _open_cleanup_dir(path)
+    try:
+        if opened.st_dev != expected_dev or opened.st_ino != expected_ino:
+            raise WorkspaceCleanupIdentityError(
+                "quarantine inode does not match cleanup reservation"
+            )
+        _empty_cleanup_dir_fd(directory_fd)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_inode(opened, named):
+            raise WorkspaceCleanupIdentityError(
+                "quarantine pathname changed during anchored deletion"
+            )
+    finally:
+        os.close(directory_fd)
+        os.close(parent_fd)
+
+
 def _process_workspace_cleanup_reservation(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6639,7 +6836,7 @@ def _process_workspace_cleanup_reservation(
     """
     row = conn.execute(
         "SELECT task_id, token, workspace_path, state, worker_pid, run_id, "
-        "claim_lock, claim_expires, renamed_path "
+        "claim_lock, claim_expires, source_dev, source_ino, renamed_path "
         "FROM workspace_cleanup_reservations WHERE task_id = ?",
         (task_id,),
     ).fetchone()
@@ -6673,6 +6870,31 @@ def _process_workspace_cleanup_reservation(
                 conn, task_id, token, "pending", state="refused",
                 last_error="refused: task no longer matches cleanup reservation",
                 completed=True,
+            )
+            return False
+        open_runs = conn.execute(
+            "SELECT id, worker_pid, claim_lock, claim_expires FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        if open_runs:
+            live_run = next(
+                (
+                    run for run in open_runs
+                    if run["worker_pid"] is not None
+                    and _pid_alive(int(run["worker_pid"]))
+                ),
+                None,
+            )
+            detail = (
+                f"open run {live_run['id']} owns live worker pid "
+                f"{live_run['worker_pid']}"
+                if live_run is not None
+                else "one or more task_runs remain open"
+            )
+            _update_workspace_cleanup_reservation(
+                conn, task_id, token, "pending",
+                last_error=f"deferred: {detail}",
             )
             return False
         captured_pid = row["worker_pid"]
@@ -6763,31 +6985,94 @@ def _process_workspace_cleanup_reservation(
             return False
 
         try:
-            if source.exists():
-                if not source.is_dir():
-                    _update_workspace_cleanup_reservation(
-                        conn, task_id, token, "pending", state="refused",
-                        last_error="refused: source workspace is not a directory",
-                        completed=True,
+            source_exists = source.exists()
+            quarantine_exists = quarantine.exists()
+            if source_exists and quarantine_exists:
+                raise WorkspaceCleanupIdentityError(
+                    "source and quarantine both exist before rename"
+                )
+            if source_exists:
+                parent_fd, source_fd, opened = _open_cleanup_dir(source)
+                try:
+                    if (
+                        row["source_dev"] is not None
+                        and (
+                            int(row["source_dev"]) != opened.st_dev
+                            or int(row["source_ino"]) != opened.st_ino
+                        )
+                    ):
+                        raise WorkspaceCleanupIdentityError(
+                            "source inode no longer matches cleanup reservation"
+                        )
+                    if not _bind_workspace_cleanup_identity(
+                        conn, task_id, token, opened,
+                    ):
+                        return False
+                    os.rename(
+                        source.name,
+                        quarantine.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
                     )
-                    return False
-                if quarantine.exists():
-                    _update_workspace_cleanup_reservation(
-                        conn, task_id, token, "pending", state="refused",
-                        last_error=(
-                            "refused: source and quarantine both exist after rename"
-                        ),
-                        completed=True,
+                    renamed = os.stat(
+                        quarantine.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
                     )
-                    return False
-                source.rename(quarantine)
-            elif not quarantine.exists():
+                    if not _same_inode(opened, renamed):
+                        # The name was swapped between open and rename. Restore
+                        # the moved replacement iff the source slot is empty;
+                        # never delete either inode.
+                        try:
+                            os.stat(
+                                source.name,
+                                dir_fd=parent_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            os.rename(
+                                quarantine.name,
+                                source.name,
+                                src_dir_fd=parent_fd,
+                                dst_dir_fd=parent_fd,
+                            )
+                        raise WorkspaceCleanupIdentityError(
+                            "source pathname changed during anchored rename"
+                        )
+                finally:
+                    os.close(source_fd)
+                    os.close(parent_fd)
+            elif quarantine_exists:
+                if row["source_dev"] is None or row["source_ino"] is None:
+                    raise WorkspaceCleanupIdentityError(
+                        "quarantine exists without a bound source inode"
+                    )
+                parent_fd, quarantine_fd, opened = _open_cleanup_dir(quarantine)
+                try:
+                    if (
+                        opened.st_dev != int(row["source_dev"])
+                        or opened.st_ino != int(row["source_ino"])
+                    ):
+                        raise WorkspaceCleanupIdentityError(
+                            "recovered quarantine inode does not match reservation"
+                        )
+                finally:
+                    os.close(quarantine_fd)
+                    os.close(parent_fd)
+            else:
                 _update_workspace_cleanup_reservation(
                     conn, task_id, token, "pending", state="completed",
                     last_error=None, completed=True,
                 )
                 _cleanup_worker_tmux(conn, task_id)
                 return True
+        except WorkspaceCleanupIdentityError as exc:
+            _update_workspace_cleanup_reservation(
+                conn, task_id, token, "pending", state="refused",
+                last_error=f"refused: {exc}", completed=True,
+            )
+            _log.warning("Workspace cleanup identity refused for %s: %s", task_id, exc)
+            return False
         except Exception as exc:
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "pending",
@@ -6805,7 +7090,8 @@ def _process_workspace_cleanup_reservation(
 
     if state == "renamed":
         row = conn.execute(
-            "SELECT renamed_path FROM workspace_cleanup_reservations "
+            "SELECT renamed_path, source_dev, source_ino "
+            "FROM workspace_cleanup_reservations "
             "WHERE task_id = ? AND token = ? AND state = 'renamed'",
             (task_id, token),
         ).fetchone()
@@ -6823,6 +7109,13 @@ def _process_workspace_cleanup_reservation(
                 completed=True,
             )
             return False
+        if row["source_dev"] is None or row["source_ino"] is None:
+            _update_workspace_cleanup_reservation(
+                conn, task_id, token, "renamed", state="refused",
+                last_error="refused: renamed cleanup lacks source inode binding",
+                completed=True,
+            )
+            return False
         try:
             if recorded.exists():
                 if recorded.is_symlink() or not recorded.is_dir():
@@ -6832,8 +7125,17 @@ def _process_workspace_cleanup_reservation(
                         completed=True,
                     )
                     return False
-                import shutil
-                shutil.rmtree(recorded)
+                _secure_empty_cleanup_quarantine(
+                    recorded,
+                    expected_dev=int(row["source_dev"]),
+                    expected_ino=int(row["source_ino"]),
+                )
+        except WorkspaceCleanupIdentityError as exc:
+            _update_workspace_cleanup_reservation(
+                conn, task_id, token, "renamed", state="refused",
+                last_error=f"refused: {exc}", completed=True,
+            )
+            return False
         except Exception as exc:
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "renamed",
@@ -8260,23 +8562,42 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # immutable path binding.  A live captured worker or failed/refused cleanup
     # makes deletion return False; callers can retry after recovery.
     _cleanup_workspace(conn, task_id)
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+    row = conn.execute(
+        "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] != "archived":
+        return False
+    if row["workspace_kind"] == "scratch" and row["workspace_path"]:
+        reservation = conn.execute(
+            "SELECT state, workspace_path FROM workspace_cleanup_reservations "
+            "WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        if not row or row["status"] != "archived":
+        if (
+            reservation is None
+            or reservation["state"] != "completed"
+            or reservation["workspace_path"] != row["workspace_path"]
+        ):
             return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+                (task_id, task_id),
+            )
+            conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            return cur.rowcount == 1
+    except sqlite3.IntegrityError as exc:
+        # The DB trigger is the final race fence if another writer creates a
+        # fresh cleanup generation between the preflight and DELETE.
+        if "scratch workspace cleanup is not complete" in str(exc):
+            return False
+        raise
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
