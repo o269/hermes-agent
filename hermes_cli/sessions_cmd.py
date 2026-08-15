@@ -224,6 +224,107 @@ def cmd_sessions(args, sessions_parser=None):
         print("  Do not install it. Review the JSON report for partial data or errors.")
         return 1
 
+    if action in {"cold-archive-mark-cutover", "cold-archive-prune-bundle"}:
+        from hermes_cli.session_cold_archive import (
+            ColdArchiveError,
+            prune_source_bundle_after_retention,
+            record_candidate_cutover,
+        )
+
+        try:
+            if action == "cold-archive-mark-cutover":
+                result = record_candidate_cutover(
+                    args.stage_root,
+                    candidate_health_confirmed=getattr(
+                        args, "candidate_health_confirmed", False
+                    ),
+                    rclone_config=args.rclone_config,
+                    rclone_exe=args.rclone_exe,
+                )
+            else:
+                result = prune_source_bundle_after_retention(
+                    args.stage_root,
+                    candidate_health_confirmed=getattr(
+                        args, "candidate_health_confirmed", False
+                    ),
+                    approved_cutover_marker_sha256=(
+                        args.approved_cutover_marker_sha256
+                    ),
+                    rclone_config=args.rclone_config,
+                    rclone_exe=args.rclone_exe,
+                )
+        except ColdArchiveError as exc:
+            print(f"Error: cold archive lifecycle failed closed: {exc}")
+            raise SystemExit(1) from exc
+        print(_json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if action == "cold-archive":
+        from hermes_cli.session_cold_archive import (
+            ColdArchiveError,
+            DEFAULT_PERMANENT_HOLD_SOURCES,
+            run_cold_archive_pass,
+        )
+
+        hold_sources = (
+            []
+            if getattr(args, "no_default_holds", False)
+            else list(DEFAULT_PERMANENT_HOLD_SOURCES)
+        )
+        hold_sources.extend(getattr(args, "hold_source", None) or [])
+        try:
+            receipt = run_cold_archive_pass(
+                source_db=args.source,
+                stage_root=args.stage_root,
+                board_db=args.board_db,
+                hot_days=getattr(args, "hot_days", 30.0),
+                archive_grace_days=getattr(args, "archive_grace_days", 7.0),
+                hold_sources=hold_sources,
+                hold_title_regexes=getattr(args, "hold_title_regex", None) or [],
+                hold_cwd_prefixes=getattr(args, "hold_cwd_prefix", None) or [],
+                manifest_only=getattr(args, "manifest_only", False),
+                apply_retention=getattr(args, "apply_retention", False),
+                approved_manifest_path=getattr(args, "approved_manifest", None),
+                approved_manifest_sha256=getattr(
+                    args, "approved_manifest_sha256", None
+                ),
+                approved_producer_receipt_path=getattr(
+                    args, "approved_producer_receipt", None
+                ),
+                approved_producer_receipt_sha256=getattr(
+                    args, "approved_producer_receipt_sha256", None
+                ),
+                rclone_remote=getattr(args, "rclone_remote", None),
+                rclone_config=getattr(args, "rclone_config", None),
+                remote_namespace=getattr(args, "remote_namespace", None),
+                age_recipient_file=getattr(args, "age_recipient_file", None),
+                age_exe=getattr(args, "age_exe", "age"),
+                rclone_exe=getattr(args, "rclone_exe", "rclone"),
+            )
+        except ColdArchiveError as exc:
+            print(f"Error: cold archive failed closed: {exc}")
+            raise SystemExit(1) from exc
+        public_receipt = dict(receipt)
+        public_receipt.pop("source_db", None)
+        public_receipt.pop("stage_root", None)
+        qmd = public_receipt.get("qmd_export")
+        if isinstance(qmd, dict):
+            public_receipt["qmd_export"] = {
+                "exported_file_count": len(qmd.get("exported_files") or []),
+                "message_count": qmd.get("message_count"),
+                "verified": qmd.get("verified"),
+            }
+        remote = public_receipt.get("remote_publish")
+        if isinstance(remote, list):
+            public_receipt["remote_publish"] = [
+                {key: value for key, value in item.items() if key != "local_path"}
+                if isinstance(item, dict)
+                else item
+                for item in remote
+            ]
+        print(_json.dumps(public_receipt, indent=2, sort_keys=True))
+        return 0
+
     try:
         from hermes_state import SessionDB
 

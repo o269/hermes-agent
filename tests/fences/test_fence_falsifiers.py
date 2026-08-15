@@ -48,13 +48,16 @@ Seeded with the create-dedup fence merged as PR #75.
 from __future__ import annotations
 
 import importlib
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import session_cold_archive as cold
 
 # ---------------------------------------------------------------------------
 # Harness types
@@ -565,6 +568,78 @@ def _mnf_distinct_scopes_emit_no_receipt() -> None:
 # Registry
 # ---------------------------------------------------------------------------
 
+
+def _board_snapshot(live_session_ids: tuple[str, ...]) -> cold.BoardLivenessSnapshot:
+    identity = Path(".").stat()
+    return cold.BoardLivenessSnapshot(
+        board_path=Path("."),
+        board_identity=identity,
+        tasks_total=1,
+        linked_tasks=len(live_session_ids),
+        live_linked_tasks=len(live_session_ids),
+        live_session_ids=live_session_ids,
+        task_projection_sha256="0" * 64,
+    )
+
+
+def _ablate_live_board_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.session_cold_archive._require_no_live_board_selection",
+        lambda _snapshot, _selected_ids: None,
+    )
+
+
+def _mf_live_board_session_is_not_deleted() -> None:
+    fired = False
+    try:
+        cold._require_no_live_board_selection(
+            _board_snapshot(("session-live",)), ["session-live"]
+        )
+    except cold.ColdArchiveError:
+        fired = True
+    assert fired, "live board lineage was accepted for destructive retention"
+
+
+def _mnf_terminal_or_unlinked_board_session_is_allowed() -> None:
+    cold._require_no_live_board_selection(_board_snapshot(()), ["session-cold"])
+
+
+def _ablate_candidate_filesystem_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.session_cold_archive._require_candidate_filesystem_boundary",
+        lambda _source: None,
+    )
+
+
+def _mf_same_filesystem_candidate_is_refused() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source = Path(temp_dir) / "candidate.db"
+        source.write_bytes(b"offline")
+        source_device = source.stat().st_dev
+        fired = False
+        with mock.patch.object(
+            cold,
+            "_protected_live_filesystem_devices",
+            return_value=frozenset({source_device}),
+        ):
+            try:
+                cold._require_candidate_filesystem_boundary(source)
+            except cold.ColdArchiveError:
+                fired = True
+        assert fired, "same-filesystem candidate passed the alias/race boundary"
+
+
+def _mnf_separate_filesystem_candidate_is_allowed() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source = Path(temp_dir) / "candidate.db"
+        source.write_bytes(b"offline")
+        with mock.patch.object(
+            cold,
+            "_protected_live_filesystem_devices",
+            return_value=frozenset({source.stat().st_dev + 1}),
+        ):
+            cold._require_candidate_filesystem_boundary(source)
+
 FENCES: tuple[FenceSpec, ...] = (
     FenceSpec(
         fence_id="kanban.create.dedup.title_scope",
@@ -637,6 +712,52 @@ FENCES: tuple[FenceSpec, ...] = (
         must_not_fire={
             "legitimate_creates_emit_no_receipt": _mnf_legitimate_creates_emit_no_receipt,
             "distinct_scopes_emit_no_receipt": _mnf_distinct_scopes_emit_no_receipt,
+        },
+    ),
+    FenceSpec(
+        fence_id="sessions.cold_archive.live_board_liveness",
+        origin="replacement for PR #100",
+        mechanism=(
+            "apply rechecks the selected session set against a fail-closed board "
+            "liveness snapshot held under a writer reservation through commit"
+        ),
+        ablation=Ablation(
+            describes="live board overlap is accepted",
+            targets=(
+                "hermes_cli.session_cold_archive._require_no_live_board_selection",
+            ),
+            apply=_ablate_live_board_selection,
+        ),
+        must_fire={
+            "live_board_session_is_not_deleted": _mf_live_board_session_is_not_deleted
+        },
+        must_not_fire={
+            "terminal_or_unlinked_board_session_is_allowed": (
+                _mnf_terminal_or_unlinked_board_session_is_allowed
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="sessions.cold_archive.filesystem_boundary",
+        origin="replacement for PR #100",
+        mechanism=(
+            "an offline candidate must be on a different filesystem from every "
+            "protected live profile, eliminating post-check hardlink alias creation"
+        ),
+        ablation=Ablation(
+            describes="candidate filesystem separation is not enforced",
+            targets=(
+                "hermes_cli.session_cold_archive._require_candidate_filesystem_boundary",
+            ),
+            apply=_ablate_candidate_filesystem_boundary,
+        ),
+        must_fire={
+            "same_filesystem_candidate_is_refused": _mf_same_filesystem_candidate_is_refused
+        },
+        must_not_fire={
+            "separate_filesystem_candidate_is_allowed": (
+                _mnf_separate_filesystem_candidate_is_allowed
+            )
         },
     ),
 )
