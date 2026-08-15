@@ -1436,6 +1436,15 @@ CREATE TABLE IF NOT EXISTS workspace_cleanup_reservations (
     completed_at        INTEGER
 );
 
+"""
+
+# These triggers reference optional ``tasks`` columns and the canonical
+# ``task_runs`` shape.  They must be installed only after the additive and
+# drift-rebuild migrations complete: SQLite reparses every trigger during an
+# ALTER TABLE RENAME, so placing them in SCHEMA_SQL makes a legacy board fail
+# before ``worker_pid`` and its companion custody columns can be migrated.
+_WORKSPACE_CLEANUP_TRIGGERS_SQL = """
+
 -- Capture cleanup authority for every SQL mutation path, including canonical
 -- BrokerConnection transactions and boardd-native/raw status writers.  A
 -- completed/refused generation is replaced only by a genuinely new terminal
@@ -1562,6 +1571,10 @@ WHEN OLD.workspace_kind = 'scratch'
 BEGIN
     SELECT RAISE(ABORT, 'scratch workspace cleanup is not complete');
 END;
+
+"""
+
+SCHEMA_SQL += """
 
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
@@ -1955,6 +1968,26 @@ def _install_assignment_policy_triggers(conn: sqlite3.Connection) -> None:
             "DROP TRIGGER IF EXISTS trg_tasks_assignment_policy_update;"
             "COMMIT;"
         )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _install_workspace_cleanup_triggers(conn: sqlite3.Connection) -> None:
+    """Replace cleanup triggers after every legacy schema migration succeeds."""
+    replace_sql = (
+        "BEGIN IMMEDIATE;"
+        "DROP TRIGGER IF EXISTS trg_tasks_reserve_workspace_cleanup_update;"
+        "DROP TRIGGER IF EXISTS trg_tasks_reserve_workspace_cleanup_insert;"
+        "DROP TRIGGER IF EXISTS trg_tasks_freeze_workspace_cleanup_target;"
+        "DROP TRIGGER IF EXISTS trg_tasks_freeze_workspace_cleanup_lifecycle;"
+        "DROP TRIGGER IF EXISTS trg_tasks_require_workspace_cleanup_before_delete;"
+        + _WORKSPACE_CLEANUP_TRIGGERS_SQL
+        + "COMMIT;"
+    )
+    try:
+        conn.executescript(replace_sql)
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -2768,6 +2801,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _install_workspace_cleanup_triggers(conn)
                     _install_assignment_policy_triggers(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
