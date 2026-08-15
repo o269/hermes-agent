@@ -24,7 +24,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-FIXTURE = REPO_ROOT / "tests" / "fixtures" / "fleet_tmp_reaper" / "aged_bulk_20260813.txt"
+FIXTURE = (
+    REPO_ROOT / "tests" / "fixtures" / "fleet_tmp_reaper" / "aged_bulk_20260813.txt"
+)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -221,13 +223,53 @@ def test_does_not_fire_on_name_carrying_a_live_task_id(tmp_path, now):
     """Real measured name — the board says the task is still live, so keep it."""
     root = tmp_path / "tmp"
     root.mkdir()
-    make_tree(root, "hermes-symptomd-slice2-t_fe15ed02-15658", age_seconds=6 * DAY, now=now)
+    make_tree(
+        root, "hermes-symptomd-slice2-t_fe15ed02-15658", age_seconds=6 * DAY, now=now
+    )
 
     live = [reaper.BoardTask("t_fe15ed02", "review", workspace_path=None)]
-    assert reaper.sweep(root, now=now, tasks=live, process_paths=frozenset()).candidates == []
+    assert (
+        reaper.sweep(root, now=now, tasks=live, process_paths=frozenset()).candidates
+        == []
+    )
 
     finished = [reaper.BoardTask("t_fe15ed02", "done", workspace_path=None)]
-    assert len(reaper.sweep(root, now=now, tasks=finished, process_paths=frozenset()).candidates) == 1
+    assert (
+        len(
+            reaper.sweep(
+                root, now=now, tasks=finished, process_paths=frozenset()
+            ).candidates
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("dirname", "task_id", "status"),
+    [
+        ("wave-d4-item2-t7e073169", "t_7e073169", "ready"),
+        ("cursor-verify-t19ba5cba", "t_19ba5cba", "blocked"),
+        ("hermes-tce22-fd-reaper-main", "t_ce22cf43", "review"),
+    ],
+)
+def test_does_not_fire_on_underscoreless_or_truncated_live_ids(
+    tmp_path, now, dirname, task_id, status
+):
+    """2026-08-13 incident names: dropped underscore and truncated hex."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    make_tree(root, dirname, age_seconds=6 * DAY, now=now)
+    junk = make_tree(root, "wdguard-junk-plain-no-tid", age_seconds=6 * DAY, now=now)
+
+    live = [reaper.BoardTask(task_id, status, workspace_path=None)]
+    result = reaper.sweep(root, now=now, tasks=live, process_paths=frozenset())
+    assert {d.name for d in result.candidates} == {junk.name}
+    kept = {d.name: d.reason for d in result.keeps}
+    assert kept[dirname] == reaper.KEEP_LIVE_TASK_ID
+
+    finished = [reaper.BoardTask(task_id, "done", workspace_path=None)]
+    dead = reaper.sweep(root, now=now, tasks=finished, process_paths=frozenset())
+    assert {d.name for d in dead.candidates} == {dirname, junk.name}
 
 
 def test_does_not_fire_on_process_referenced_path(tmp_path, now):

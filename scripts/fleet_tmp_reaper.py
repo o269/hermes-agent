@@ -62,6 +62,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import board_liveness
+
 # ── policy constants ────────────────────────────────────────────────────────
 
 DEFAULT_ROOT = Path("/tmp")
@@ -70,7 +72,13 @@ DEFAULT_ROOT = Path("/tmp")
 DEFAULT_MAX_AGE_SECONDS = 12 * 3600
 
 #: Board statuses that mean "this task will never write here again".
-TERMINAL_STATUSES = frozenset({"done", "completed", "archived", "cancelled", "canceled"})
+TERMINAL_STATUSES = frozenset({
+    "done",
+    "completed",
+    "archived",
+    "cancelled",
+    "canceled",
+})
 
 #: Names that are never candidates regardless of age. These are live sockets,
 #: OS-managed private mounts, and the Claude Code session scratch root
@@ -92,8 +100,10 @@ PROTECTED_NAME_RE = re.compile(
 )
 
 #: Task ids look like ``t_ce22cf43``; they show up inside worktree names such as
-#: ``hermes-symptomd-slice2-t_fe15ed02-15658``.
-TASK_ID_RE = re.compile(r"t_[0-9a-f]{8,}", re.IGNORECASE)
+#: ``hermes-symptomd-slice2-t_fe15ed02-15658``, ``wave-d4-item2-t7e073169``
+#: (underscore dropped), and ``hermes-tce22-fd-reaper-main`` (truncated).
+#: The compiled form lives in ``board_liveness`` so every reaper shares it.
+TASK_ID_RE = board_liveness.TASK_TOKEN_RE
 
 #: Directory names pruned while computing tree age. Git safety probes and
 #: status calls rewrite ``.git/index``, so including it would make every
@@ -184,7 +194,9 @@ def live_workspace_paths(tasks: Iterable[BoardTask]) -> frozenset[Path]:
 
 def live_task_ids(tasks: Iterable[BoardTask]) -> frozenset[str]:
     """Lowercased ids of every non-terminal task."""
-    return frozenset(t.task_id.strip().lower() for t in tasks if t.is_live and t.task_id)
+    return frozenset(
+        t.task_id.strip().lower() for t in tasks if t.is_live and t.task_id
+    )
 
 
 def _paths_overlap(a: Path, b: Path) -> bool:
@@ -204,7 +216,8 @@ def _contains_or_equals(container: Path, other: Path) -> bool:
 
 
 def names_task_ids(name: str) -> frozenset[str]:
-    return frozenset(m.group(0).lower() for m in TASK_ID_RE.finditer(name))
+    """Canonical ``t_<hex>`` ids implied by tokens in *name* (may be truncated)."""
+    return frozenset(f"t_{token}" for token in board_liveness.extract_hex_tokens(name))
 
 
 def process_referenced_paths(proc_root: Path = Path("/proc")) -> frozenset[Path]:
@@ -243,7 +256,9 @@ def process_referenced_paths(proc_root: Path = Path("/proc")) -> frozenset[Path]
 # ── age probe ───────────────────────────────────────────────────────────────
 
 
-def newest_mtime(path: Path, prune_dirs: frozenset[str] = AGE_PRUNE_DIRS) -> float | None:
+def newest_mtime(
+    path: Path, prune_dirs: frozenset[str] = AGE_PRUNE_DIRS
+) -> float | None:
     """Newest mtime anywhere under *path*, or ``None`` if it cannot be read.
 
     ``None`` is a hard keep: we never delete a tree whose age we could not
@@ -314,7 +329,7 @@ def evaluate_entry(
         if _paths_overlap(resolved, workspace):
             return Decision(entry, False, KEEP_LIVE_WORKSPACE)
 
-    if names_task_ids(entry.name) & live_ids:
+    if board_liveness.name_is_held(entry.name, live_ids, board_ok=True):
         return Decision(entry, False, KEEP_LIVE_TASK_ID)
 
     newest = mtime_probe(entry)
@@ -450,7 +465,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually delete. Omitted = dry run, which is the default.",
     )
-    parser.add_argument("--json", action="store_true", help="Emit a machine-readable report.")
+    parser.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable report."
+    )
     parser.add_argument(
         "--show-keeps",
         action="store_true",
