@@ -22,6 +22,8 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from configparser import Error as ConfigParserError
+from configparser import RawConfigParser
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +43,7 @@ DEFAULT_ARCHIVE_GRACE_DAYS = 7.0
 MINIMUM_COLD_AGE_DAYS = 37.0
 DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS = 14 * 86_400
 _ARCHIVE_VERSION = 2
+_AUTHORITATIVE_FLEET_BOARD_PATH = Path("/var/lib/boardd/fleet/kanban.db")
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _ROLLBACK_MEMBER_NAMES = {
     "": "state.db",
@@ -150,6 +153,10 @@ class BoardLivenessSnapshot:
     def public_receipt(self) -> dict[str, Any]:
         return {
             "control": "tasks(id,status,session_id)>0",
+            "authority": "canonical-fleet-board-path-v1",
+            "board_path": str(self.board_path),
+            "board_device": self.board_identity.st_dev,
+            "board_inode": self.board_identity.st_ino,
             "tasks_total": self.tasks_total,
             "linked_tasks": self.linked_tasks,
             "live_linked_tasks": self.live_linked_tasks,
@@ -729,6 +736,7 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     uri = source.as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1.0)
     conn.row_factory = sqlite3.Row
+    _load_optional_fts_tokenizers(conn)
     conn.execute("PRAGMA query_only=ON")
     return conn
 
@@ -740,6 +748,7 @@ def _connect_candidate(db_path: Path) -> sqlite3.Connection:
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        _load_optional_fts_tokenizers(conn)
         after = source.stat()
         if not os.path.samestat(before, after):
             raise ColdArchiveError("candidate database identity changed during open")
@@ -756,6 +765,55 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
+
+def _load_optional_fts_tokenizers(conn: sqlite3.Connection) -> bool:
+    """Load optional runtime tokenizers before SQLite parses installed FTS roots."""
+
+    try:
+        from hermes_state import load_fts5_cjk_extension
+
+        return bool(load_fts5_cjk_extension(conn))
+    except Exception as exc:
+        raise ColdArchiveError(
+            f"could not safely initialize optional FTS tokenizers: {exc}"
+        ) from exc
+
+
+def _installed_fts_roots(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Inventory every installed messages FTS5 root from the live schema."""
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT name, sql
+            FROM sqlite_master
+            WHERE type='table' AND name LIKE 'messages_fts%'
+            ORDER BY name
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise ColdArchiveError(
+            "installed FTS roots could not be inventoried; a required tokenizer "
+            "may be unavailable"
+        ) from exc
+    roots = tuple(
+        str(row[0])
+        for row in rows
+        if str(row[1] or "").lstrip().upper().startswith("CREATE VIRTUAL TABLE")
+    )
+    required = {"messages_fts", "messages_fts_trigram"}
+    missing = sorted(required - set(roots))
+    if missing:
+        raise ColdArchiveError(
+            "cold archive schema cannot prove required FTS roots/triggers: "
+            + ", ".join(missing)
+        )
+    return roots
+
+
+def _required_fts_triggers(root: str) -> tuple[str, str, str]:
+    return (f"{root}_insert", f"{root}_delete", f"{root}_update")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -893,13 +951,17 @@ def _require_archive_schema(conn: sqlite3.Connection) -> None:
             "cold archive schema is missing required messages columns: "
             + ", ".join(missing_messages)
         )
+    roots = _installed_fts_roots(conn)
     fts_objects = {
         str(row[0])
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'"
         )
     }
-    missing_fts = sorted(_REQUIRED_FTS_OBJECTS - fts_objects)
+    required_objects = set(_REQUIRED_FTS_OBJECTS)
+    for root in roots:
+        required_objects.update(_required_fts_triggers(root))
+    missing_fts = sorted(required_objects - fts_objects)
     if missing_fts:
         raise ColdArchiveError(
             "cold archive schema cannot prove required FTS roots/triggers: "
@@ -912,7 +974,10 @@ def _require_archive_schema(conn: sqlite3.Connection) -> None:
                 """
                 SELECT key
                 FROM state_meta
-                WHERE key IN ('fts_rebuild_high_water', 'fts_rebuild_progress')
+                WHERE key IN (
+                    'fts_rebuild_high_water', 'fts_rebuild_progress',
+                    'fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress'
+                )
                 ORDER BY key
                 """
             )
@@ -1181,6 +1246,24 @@ def _read_board_liveness_snapshot(
     )
 
 
+def _require_authoritative_board_path(board_db: Path) -> Path:
+    """Resolve only the fixed fleet-board authority; arbitrary lookalikes fail."""
+
+    try:
+        requested = _resolve_existing_file(board_db)
+        authoritative = _resolve_existing_file(_AUTHORITATIVE_FLEET_BOARD_PATH)
+    except ColdArchiveError as exc:
+        raise ColdArchiveError(
+            f"authoritative fleet board is unavailable: {exc}"
+        ) from exc
+    if requested != authoritative:
+        raise ColdArchiveError(
+            "board liveness database is not the authoritative fleet board: "
+            f"expected {authoritative}"
+        )
+    return authoritative
+
+
 def _assert_board_path_identity(snapshot: BoardLivenessSnapshot) -> None:
     try:
         current = snapshot.board_path.lstat()
@@ -1201,7 +1284,7 @@ def _board_liveness_snapshot(
     """Read board liveness; apply holds a SQLite writer reservation to COMMIT."""
 
     try:
-        board_path = _resolve_existing_file(board_db)
+        board_path = _require_authoritative_board_path(board_db)
     except ColdArchiveError as exc:
         raise ColdArchiveError(
             f"board liveness database is unavailable: {exc}"
@@ -1239,6 +1322,10 @@ def _board_liveness_snapshot(
         raise
     try:
         yield snapshot
+        if _require_authoritative_board_path(board_db) != snapshot.board_path:
+            raise ColdArchiveError(
+                "authoritative fleet board path changed during archive authorization"
+            )
         _assert_board_path_identity(snapshot)
     finally:
         if conn.in_transaction:
@@ -1268,6 +1355,8 @@ def _validate_board_liveness_receipt(
     linked_tasks = receipt.get("linked_tasks")
     live_linked_tasks = receipt.get("live_linked_tasks")
     live_session_count = receipt.get("live_session_ids")
+    board_device = receipt.get("board_device")
+    board_inode = receipt.get("board_inode")
     counts = (tasks_total, linked_tasks, live_linked_tasks, live_session_count)
     if any(type(value) is not int for value in counts):
         raise ColdArchiveError("approved board liveness counts are invalid")
@@ -1280,6 +1369,13 @@ def _validate_board_liveness_receipt(
         raise ColdArchiveError("approved board liveness counts are inconsistent")
     if (
         receipt.get("control") != "tasks(id,status,session_id)>0"
+        or receipt.get("authority") != "canonical-fleet-board-path-v1"
+        or not isinstance(receipt.get("board_path"), str)
+        or not receipt.get("board_path")
+        or type(board_device) is not int
+        or type(board_inode) is not int
+        or board_device < 0
+        or board_inode <= 0
         or receipt.get("unknown_statuses_are_live") is not True
         or live_session_count != len(restricted_ids)
         or receipt.get("live_session_ids_sha256") != _ids_digest(restricted_ids)
@@ -1289,6 +1385,33 @@ def _validate_board_liveness_receipt(
     ):
         raise ColdArchiveError(
             "restricted board-live session IDs do not match approved manifest"
+        )
+
+
+def _require_board_matches_manifest(
+    snapshot: BoardLivenessSnapshot, manifest: dict[str, Any]
+) -> None:
+    approved = manifest.get("board_liveness")
+    if not isinstance(approved, dict):
+        raise ColdArchiveError("approved manifest lacks board authority binding")
+    current = snapshot.public_receipt()
+    bound_fields = (
+        "authority",
+        "board_path",
+        "board_device",
+        "board_inode",
+        "tasks_total",
+        "linked_tasks",
+        "live_linked_tasks",
+        "live_session_ids",
+        "live_session_ids_sha256",
+        "task_projection_sha256",
+        "unknown_statuses_are_live",
+        "control",
+    )
+    if any(approved.get(field) != current.get(field) for field in bound_fields):
+        raise ColdArchiveError(
+            "authoritative board path/identity/projection changed since Gate-B approval"
         )
 
 
@@ -1661,6 +1784,10 @@ def load_approved_producer_receipt(
     ]
     if not isinstance(reports, list) or len(reports) != len(expected_remote_names):
         raise ColdArchiveError("approved producer receipt lacks complete remote proof")
+    remote_authority = receipt.get("remote_authority")
+    if not isinstance(remote_authority, dict):
+        raise ColdArchiveError("approved producer receipt lacks rclone authority")
+    approved_root = str(remote_authority.get("remote_root") or "").rstrip("/")
     local_hashes[stage.manifest_path.name] = (
         sha256_path(stage.manifest_path),
         stage.manifest_path.stat().st_size,
@@ -1675,6 +1802,8 @@ def load_approved_producer_receipt(
             or report.get("readback_sha256") != digest
             or report.get("bytes") != size
             or report.get("integrity") != "rclone-checksum-and-readback-ok"
+            or report.get("remote_authority") != remote_authority
+            or not str(report.get("remote") or "").startswith(approved_root + "/")
         ):
             raise ColdArchiveError("approved producer remote proof is misbound")
     return receipt
@@ -2030,6 +2159,63 @@ def _require_secret_config(path: Path) -> tuple[Path, bytes]:
     return config, data
 
 
+def _rclone_authority(remote_root: str, config_bytes: bytes) -> dict[str, str]:
+    remote_base, _ = _validate_remote_namespace(remote_root, "authority")
+    remote_name, remote_path = remote_base.split(":", 1)
+    parser = RawConfigParser(interpolation=None)
+    try:
+        parser.read_string(config_bytes.decode("utf-8"))
+    except (ConfigParserError, UnicodeDecodeError, ValueError) as exc:
+        raise ColdArchiveError("rclone config cannot be parsed for authority") from exc
+    if not parser.has_section(remote_name):
+        raise ColdArchiveError(
+            f"rclone config lacks the approved remote section: {remote_name}"
+        )
+    backend = parser.get(remote_name, "type", fallback="").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", backend):
+        raise ColdArchiveError("rclone remote backend type is missing or invalid")
+    return {
+        "version": "rclone-authority-v1",
+        "remote_name": remote_name,
+        "backend_type": backend,
+        "remote_root": f"{remote_name}:{remote_path}",
+        "approved_config_sha256": _sha256_bytes(config_bytes),
+    }
+
+
+def _remote_parent(remote_object: str, expected_name: str) -> str:
+    suffix = "/" + expected_name
+    if not remote_object.endswith(suffix):
+        raise ColdArchiveError("remote object is outside its approved root")
+    return remote_object[: -len(suffix)]
+
+
+def _rclone_check_single_object_command(
+    *,
+    rclone_exe: str,
+    local: Path,
+    remote_object: str,
+    config: Path,
+) -> list[str]:
+    """Return a supported directory check bounded to one exact object name."""
+
+    remote_directory = _remote_parent(remote_object, local.name)
+    return [
+        rclone_exe,
+        "check",
+        str(local.parent),
+        remote_directory,
+        "--checksum",
+        "--one-way",
+        "--include",
+        f"/{local.name}",
+        "--max-depth",
+        "1",
+        "--config",
+        str(config),
+    ]
+
+
 def _assert_same_file(
     path: Path,
     expected: os.stat_result,
@@ -2077,6 +2263,7 @@ def publish_paths_with_rclone(
 
     remote_base, namespace = _validate_remote_namespace(remote_root, namespace)
     _, config_bytes = _require_secret_config(rclone_config)
+    remote_authority = _rclone_authority(remote_base, config_bytes)
     published: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="hermes-cold-archive-rclone-") as temp_name:
         temp = Path(temp_name)
@@ -2119,16 +2306,12 @@ def publish_paths_with_rclone(
                 expected_sha256=config_sha256,
             )
             check = _run_rclone(
-                [
-                    rclone_exe,
-                    "check",
-                    str(local),
-                    remote,
-                    "--checksum",
-                    "--one-way",
-                    "--config",
-                    str(config),
-                ],
+                _rclone_check_single_object_command(
+                    rclone_exe=rclone_exe,
+                    local=local,
+                    remote_object=remote,
+                    config=config,
+                ),
                 runner,
             )
             if check.returncode != 0:
@@ -2164,6 +2347,7 @@ def publish_paths_with_rclone(
                 "sha256": local_sha,
                 "readback_sha256": readback_sha,
                 "integrity": "rclone-checksum-and-readback-ok",
+                "remote_authority": remote_authority,
             })
     return published
 
@@ -2187,6 +2371,16 @@ def _verify_remote_custody(
             "producer receipt lacks complete encrypted offsite custody"
         )
     _, config_bytes = _require_secret_config(rclone_config)
+    approved_authority = producer_receipt.get("remote_authority")
+    if not isinstance(approved_authority, dict):
+        raise ColdArchiveError("producer receipt lacks approved rclone authority")
+    current_authority = _rclone_authority(
+        str(approved_authority.get("remote_root") or ""), config_bytes
+    )
+    if current_authority != approved_authority:
+        raise ColdArchiveError(
+            "rclone backend/account/root or approved config fingerprint changed"
+        )
     verified: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="hermes-cold-archive-verify-") as temp_name:
         temp = Path(temp_name)
@@ -2207,11 +2401,17 @@ def _verify_remote_custody(
                 raise ColdArchiveError("producer remote receipt hash mismatch")
             if report.get("integrity") != "rclone-checksum-and-readback-ok":
                 raise ColdArchiveError("producer remote receipt is not verified")
+            if report.get("remote_authority") != approved_authority:
+                raise ColdArchiveError("producer remote object authority is inconsistent")
             remote = str(report.get("remote") or "")
             if re.search(r"[\r\n\x00]", remote) or not remote.endswith(
                 "/" + local.name
             ):
                 raise ColdArchiveError("producer remote receipt path is invalid")
+            if not remote.startswith(
+                str(approved_authority.get("remote_root") or "").rstrip("/") + "/"
+            ):
+                raise ColdArchiveError("producer remote receipt escaped approved root")
             _assert_same_file(
                 config,
                 config_identity,
@@ -2219,16 +2419,12 @@ def _verify_remote_custody(
                 expected_sha256=config_sha256,
             )
             check = _run_rclone(
-                [
-                    rclone_exe,
-                    "check",
-                    str(local),
-                    remote,
-                    "--checksum",
-                    "--one-way",
-                    "--config",
-                    str(config),
-                ],
+                _rclone_check_single_object_command(
+                    rclone_exe=rclone_exe,
+                    local=local,
+                    remote_object=remote,
+                    config=config,
+                ),
                 runner,
             )
             if check.returncode != 0:
@@ -2256,7 +2452,12 @@ def _verify_remote_custody(
                 raise ColdArchiveError(
                     f"remote custody sha256 mismatch for {local.name}"
                 )
-            verified.append({"remote": remote, "sha256": local_sha, "verified": True})
+            verified.append({
+                "remote": remote,
+                "sha256": local_sha,
+                "verified": True,
+                "remote_authority": approved_authority,
+            })
     return verified
 
 
@@ -2299,8 +2500,9 @@ def _capture_payload_survivors(
         "session_model_usage": "session_id",
     }
     payload: dict[str, Any] = {}
+    fts_roots = set(_installed_fts_roots(conn))
     for table in _logical_table_names(conn):
-        if table in {"messages_fts", "messages_fts_trigram"}:
+        if table in fts_roots:
             continue
         if table == "system_prompts" and "hash" in _table_columns(conn, table):
             if prompt_hashes_to_delete:
@@ -2415,7 +2617,7 @@ def _capture_search_survivor_invariants(
     payload: dict[str, Any] = {
         "messages": _survivor_message_digest(conn, selected_session_ids)
     }
-    for table in ("messages_fts", "messages_fts_trigram"):
+    for table in _installed_fts_roots(conn):
         digest = _fts_survivor_content_digest(conn, table, excluded)
         if digest is not None:
             payload[table] = digest
@@ -2428,9 +2630,9 @@ def _verify_fts_counts(
     checks: dict[str, Any] = {}
     message_count = _count_where(conn, "SELECT COUNT(*) FROM messages")
     checks["messages"] = message_count
-    for table in ("messages_fts", "messages_fts_trigram"):
-        if not _table_exists(conn, table):
-            continue
+    roots = _installed_fts_roots(conn)
+    checks["installed_roots"] = list(roots)
+    for table in roots:
         schema_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone()
@@ -2441,7 +2643,7 @@ def _verify_fts_counts(
         )
         if content_match:
             source_table = content_match.group(1)
-            if source_table not in {"messages", "messages_fts_trigram_src"}:
+            if source_table not in {"messages", f"{table}_src"}:
                 raise ColdArchiveError(
                     f"{table} uses an unsupported external content source: {source_table}"
                 )
@@ -2667,6 +2869,7 @@ def _apply_retention_to_candidate_locked(
     if not ids:
         return {"applied": False, "reason": "no selected sessions"}
     _require_no_live_board_selection(board_snapshot, ids)
+    _require_board_matches_manifest(board_snapshot, manifest)
     hot_cutoff = float(manifest["policy"]["hot_cutoff_epoch"])
     source = reject_live_state_db(candidate_db)
     _require_candidate_filesystem_boundary(source)
@@ -2779,6 +2982,9 @@ def _apply_retention_to_candidate_locked(
             raise
     finally:
         conn.close()
+    report["post_commit_candidate"] = _verify_post_commit_candidate(
+        source, manifest, report
+    )
     return report
 
 
@@ -2824,6 +3030,14 @@ def _producer_receipt(
     remote_report: list[dict[str, Any]],
     age_recipient_sha256: str | None,
 ) -> dict[str, Any]:
+    remote_authority: dict[str, Any] | None = None
+    if remote_report:
+        candidate = remote_report[0].get("remote_authority")
+        if not isinstance(candidate, dict) or any(
+            report.get("remote_authority") != candidate for report in remote_report
+        ):
+            raise ColdArchiveError("remote publication reports disagree on authority")
+        remote_authority = candidate
     return {
         "operation": "hermes-state-cold-archive-producer",
         "created_at": utc_iso(),
@@ -2839,6 +3053,7 @@ def _producer_receipt(
         "restricted_encrypted": restricted_encrypted,
         "age_recipient_sha256": age_recipient_sha256,
         "remote_publish": remote_report,
+        "remote_authority": remote_authority,
         "manifest_only": manifest_only,
         "producer_complete": bool(
             manifest_only
@@ -2916,6 +3131,72 @@ def _validate_candidate_path_identity(source: Path, manifest: dict[str, Any]) ->
         )
 
 
+def _verify_post_commit_candidate(
+    source: Path, manifest: dict[str, Any], report: dict[str, Any]
+) -> dict[str, Any]:
+    """Reopen the committed pathname and prove the receipt's exact post-state."""
+
+    source = reject_live_state_db(source)
+    _require_candidate_filesystem_boundary(source)
+    _validate_candidate_path_identity(source, manifest)
+    ids = sorted(str(value) for value in manifest.get("_restricted_selected_ids") or [])
+    conn = _connect_candidate(source)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-resolve after the new file descriptor and lock exist. This catches
+            # a pathname/WAL namespace replacement adjacent to the first COMMIT.
+            reopened_info = source.stat()
+            _validate_candidate_path_identity(source, manifest)
+            reject_live_state_db(source)
+            logical = _logical_snapshot_sha256(conn)
+            if logical != report.get("post_logical_sha256"):
+                raise ColdArchiveError(
+                    "reopened committed candidate logical state differs from checked state"
+                )
+            if ids and _count_where(
+                conn,
+                f"SELECT COUNT(*) FROM sessions WHERE id IN ({_placeholders(ids)})",
+                ids,
+            ):
+                raise ColdArchiveError(
+                    "reopened committed candidate still contains selected sessions"
+                )
+            integrity = [
+                str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
+            ]
+            foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if integrity != ["ok"] or foreign_keys:
+                raise ColdArchiveError(
+                    "reopened committed candidate failed integrity checks"
+                )
+            fts = _verify_fts_counts(conn, deleted_message_ids=[])
+            survivors = _capture_search_survivor_invariants(conn, [])
+            if survivors != report.get("survivor_search_invariants"):
+                raise ColdArchiveError(
+                    "reopened committed candidate survivor/FTS state differs"
+                )
+            conn.execute("ROLLBACK")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+    return {
+        "verified": True,
+        "path": str(source),
+        "device": reopened_info.st_dev,
+        "inode": reopened_info.st_ino,
+        "post_logical_sha256": logical,
+        "integrity_check": integrity,
+        "foreign_key_check_rows": len(foreign_keys),
+        "fts_counts": fts,
+        "selected_sessions_remaining": 0,
+        "namespace_reopened_after_commit": True,
+    }
+
+
 def _retention_receipt_payload(
     stage: StageArtifacts,
     manifest: dict[str, Any],
@@ -2926,6 +3207,11 @@ def _retention_receipt_payload(
     report: dict[str, Any],
     recovered_from_prepared: bool = False,
 ) -> dict[str, Any]:
+    post_commit = report.get("post_commit_candidate")
+    if not isinstance(post_commit, dict) or post_commit.get("verified") is not True:
+        raise ColdArchiveError(
+            "retention success receipt requires reopened post-COMMIT verification"
+        )
     return {
         "operation": "hermes-state-cold-archive-retention",
         "created_at": utc_iso(),
@@ -2987,30 +3273,14 @@ def _recover_committed_prepared_apply(
         "board_liveness_reverified"
     ):
         raise ColdArchiveError("prepared apply receipt lacks board liveness proof")
-    _validate_candidate_path_identity(source, manifest)
-    with _connect_readonly(source) as conn:
-        current_logical = _logical_snapshot_sha256(conn)
-        if current_logical != prepared.get("post_logical_sha256"):
-            return None
-        ids = sorted(
-            str(value) for value in manifest.get("_restricted_selected_ids") or []
+    try:
+        report["post_commit_candidate"] = _verify_post_commit_candidate(
+            source, manifest, report
         )
-        if ids and _count_where(
-            conn,
-            f"SELECT COUNT(*) FROM sessions WHERE id IN ({_placeholders(ids)})",
-            ids,
-        ):
-            raise ColdArchiveError(
-                "prepared post-state still contains selected sessions"
-            )
-        integrity = [
-            str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
-        ]
-        if integrity != ["ok"] or conn.execute("PRAGMA foreign_key_check").fetchone():
-            raise ColdArchiveError(
-                "prepared post-state failed integrity recovery checks"
-            )
-        _verify_fts_counts(conn, deleted_message_ids=[])
+    except ColdArchiveError as exc:
+        if "logical state differs" in str(exc):
+            return None
+        raise
     receipt = _retention_receipt_payload(
         stage,
         manifest,
@@ -3064,33 +3334,18 @@ def _validate_final_retention_receipt(
         or receipt.get("board_writer_reservation_held_through_commit") is not True
         or report.get("board_liveness_reverified")
         != receipt.get("board_liveness_reverified")
+        or not isinstance(report.get("post_commit_candidate"), dict)
+        or report["post_commit_candidate"].get("verified") is not True
         or not stage.apply_prepared_path.exists()
         or receipt.get("prepared_receipt_sha256")
         != sha256_path(stage.apply_prepared_path)
     ):
         raise ColdArchiveError("final retention receipt lacks approved committed proof")
-    _validate_candidate_path_identity(source, manifest)
-    with _connect_readonly(source) as conn:
-        if _logical_snapshot_sha256(conn) != report.get("post_logical_sha256"):
-            raise ColdArchiveError(
-                "final retention receipt post-state no longer matches"
-            )
-        if _count_where(
-            conn,
-            f"SELECT COUNT(*) FROM sessions WHERE id IN ({_placeholders(ids)})",
-            ids,
-        ):
-            raise ColdArchiveError(
-                "final retention receipt replay found selected sessions"
-            )
-        integrity = [
-            str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
-        ]
-        if integrity != ["ok"] or conn.execute("PRAGMA foreign_key_check").fetchone():
-            raise ColdArchiveError(
-                "final retention receipt replay failed integrity checks"
-            )
-        _verify_fts_counts(conn, deleted_message_ids=[])
+    verified = _verify_post_commit_candidate(source, manifest, report)
+    if verified != report.get("post_commit_candidate"):
+        raise ColdArchiveError(
+            "final retention receipt post-COMMIT proof no longer matches"
+        )
 
 
 def run_cold_archive_pass(
@@ -3145,8 +3400,9 @@ def run_cold_archive_pass(
             ids = manifest.get("_restricted_selected_ids") or []
             if not ids:
                 with _board_liveness_snapshot(
-                    board_db, reserve_writes=False
+                    board_db, reserve_writes=True
                 ) as board_snapshot:
+                    _require_board_matches_manifest(board_snapshot, manifest)
                     board_receipt = board_snapshot.public_receipt()
                 if stage.retention_receipt_path.exists():
                     existing = _load_private_json(stage.retention_receipt_path)
@@ -3427,6 +3683,8 @@ def record_candidate_cutover(
         or retention_receipt.get("operation") != "hermes-state-cold-archive-retention"
         or not isinstance(retention, dict)
         or retention.get("applied") is not True
+        or not isinstance(retention.get("post_commit_candidate"), dict)
+        or retention["post_commit_candidate"].get("verified") is not True
         or retention_receipt.get("approved_producer_receipt_sha256") != producer_sha
         or retention_receipt.get("prepared_receipt_sha256")
         != sha256_path(stage.apply_prepared_path)
@@ -3467,6 +3725,8 @@ def record_candidate_cutover(
             or existing_marker.get("producer_receipt_sha256") != producer_sha
             or existing_marker.get("retention_receipt_sha256")
             != sha256_path(stage.retention_receipt_path)
+            or existing_marker.get("remote_authority")
+            != producer.get("remote_authority")
         ):
             raise ColdArchiveError("existing cutover marker is invalid")
         return {**existing_marker, "replayed": True}
@@ -3478,6 +3738,7 @@ def record_candidate_cutover(
         "rollback_bundle_sha256": bundle_sha,
         "producer_receipt_sha256": producer_sha,
         "retention_receipt_sha256": sha256_path(stage.retention_receipt_path),
+        "remote_authority": producer.get("remote_authority"),
         "candidate_health_confirmed": True,
     }
     _exclusive_write_json(stage.cutover_marker_path, marker)
@@ -3639,6 +3900,7 @@ def prune_source_bundle_after_retention(
         or marker.get("candidate_health_confirmed") is not True
         or marker.get("cutover_at") != utc_iso(cutover)
         or marker.get("rollback_bundle_sha256") != bundle_sha
+        or marker.get("remote_authority") != producer.get("remote_authority")
     ):
         raise ColdArchiveError("cutover marker fields are invalid or inconsistent")
     if marker.get("producer_receipt_sha256") != sha256_path(
@@ -3682,6 +3944,8 @@ def prune_source_bundle_after_retention(
             or existing_pruned.get("rollback_bundle_sha256") != bundle_sha
             or existing_pruned.get("prepared_prune_sha256")
             != sha256_path(stage.source_bundle_prune_prepared_path)
+            or existing_pruned.get("remote_authority")
+            != producer.get("remote_authority")
             or prepared.get("operation") != "hermes-source-bundle-prune-prepared"
             or prepared.get("rollback_bundle_sha256") != bundle_sha
             or prepared.get("cutover_marker_sha256") != approved_cutover_marker_sha256
@@ -3712,6 +3976,7 @@ def prune_source_bundle_after_retention(
         "deleted_local_plaintext_paths": deleted,
         "remote_objects_deleted": False,
         "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
+        "remote_authority": producer.get("remote_authority"),
     }
     _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
     return receipt

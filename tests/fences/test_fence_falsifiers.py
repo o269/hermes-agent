@@ -48,8 +48,15 @@ Seeded with the create-dedup fence merged as PR #75.
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
@@ -58,6 +65,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import session_cold_archive as cold
+from hermes_state import SessionDB
 
 # ---------------------------------------------------------------------------
 # Harness types
@@ -640,6 +648,255 @@ def _mnf_separate_filesystem_candidate_is_allowed() -> None:
         ):
             cold._require_candidate_filesystem_boundary(source)
 
+
+_COLD_NOW = 1_800_000_000.0
+
+
+class _ColdFenceRclone:
+    def __init__(self) -> None:
+        self.remote: dict[str, bytes] = {}
+
+    def __call__(self, command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        verb, source, destination = command[1:4]
+        if verb == "copy":
+            remote = destination.rstrip("/") + "/" + Path(source).name
+            self.remote[remote] = Path(source).read_bytes()
+        elif verb == "check":
+            name = command[command.index("--include") + 1][1:]
+            expected = (Path(source) / name).read_bytes()
+            remote = destination.rstrip("/") + "/" + name
+            if self.remote.get(remote) != expected:
+                return subprocess.CompletedProcess(command, 1, "", "mismatch")
+        elif verb == "copyto":
+            Path(destination).write_bytes(self.remote.get(source, b""))
+        else:  # pragma: no cover - a command-shape regression is a harness bug
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+def _cold_fence_age(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    source = Path(command[-1])
+    output = Path(command[command.index("-o") + 1])
+    output.write_bytes(b"AGE-FENCE\n" + hashlib.sha256(source.read_bytes()).digest())
+    os.chmod(output, 0o600)
+    return subprocess.CompletedProcess(command, 0, "", "")
+
+
+def _cold_fence_setup(root: Path) -> tuple[Path, Path, Path, dict[str, object], _ColdFenceRclone]:
+    candidate = root / "candidate.db"
+    db = SessionDB(db_path=candidate)
+    try:
+        db.create_session(session_id="eligible", source="cli")
+        db.append_message(
+            "eligible", "user", "must-fire-cold-archive", timestamp=_COLD_NOW - 90 * 86400
+        )
+        assert db._conn is not None
+        db._conn.execute(
+            """UPDATE sessions SET started_at=?, ended_at=?, archived=1, pinned=0,
+               last_activity_at=? WHERE id='eligible'""",
+            (_COLD_NOW - 90 * 86400 - 1, _COLD_NOW - 90 * 86400, _COLD_NOW - 90 * 86400),
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+    board = root / "fleet.board.db"
+    conn = sqlite3.connect(board)
+    try:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)"
+        )
+        conn.execute("INSERT INTO tasks VALUES ('control', 'done', NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+    recipient = root / "recipient.txt"
+    recipient.write_text("age1fencefixture", encoding="utf-8")
+    config = root / "rclone.conf"
+    config.write_text("[archive]\ntype = local\n", encoding="utf-8")
+    os.chmod(config, 0o600)
+    stage = root / "stage"
+    remote = _ColdFenceRclone()
+    with (
+        mock.patch.object(cold, "_AUTHORITATIVE_FLEET_BOARD_PATH", board),
+        mock.patch.object(
+            cold,
+            "_protected_live_filesystem_devices",
+            return_value=frozenset({candidate.stat().st_dev + 1}),
+        ),
+    ):
+        producer = cold.run_cold_archive_pass(
+            source_db=candidate,
+            stage_root=stage,
+            board_db=board,
+            now=_COLD_NOW,
+            hold_sources=[],
+            rclone_remote=f"archive:{root / 'remote'}",
+            rclone_config=config,
+            age_recipient_file=recipient,
+            age_runner=_cold_fence_age,
+            rclone_runner=remote,
+        )
+    approved_manifest = root / "approved-manifest.json"
+    approved_manifest.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+    os.chmod(approved_manifest, 0o400)
+    approved_producer = root / "approved-producer.json"
+    approved_producer.write_bytes(
+        (stage / "COLD-ARCHIVE-PRODUCER-RECEIPT.json").read_bytes()
+    )
+    os.chmod(approved_producer, 0o400)
+    producer["_board"] = board
+    producer["_approved_manifest"] = approved_manifest
+    producer["_approved_producer"] = approved_producer
+    return candidate, stage, config, producer, remote
+
+
+def _cold_fence_apply(
+    candidate: Path,
+    stage: Path,
+    config: Path,
+    producer: dict[str, object],
+    remote: _ColdFenceRclone,
+) -> dict[str, object]:
+    board = Path(str(producer["_board"]))
+    with (
+        mock.patch.object(cold, "_AUTHORITATIVE_FLEET_BOARD_PATH", board),
+        mock.patch.object(
+            cold,
+            "_protected_live_filesystem_devices",
+            return_value=frozenset({candidate.stat().st_dev + 1}),
+        ),
+    ):
+        return cold.run_cold_archive_pass(
+            source_db=candidate,
+            stage_root=stage,
+            board_db=board,
+            apply_retention=True,
+            approved_manifest_path=Path(str(producer["_approved_manifest"])),
+            approved_manifest_sha256=str(producer["manifest_file_sha256"]),
+            approved_producer_receipt_path=Path(str(producer["_approved_producer"])),
+            approved_producer_receipt_sha256=str(producer["receipt_sha256"]),
+            rclone_config=config,
+            rclone_runner=remote,
+        )
+
+
+def _ablate_cold_board_integration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cold, "_require_no_live_board_selection", lambda *_args: None)
+    monkeypatch.setattr(cold, "_require_board_matches_manifest", lambda *_args: None)
+
+
+def _mf_cold_full_apply_blocks_late_live_board_reference() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        candidate, stage, config, producer, remote = _cold_fence_setup(Path(temp_dir))
+        conn = sqlite3.connect(Path(str(producer["_board"])))
+        try:
+            conn.execute("INSERT INTO tasks VALUES ('late', 'ready', 'eligible')")
+            conn.commit()
+        finally:
+            conn.close()
+        fired = False
+        try:
+            _cold_fence_apply(candidate, stage, config, producer, remote)
+        except cold.ColdArchiveError:
+            fired = True
+        assert fired, "full apply deleted a session referenced by the live board"
+
+
+def _mnf_cold_full_apply_accepts_unchanged_terminal_board() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        candidate, stage, config, producer, remote = _cold_fence_setup(Path(temp_dir))
+        receipt = _cold_fence_apply(candidate, stage, config, producer, remote)
+        assert receipt["retention"]["applied"] is True
+
+
+def _ablate_cold_board_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = cold._board_liveness_snapshot
+
+    @contextmanager
+    def no_reservation(board_db: Path, *, reserve_writes: bool):
+        del reserve_writes
+        with original(board_db, reserve_writes=False) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(cold, "_board_liveness_snapshot", no_reservation)
+
+
+def _mf_cold_full_apply_holds_board_reservation_to_commit() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        candidate, stage, config, producer, remote = _cold_fence_setup(Path(temp_dir))
+        original_write = cold._exclusive_write_json
+        observations: list[bool] = []
+
+        def probe(path: Path, payload: dict[str, object]) -> Path:
+            if path.name == "COLD-ARCHIVE-APPLY-PREPARED.json":
+                contender = sqlite3.connect(
+                    Path(str(producer["_board"])), timeout=0, isolation_level=None
+                )
+                try:
+                    try:
+                        contender.execute("BEGIN IMMEDIATE")
+                    except sqlite3.OperationalError:
+                        observations.append(True)
+                    else:
+                        observations.append(False)
+                        contender.execute("ROLLBACK")
+                finally:
+                    contender.close()
+            return original_write(path, payload)
+
+        with mock.patch.object(cold, "_exclusive_write_json", probe):
+            receipt = _cold_fence_apply(candidate, stage, config, producer, remote)
+        assert receipt["retention"]["applied"] is True
+        assert observations == [True], "apply did not hold the board writer reservation"
+
+
+def _ablate_cold_post_commit_reopen(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cold,
+        "_verify_post_commit_candidate",
+        lambda *_args: {"verified": True},
+    )
+
+
+def _mf_cold_full_apply_reopens_committed_namespace() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        candidate, stage, config, producer, remote = _cold_fence_setup(root)
+        pre_commit = root / "pre-commit.db"
+        shutil.copy2(candidate, pre_commit)
+        original_connect = cold._connect_candidate
+        first = True
+
+        class SwapAfterCommit:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.wrapped, name)
+
+            def execute(self, sql: str, *args: object) -> object:
+                result = self.wrapped.execute(sql, *args)
+                if sql == "COMMIT":
+                    candidate.rename(root / "committed.db")
+                    shutil.copy2(pre_commit, candidate)
+                return result
+
+        def connect(path: Path) -> object:
+            nonlocal first
+            wrapped = original_connect(path)
+            if first:
+                first = False
+                return SwapAfterCommit(wrapped)
+            return wrapped
+
+        fired = False
+        with mock.patch.object(cold, "_connect_candidate", connect):
+            try:
+                _cold_fence_apply(candidate, stage, config, producer, remote)
+            except cold.ColdArchiveError:
+                fired = True
+        assert fired, "full apply emitted success after a commit-adjacent path swap"
+
 FENCES: tuple[FenceSpec, ...] = (
     FenceSpec(
         fence_id="kanban.create.dedup.title_scope",
@@ -757,6 +1014,75 @@ FENCES: tuple[FenceSpec, ...] = (
         must_not_fire={
             "separate_filesystem_candidate_is_allowed": (
                 _mnf_separate_filesystem_candidate_is_allowed
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="sessions.cold_archive.full_apply_board_authority",
+        origin="PR #109 exact-head repair",
+        mechanism=(
+            "the disposable producer-to-apply path binds the canonical board "
+            "identity/projection and rejects a selected live-board lineage"
+        ),
+        ablation=Ablation(
+            describes="board authority binding and selected-live overlap both accept",
+            targets=(
+                "hermes_cli.session_cold_archive._require_no_live_board_selection",
+                "hermes_cli.session_cold_archive._require_board_matches_manifest",
+            ),
+            apply=_ablate_cold_board_integration,
+        ),
+        must_fire={
+            "full_apply_blocks_late_live_reference": (
+                _mf_cold_full_apply_blocks_late_live_board_reference
+            )
+        },
+        must_not_fire={
+            "full_apply_accepts_unchanged_terminal_board": (
+                _mnf_cold_full_apply_accepts_unchanged_terminal_board
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="sessions.cold_archive.full_apply_board_reservation",
+        origin="PR #109 exact-head repair",
+        mechanism="the real apply path holds BEGIN IMMEDIATE on the board through commit",
+        ablation=Ablation(
+            describes="the board snapshot always uses a read transaction",
+            targets=("hermes_cli.session_cold_archive._board_liveness_snapshot",),
+            apply=_ablate_cold_board_reservation,
+        ),
+        must_fire={
+            "full_apply_holds_writer_reservation": (
+                _mf_cold_full_apply_holds_board_reservation_to_commit
+            )
+        },
+        must_not_fire={
+            "full_apply_still_accepts_unchanged_board": (
+                _mnf_cold_full_apply_accepts_unchanged_terminal_board
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="sessions.cold_archive.full_apply_post_commit_reopen",
+        origin="PR #109 exact-head repair",
+        mechanism=(
+            "success requires reopening the committed candidate pathname and "
+            "revalidating identity, logical state, integrity, FTS, and selection"
+        ),
+        ablation=Ablation(
+            describes="post-COMMIT reopen returns an unconditional success token",
+            targets=("hermes_cli.session_cold_archive._verify_post_commit_candidate",),
+            apply=_ablate_cold_post_commit_reopen,
+        ),
+        must_fire={
+            "full_apply_rejects_commit_adjacent_namespace_swap": (
+                _mf_cold_full_apply_reopens_committed_namespace
+            )
+        },
+        must_not_fire={
+            "full_apply_accepts_stable_committed_namespace": (
+                _mnf_cold_full_apply_accepts_unchanged_terminal_board
             )
         },
     ),

@@ -14,7 +14,7 @@ The workflow has separate custody phases:
 ## Non-goals and hard fences
 
 - Do not run this command against any active default, current, or named-profile `state.db`, sidecar, symlink, or hardlink alias. The offline candidate and every present sidecar must be owned by the current effective user, have exactly one link, and reside on a filesystem different from every protected live-profile path. This filesystem boundary prevents a hardlink alias from appearing after the final check.
-- `--board-db` is mandatory. It must be the readable canonical board with a non-empty `tasks(id,status,session_id)` population. Missing schema, empty/unreadable state, or an identity change fails closed. Unknown/non-terminal statuses are live; terminal statuses are `done`, `archived`, `completed`, `cancelled`, and `canceled`.
+- `--board-db` is mandatory and must resolve exactly to `/var/lib/boardd/fleet/kanban.db`. A compatible substitute is not authority. Producer binds its resolved path, device, inode, and complete `tasks(id,status,session_id)` projection; apply must reproduce all of them under `BEGIN IMMEDIATE`. Missing schema, empty/unreadable state, replacement, or projection drift fails closed. Unknown/non-terminal statuses are live; terminal statuses are `done`, `archived`, `completed`, `cancelled`, and `canceled`.
 - Do not enable `sessions.auto_prune`.
 - Do not run `hermes sessions optimize`, `VACUUM`, FTS optimize, WAL checkpoint, live `DELETE`, config changes, service changes, rclone sync/delete/purge/dedupe, or a production upload as part of author verification.
 - The command never installs a candidate over an active database. Fable is the sole cutover/landing operator.
@@ -26,10 +26,12 @@ The workflow has separate custody phases:
 ## Required candidate schema and policy
 
 Cold retention is intentionally unavailable when durable policy state cannot be proven. The candidate `sessions` table must carry canonical `pinned` and `last_activity_at` columns. Missing columns fail the whole command closed; `NULL` values make that lineage ineligible.
-Both canonical FTS5 roots and all six message-sync triggers are mandatory; missing
-search roots/triggers fail closed before selection or deletion. A candidate with
-`fts_rebuild_high_water` or `fts_rebuild_progress` state is also refused until the
-deferred rebuild is complete, so a knowingly partial index can never cross Gate B.
+Every installed `messages_fts*` virtual-table root is inventoried dynamically. The
+standard and trigram roots are mandatory; optional roots such as
+`messages_fts_cjk` become mandatory when installed. The command loads the optional
+CJK tokenizer when available and validates each root's insert/delete/update
+triggers, rebuild markers, strict integrity, counts, deleted-row absence, and
+survivor digest. Missing or unqueryable installed roots fail closed.
 
 The current selection rules are:
 
@@ -94,8 +96,11 @@ The producer creates and verifies, in order:
 6. the clear redacted `GATE-B-MANIFEST.json` uploaded last as the sole clear commit marker.
 
 No selected ID, title, QMD basename, parent-map filename, or clear restricted tar is published remotely. Uploads use directory-targeted `rclone copy --immutable`
-(not `copyto`, which can replace a destination on supported backends), followed by
-`rclone check --checksum --one-way` and exact `copyto` readback. There is no remote
+(not `copyto`, which can replace a destination on supported backends), followed by a
+supported directory-to-directory `rclone check --checksum --one-way` bounded to one
+exact root-relative object with `--include /<name> --max-depth 1`, plus exact
+`copyto` byte readback. The approved receipt binds a fingerprint of the exact config
+bytes, the named backend type, remote name, and root across apply, cutover, and prune. There is no remote
 delete, sync, purge, dedupe, move, cleanup, or retention verb. The age recipient is
 read once into `restricted/AGE-RECIPIENTS.txt`; rclone config bytes are copied once
 into a private per-operation temporary snapshot. Every subprocess uses only those
@@ -135,8 +140,9 @@ Before opening a candidate write transaction, apply proves candidate device/inod
 complete logical state match the approved source snapshot and performs fresh
 checksum/readback verification of both encrypted packets and the final manifest.
 It also acquires `BEGIN IMMEDIATE` on the canonical board, switches that connection
-to query-only, re-derives liveness, and holds the board writer reservation through the
-candidate commit. The archive command never writes board data.
+to query-only, re-derives its exact authority-bound projection, and holds the board
+writer reservation through the candidate commit and post-commit verification. The
+archive command never writes board data.
 
 Then it acquires `BEGIN IMMEDIATE` and, while holding that lock:
 
@@ -155,9 +161,14 @@ Then it acquires `BEGIN IMMEDIATE` and, while holding that lock:
   selected/dependent deletion and trigger side effects.
 
 `COLD-ARCHIVE-RETENTION-RECEIPT.json` is exclusively created only after the checked
-transaction commits. If the process stops after commit but before that final receipt
-write, replay verifies the prepared post-state digest and reconstructs the final receipt
-without deleting again. Existing receipts are never clobbered.
+transaction commits. Before a success receipt can exist, apply closes the destructive
+connection, reopens the approved pathname, proves the original device/inode is still
+there, and re-runs logical-state, selected-row absence, integrity, foreign-key,
+installed-FTS-root, and survivor checks. A commit-adjacent pathname or WAL namespace
+swap therefore leaves only the prepared intent, never a success receipt. If the
+process stops after commit but before that final receipt write, replay performs the
+same reopened post-state proof and reconstructs the final receipt without deleting
+again. Existing receipts are never clobbered.
 
 ## Rollback proof and restore
 

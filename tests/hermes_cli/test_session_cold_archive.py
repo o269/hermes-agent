@@ -35,10 +35,14 @@ def _candidate_on_separate_test_filesystem(
         "_protected_live_filesystem_devices",
         lambda: frozenset({candidate_device + 1}),
     )
+    monkeypatch.setattr(
+        cold, "_AUTHORITATIVE_FLEET_BOARD_PATH", tmp_path / "canonical.board.db"
+    )
 
 
 def _board(tmp_path: Path, name: str = "stage") -> Path:
-    board_path = tmp_path / f"{name}.board.db"
+    del name
+    board_path = tmp_path / "canonical.board.db"
     if board_path.exists():
         return board_path
     conn = sqlite3.connect(board_path)
@@ -260,8 +264,12 @@ class FakeRclone:
                 data = bytes([data[0] ^ 0x01]) + data[1:]
             self.remote[remote_object] = data
         elif step == "check":
-            expected = Path(source).read_bytes()
-            success = self.lie_on_check or self.remote.get(destination) == expected
+            include = command[command.index("--include") + 1]
+            assert include.startswith("/") and "/" not in include[1:]
+            name = include[1:]
+            expected = (Path(source) / name).read_bytes()
+            remote_object = destination.rstrip("/") + "/" + name
+            success = self.lie_on_check or self.remote.get(remote_object) == expected
             return subprocess.CompletedProcess(command, 0 if success else 1, "", "")
         else:
             Path(destination).write_bytes(self.remote.get(source, b""))
@@ -2680,6 +2688,253 @@ def test_apply_reverifies_every_remote_object_before_delete(
     with pytest.raises(ColdArchiveError, match="remote custody checksum failed"):
         _apply(db_path, stage, config, producer, fake)
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+
+
+def test_supported_rclone_directory_check_verifies_one_real_local_object(
+    tmp_path: Path,
+) -> None:
+    local_dir = tmp_path / "local"
+    local_dir.mkdir(mode=0o700)
+    source = local_dir / "packet.age"
+    source.write_bytes(b"opaque-custody-packet")
+    os.chmod(source, 0o600)
+    remote_dir = tmp_path / "remote"
+    config = tmp_path / "rclone-local.conf"
+    config.write_text("[archive]\ntype = local\n", encoding="utf-8")
+    os.chmod(config, 0o600)
+
+    reports = cold.publish_paths_with_rclone(
+        [source],
+        remote_root=f"archive:{remote_dir}",
+        rclone_config=config,
+        namespace="one-object",
+        rclone_exe="rclone",
+    )
+
+    assert len(reports) == 1
+    assert reports[0]["readback_sha256"] == _sha(source)
+    assert reports[0]["remote_authority"] == {
+        "version": "rclone-authority-v1",
+        "remote_name": "archive",
+        "backend_type": "local",
+        "remote_root": f"archive:{remote_dir}",
+        "approved_config_sha256": _sha(config),
+    }
+    assert (remote_dir / "one-object" / source.name).read_bytes() == source.read_bytes()
+
+
+def test_apply_rejects_substitute_nonempty_board_and_changed_rclone_authority(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    approved_manifest = tmp_path / "approved-manifest.json"
+    approved_manifest.write_bytes((stage / "GATE-B-MANIFEST.json").read_bytes())
+    os.chmod(approved_manifest, 0o400)
+    approved_producer = tmp_path / "approved-producer.json"
+    approved_producer.write_bytes(
+        (stage / "COLD-ARCHIVE-PRODUCER-RECEIPT.json").read_bytes()
+    )
+    os.chmod(approved_producer, 0o400)
+
+    substitute = tmp_path / "substitute.board.db"
+    conn = sqlite3.connect(substitute)
+    try:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)"
+        )
+        conn.execute("INSERT INTO tasks VALUES ('control', 'done', NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(ColdArchiveError, match="not the authoritative fleet board"):
+        cold.run_cold_archive_pass(
+            source_db=db_path,
+            stage_root=stage,
+            board_db=substitute,
+            apply_retention=True,
+            approved_manifest_path=approved_manifest,
+            approved_manifest_sha256=producer["manifest_file_sha256"],
+            approved_producer_receipt_path=approved_producer,
+            approved_producer_receipt_sha256=producer["receipt_sha256"],
+            rclone_config=config,
+            rclone_runner=fake,
+        )
+
+    config.write_text("[gdrive]\ntype = local\n", encoding="utf-8")
+    os.chmod(config, 0o600)
+    with pytest.raises(ColdArchiveError, match="approved config fingerprint changed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+
+
+def test_apply_rejects_terminal_only_board_projection_drift(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    conn = sqlite3.connect(_board(tmp_path))
+    try:
+        conn.execute("UPDATE tasks SET status='completed' WHERE id='t_control'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ColdArchiveError, match="identity/projection changed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
+
+
+def test_cutover_rejects_rclone_config_fingerprint_rotation(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="selected")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    config.write_text("[gdrive]\ntype = local\n", encoding="utf-8")
+    os.chmod(config, 0o600)
+
+    with pytest.raises(ColdArchiveError, match="approved config fingerprint changed"):
+        cold.record_candidate_cutover(
+            stage,
+            candidate_health_confirmed=True,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=NOW + DAY,
+        )
+    assert not (stage / "rollback" / "CANDIDATE-CUTOVER.json").exists()
+
+
+def test_post_commit_reopen_rejects_candidate_namespace_swap_before_success_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_commit_copy = tmp_path / "candidate-pre-commit.db"
+    shutil.copy2(db_path, pre_commit_copy)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    original_connect = cold._connect_candidate
+    destructive_open = True
+
+    class CommitSwapConnection:
+        def __init__(self, wrapped: sqlite3.Connection) -> None:
+            self._wrapped = wrapped
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._wrapped, name)
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            result = self._wrapped.execute(sql, *args)
+            if sql == "COMMIT":
+                committed = tmp_path / "committed-original.db"
+                db_path.rename(committed)
+                shutil.copy2(pre_commit_copy, db_path)
+            return result
+
+    def connect_with_commit_swap(path: Path) -> Any:
+        nonlocal destructive_open
+        wrapped = original_connect(path)
+        if destructive_open:
+            destructive_open = False
+            return CommitSwapConnection(wrapped)
+        return wrapped
+
+    monkeypatch.setattr(cold, "_connect_candidate", connect_with_commit_swap)
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        _apply(db_path, stage, config, producer, fake)
+    assert (stage / "COLD-ARCHIVE-APPLY-PREPARED.json").exists()
+    assert not (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
+
+
+def test_every_installed_fts_root_is_rebuilt_and_reverified_after_commit(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="deletedcjkmarker")
+        _make_session(
+            db,
+            "survivor",
+            days_ago=2,
+            archived=False,
+            ended=False,
+            content="survivorcjkmarker",
+        )
+        assert db._conn is not None
+        if not db._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_cjk'"
+        ).fetchone():
+            db._conn.executescript(
+                """
+                CREATE VIEW messages_fts_cjk_src AS
+                    SELECT id, role, content, tool_name, tool_calls
+                    FROM messages WHERE role <> 'tool';
+                CREATE VIRTUAL TABLE messages_fts_cjk USING fts5(
+                    content, tool_name, tool_calls,
+                    content='messages_fts_cjk_src', content_rowid='id',
+                    tokenize='unicode61'
+                );
+                CREATE TRIGGER messages_fts_cjk_insert AFTER INSERT ON messages
+                WHEN new.role <> 'tool' BEGIN
+                    INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
+                    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+                END;
+                CREATE TRIGGER messages_fts_cjk_delete AFTER DELETE ON messages
+                WHEN old.role <> 'tool' BEGIN
+                    INSERT INTO messages_fts_cjk(messages_fts_cjk,rowid,content,tool_name,tool_calls)
+                    VALUES ('delete',old.id,old.content,old.tool_name,old.tool_calls);
+                END;
+                CREATE TRIGGER messages_fts_cjk_update
+                AFTER UPDATE OF content, tool_name, tool_calls, role ON messages BEGIN
+                    INSERT INTO messages_fts_cjk(messages_fts_cjk,rowid,content,tool_name,tool_calls)
+                    SELECT 'delete',old.id,old.content,old.tool_name,old.tool_calls
+                    WHERE old.role <> 'tool';
+                    INSERT INTO messages_fts_cjk(rowid,content,tool_name,tool_calls)
+                    SELECT new.id,new.content,new.tool_name,new.tool_calls
+                    WHERE new.role <> 'tool';
+                END;
+                INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES ('rebuild');
+                """
+            )
+            db._conn.commit()
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    receipt = _apply(db_path, stage, config, producer, fake)
+
+    roots = receipt["retention"]["fts_counts"]["installed_roots"]
+    reopened = receipt["retention"]["post_commit_candidate"]["fts_counts"]
+    assert "messages_fts_cjk" in roots
+    assert reopened["installed_roots"] == roots
+    assert _readonly_rows(
+        db_path,
+        "SELECT COUNT(*) FROM messages_fts_cjk WHERE messages_fts_cjk MATCH 'deletedcjkmarker'",
+    ) == [(0,)]
+    assert _readonly_rows(
+        db_path,
+        "SELECT COUNT(*) FROM messages_fts_cjk WHERE messages_fts_cjk MATCH 'survivorcjkmarker'",
+    ) == [(1,)]
 
 
 def test_survivor_source_only_drift_rolls_back(tmp_path: Path) -> None:

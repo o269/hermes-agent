@@ -12326,8 +12326,9 @@ def main():
         type=Path,
         required=True,
         help=(
-            "Canonical board SQLite database used to hold every session linked "
-            "from a non-terminal task; unreadable/empty/unprovable boards fail closed"
+            "The fixed authoritative fleet board at "
+            "/var/lib/boardd/fleet/kanban.db; substitutes and changed "
+            "path/device/inode/projection state fail closed"
         ),
     )
     sessions_cold_archive.add_argument(
@@ -12414,7 +12415,10 @@ def main():
     sessions_cold_archive.add_argument(
         "--rclone-config",
         type=Path,
-        help="Dedicated current-user mode-0600 unaliased rclone config",
+        help=(
+            "Dedicated current-user mode-0600 unaliased rclone config; its "
+            "backend/root and exact config fingerprint bind every later phase"
+        ),
     )
     sessions_cold_archive.add_argument(
         "--remote-namespace",
