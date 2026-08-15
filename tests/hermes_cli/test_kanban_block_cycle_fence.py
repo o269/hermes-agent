@@ -84,6 +84,19 @@ def test_agent_tool_description_matches_cross_kind_fence() -> None:
     assert "re-blocked for the same reason" not in description
 
 
+def test_user_guide_matches_cross_kind_fence() -> None:
+    guide = (
+        Path(__file__).resolve().parents[2]
+        / "website"
+        / "docs"
+        / "user-guide"
+        / "features"
+        / "kanban.md"
+    ).read_text(encoding="utf-8")
+    assert "even when the reason or kind changes" in guide
+    assert "same-kind re-blocks" not in guide
+
+
 # ---------------------------------------------------------------------------
 # Normal operation — the fence must not disrupt legitimate blocking
 # ---------------------------------------------------------------------------
