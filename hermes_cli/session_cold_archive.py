@@ -1809,10 +1809,68 @@ def load_approved_producer_receipt(
     return receipt
 
 
-def _exclusive_copy(source: Path, destination: Path) -> Path:
-    source = _resolve_existing_file(source)
-    with source.open("rb") as handle:
-        return _exclusive_write_bytes(destination, handle.read())
+def _exclusive_sqlite_backup(source: Path, destination: Path) -> Path:
+    """Publish one self-contained, transactionally consistent SQLite snapshot."""
+
+    source = reject_live_state_db(source)
+    before = source.stat()
+    parent = _require_private_dir(destination.parent)
+    target = _safe_immediate_child(parent, destination.name)
+    partial = _safe_immediate_child(
+        parent,
+        f".{destination.name}.{os.getpid()}.{os.urandom(8).hex()}.partial",
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(partial, flags, 0o600)
+    except FileExistsError as exc:
+        raise ColdArchiveError(f"refusing existing stage partial: {partial}") from exc
+    except OSError as exc:
+        raise ColdArchiveError(
+            f"could not create SQLite backup partial {partial}: {exc}"
+        ) from exc
+    else:
+        os.close(fd)
+    source_conn: sqlite3.Connection | None = None
+    destination_conn: sqlite3.Connection | None = None
+    try:
+        source_conn = _connect_readonly(source)
+        destination_conn = sqlite3.connect(str(partial), isolation_level=None)
+        source_conn.backup(destination_conn)
+        destination_conn.close()
+        destination_conn = None
+        source_conn.close()
+        source_conn = None
+        after = source.stat()
+        if not os.path.samestat(before, after):
+            raise ColdArchiveError(
+                "candidate database identity changed during rollback snapshot"
+            )
+        os.chmod(partial, 0o600)
+        backup_fd = os.open(partial, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(backup_fd)
+        finally:
+            os.close(backup_fd)
+        try:
+            os.link(partial, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ColdArchiveError(
+                f"refusing to overwrite stage artifact: {target}"
+            ) from exc
+        except OSError as exc:
+            raise ColdArchiveError(
+                f"could not publish SQLite backup without clobber: {target}: {exc}"
+            ) from exc
+    finally:
+        if destination_conn is not None:
+            destination_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+        partial.unlink(missing_ok=True)
+    _fsync_directory(parent)
+    return target
 
 
 def _copy_rollback_bundle(
@@ -1823,9 +1881,21 @@ def _copy_rollback_bundle(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     source = reject_live_state_db(source_db)
     bundle_root = _create_private_dir(stage.rollback_dir / "source-bundle")
-    copied: list[dict[str, Any]] = []
-    for suffix in _SIDECAR_SUFFIXES:
-        part = source if not suffix else source.with_name(source.name + suffix)
+    destination = _exclusive_sqlite_backup(
+        source, bundle_root / _ROLLBACK_MEMBER_NAMES[""]
+    )
+    copied: list[dict[str, Any]] = [
+        {
+            "name": destination.name,
+            "status": "copied",
+            "snapshot_method": "sqlite-backup",
+            "bytes": destination.stat().st_size,
+            "sha256": sha256_path(destination),
+            "mode": "0600",
+        }
+    ]
+    for suffix in _SIDECAR_SUFFIXES[1:]:
+        part = source.with_name(source.name + suffix)
         member_name = _ROLLBACK_MEMBER_NAMES[suffix]
         if not part.exists():
             copied.append({"name": member_name, "status": "absent"})
@@ -1840,13 +1910,10 @@ def _copy_rollback_bundle(
             raise ColdArchiveError(
                 f"rollback source part is not a regular file: {part}"
             )
-        destination = _exclusive_copy(part, bundle_root / member_name)
         copied.append({
-            "name": destination.name,
-            "status": "copied",
-            "bytes": destination.stat().st_size,
-            "sha256": sha256_path(destination),
-            "mode": "0600",
+            "name": member_name,
+            "status": "captured-in-sqlite-backup",
+            "snapshot_method": "sqlite-backup",
         })
     created_epoch = time.time() if now is None else float(now)
     bundle_manifest_path = _exclusive_write_json(
@@ -1899,10 +1966,21 @@ def _verify_rollback_bundle_snapshot(
     bundled_db = _require_private_file(
         stage.rollback_dir / "source-bundle" / _ROLLBACK_MEMBER_NAMES[""]
     )
-    if sha256_path(bundled_db) != manifest.get("source_db_sha256"):
-        raise ColdArchiveError(
-            "rollback bundle main database differs from approved bytes"
-        )
+    bundle_manifest = _load_private_json(
+        stage.rollback_dir / "source-bundle" / "ROLLBACK-BUNDLE-MANIFEST.json"
+    )
+    files = bundle_manifest.get("files")
+    if (
+        not isinstance(files, list)
+        or not files
+        or any(not isinstance(item, dict) for item in files)
+        or files[0].get("name") != _ROLLBACK_MEMBER_NAMES[""]
+        or files[0].get("status") != "copied"
+        or files[0].get("snapshot_method") != "sqlite-backup"
+        or files[0].get("sha256") != sha256_path(bundled_db)
+        or any(item.get("status") == "copied" for item in files[1:])
+    ):
+        raise ColdArchiveError("rollback bundle is not a self-contained SQLite backup")
     with _connect_readonly(bundled_db) as conn:
         if _logical_snapshot_sha256(conn) != manifest.get("source_logical_sha256"):
             raise ColdArchiveError(
@@ -2402,7 +2480,9 @@ def _verify_remote_custody(
             if report.get("integrity") != "rclone-checksum-and-readback-ok":
                 raise ColdArchiveError("producer remote receipt is not verified")
             if report.get("remote_authority") != approved_authority:
-                raise ColdArchiveError("producer remote object authority is inconsistent")
+                raise ColdArchiveError(
+                    "producer remote object authority is inconsistent"
+                )
             remote = str(report.get("remote") or "")
             if re.search(r"[\r\n\x00]", remote) or not remote.endswith(
                 "/" + local.name
@@ -3251,12 +3331,25 @@ def _publish_retention_receipt(
     expected = report.get("post_commit_candidate")
     if not isinstance(expected, dict) or expected.get("verified") is not True:
         raise ColdArchiveError("retention receipt has no verified candidate binding")
-    _exclusive_write_json(stage.retention_receipt_path, receipt)
-    verified = _verify_post_commit_candidate(source, manifest, report)
-    if verified != expected:
-        raise ColdArchiveError(
-            "published retention receipt candidate binding no longer matches"
-        )
+    preexisting = (
+        stage.retention_receipt_path.exists()
+        or stage.retention_receipt_path.is_symlink()
+    )
+    try:
+        _exclusive_write_json(stage.retention_receipt_path, receipt)
+        verified = _verify_post_commit_candidate(source, manifest, report)
+        if verified != expected:
+            raise ColdArchiveError(
+                "published retention receipt candidate binding no longer matches"
+            )
+    except BaseException:
+        if not preexisting and (
+            stage.retention_receipt_path.exists()
+            or stage.retention_receipt_path.is_symlink()
+        ):
+            stage.retention_receipt_path.unlink(missing_ok=True)
+            _fsync_directory(stage.retention_receipt_path.parent)
+        raise
     return {
         **receipt,
         "receipt_path": str(stage.retention_receipt_path),
@@ -3798,6 +3891,7 @@ def record_candidate_cutover(
             != sha256_path(stage.retention_receipt_path)
             or existing_marker.get("remote_authority")
             != producer.get("remote_authority")
+            or existing_marker.get("candidate_binding") != cutover_candidate
         ):
             raise ColdArchiveError("existing cutover marker is invalid")
         return {**existing_marker, "replayed": True}
@@ -3810,9 +3904,26 @@ def record_candidate_cutover(
         "producer_receipt_sha256": producer_sha,
         "retention_receipt_sha256": sha256_path(stage.retention_receipt_path),
         "remote_authority": producer.get("remote_authority"),
+        "candidate_binding": cutover_candidate,
         "candidate_health_confirmed": True,
     }
-    _exclusive_write_json(stage.cutover_marker_path, marker)
+    preexisting = (
+        stage.cutover_marker_path.exists() or stage.cutover_marker_path.is_symlink()
+    )
+    try:
+        _exclusive_write_json(stage.cutover_marker_path, marker)
+        rebound_candidate = _verify_post_commit_candidate(source, manifest, retention)
+        if rebound_candidate != cutover_candidate:
+            raise ColdArchiveError(
+                "published cutover marker candidate binding no longer matches"
+            )
+    except BaseException:
+        if not preexisting and (
+            stage.cutover_marker_path.exists() or stage.cutover_marker_path.is_symlink()
+        ):
+            stage.cutover_marker_path.unlink(missing_ok=True)
+            _fsync_directory(stage.cutover_marker_path.parent)
+        raise
     return marker
 
 
@@ -3941,6 +4052,9 @@ def prune_source_bundle_after_retention(
     producer = _load_private_json(stage.producer_receipt_path)
     retention_receipt = _load_private_json(stage.retention_receipt_path)
     retention_state = retention_receipt.get("retention")
+    producer_sha = sha256_path(stage.producer_receipt_path)
+    manifest_file_sha = sha256_path(stage.manifest_path)
+    manifest = _load_stage_candidate_verification_manifest(stage)
     if (
         policy.get("operation") != "hermes-source-bundle-retention-policy"
         or policy.get("state") != "awaiting-cutover"
@@ -3949,12 +4063,31 @@ def prune_source_bundle_after_retention(
         or retention_receipt.get("operation") != "hermes-state-cold-archive-retention"
         or not isinstance(retention_state, dict)
         or retention_state.get("applied") is not True
-        or retention_receipt.get("approved_producer_receipt_sha256")
-        != sha256_path(stage.producer_receipt_path)
+        or retention_receipt.get("approved_producer_receipt_sha256") != producer_sha
         or retention_receipt.get("prepared_receipt_sha256")
         != sha256_path(stage.apply_prepared_path)
     ):
         raise ColdArchiveError("source-bundle lifecycle receipts are invalid")
+    source_db = producer.get("source_db")
+    if not isinstance(source_db, str) or not Path(source_db).is_absolute():
+        raise ColdArchiveError("producer receipt has no absolute candidate path")
+    source = Path(source_db)
+    _validate_final_retention_receipt(
+        source,
+        stage,
+        manifest,
+        retention_receipt,
+        approved_manifest_file_sha256=manifest_file_sha,
+        approved_producer_receipt_sha256=producer_sha,
+    )
+    rebound_candidate = _verify_post_commit_candidate(source, manifest, retention_state)
+    if (
+        retention_state.get("post_commit_candidate") != rebound_candidate
+        or marker.get("candidate_binding") != rebound_candidate
+    ):
+        raise ColdArchiveError(
+            "cutover marker no longer binds the current candidate post-state"
+        )
     if not _producer_has_verified_rollback_remote(stage, producer):
         raise ColdArchiveError("verified encrypted rollback remote receipt is required")
     _verify_remote_custody(

@@ -185,6 +185,28 @@ def _logical_snapshot(path: Path) -> dict[str, list[tuple[Any, ...]]]:
         conn.close()
 
 
+def _sqlite_backup(source: Path, destination: Path) -> None:
+    source_conn = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+    destination_conn = sqlite3.connect(destination)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+
+
+def _replace_database_from_backup(
+    candidate: Path, replacement: Path, displaced_snapshot: Path
+) -> None:
+    """Swap a test namespace without carrying the old database's WAL forward."""
+
+    _sqlite_backup(candidate, displaced_snapshot)
+    candidate.unlink()
+    for suffix in ("-wal", "-shm", "-journal"):
+        candidate.with_name(candidate.name + suffix).unlink(missing_ok=True)
+    os.replace(replacement, candidate)
+
+
 def _fake_age(
     command: list[str], text: bool = True, capture_output: bool = True
 ) -> subprocess.CompletedProcess[str]:
@@ -1126,7 +1148,6 @@ def test_rollback_bundle_restores_exact_pre_retention_state(tmp_path: Path) -> N
         )
     finally:
         db.close()
-    pre_sha = _sha(db_path)
     pre_snapshot = _logical_snapshot(db_path)
     fake = FakeRclone()
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
@@ -1160,14 +1181,13 @@ def test_rollback_bundle_restores_exact_pre_retention_state(tmp_path: Path) -> N
             if item["name"] == "state.db":
                 restore_path.write_bytes(data)
                 os.chmod(restore_path, 0o600)
-                assert item["sha256"] == pre_sha
+                assert item["snapshot_method"] == "sqlite-backup"
             else:
                 suffix = item["name"][len("state.db") :]
                 sidecar_restore = restore_path.with_name(restore_path.name + suffix)
                 sidecar_restore.write_bytes(data)
                 os.chmod(sidecar_restore, 0o600)
 
-    assert _sha(restore_path) == pre_sha
     assert _logical_snapshot(restore_path) == pre_snapshot
     assert _readonly_rows(restore_path, "PRAGMA integrity_check") == [("ok",)]
     assert _readonly_rows(restore_path, "PRAGMA foreign_key_check") == []
@@ -1995,7 +2015,7 @@ def test_source_and_stage_symlinks_fail_closed(tmp_path: Path) -> None:
         )
 
 
-def test_rollback_bundle_contains_nonempty_wal_and_restores_wal_backed_row(
+def test_rollback_bundle_sqlite_backup_restores_wal_backed_row_without_sidecars(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "candidate.db"
@@ -2022,11 +2042,22 @@ def test_rollback_bundle_contains_nonempty_wal_and_restores_wal_backed_row(
             for item in producer["rollback_bundle"]["files"]
             if item["status"] == "copied"
         }
-        assert copied["state.db-wal"]["bytes"] > 0
+        assert set(copied) == {"state.db"}
+        assert copied["state.db"]["snapshot_method"] == "sqlite-backup"
+        wal_report = next(
+            item
+            for item in producer["rollback_bundle"]["files"]
+            if item["name"] == "state.db-wal"
+        )
+        assert wal_report["status"] == "captured-in-sqlite-backup"
 
         restored = tmp_path / "restored-wal.db"
         bundle = stage / "rollback" / "rollback-source-bundle.tar.gz"
         with tarfile.open(bundle, "r:gz") as archive:
+            assert set(archive.getnames()) == {
+                "ROLLBACK-BUNDLE-MANIFEST.json",
+                "state.db",
+            }
             for source_name, item in copied.items():
                 member = archive.extractfile(source_name)
                 assert member is not None
@@ -2862,7 +2893,7 @@ def test_post_commit_reopen_rejects_candidate_namespace_swap_before_success_rece
     finally:
         db.close()
     pre_commit_copy = tmp_path / "candidate-pre-commit.db"
-    shutil.copy2(db_path, pre_commit_copy)
+    _sqlite_backup(db_path, pre_commit_copy)
     fake = FakeRclone()
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
     original_connect = cold._connect_candidate
@@ -2880,7 +2911,7 @@ def test_post_commit_reopen_rejects_candidate_namespace_swap_before_success_rece
             if sql == "COMMIT":
                 committed = tmp_path / "committed-original.db"
                 db_path.rename(committed)
-                shutil.copy2(pre_commit_copy, db_path)
+                os.replace(pre_commit_copy, db_path)
             return result
 
     def connect_with_commit_swap(path: Path) -> Any:
@@ -2908,7 +2939,7 @@ def test_receipt_publication_rebinds_candidate_after_post_commit_verification(
     finally:
         db.close()
     pre_retention = tmp_path / "candidate-pre-retention.db"
-    shutil.copy2(db_path, pre_retention)
+    _sqlite_backup(db_path, pre_retention)
     fake = FakeRclone()
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
     displaced_post_retention = tmp_path / "candidate-post-retention.db"
@@ -2920,8 +2951,9 @@ def test_receipt_publication_rebinds_candidate_after_post_commit_verification(
         result = original_write(path, payload)
         if path.name == "COLD-ARCHIVE-RETENTION-RECEIPT.json" and not swapped:
             swapped = True
-            os.replace(db_path, displaced_post_retention)
-            os.replace(pre_retention, db_path)
+            _replace_database_from_backup(
+                db_path, pre_retention, displaced_post_retention
+            )
         return result
 
     monkeypatch.setattr(cold, "_exclusive_write_json", publish_then_swap)
@@ -2929,7 +2961,8 @@ def test_receipt_publication_rebinds_candidate_after_post_commit_verification(
         _apply(db_path, stage, config, producer, fake)
 
     assert swapped is True
-    assert (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
+    assert (stage / "COLD-ARCHIVE-APPLY-PREPARED.json").exists()
+    assert not (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
     assert _readonly_rows(displaced_post_retention, "SELECT id FROM sessions") == []
 
@@ -2944,13 +2977,12 @@ def test_cutover_reopens_candidate_and_rejects_post_receipt_namespace_swap(
     finally:
         db.close()
     pre_retention = tmp_path / "candidate-pre-retention.db"
-    shutil.copy2(db_path, pre_retention)
+    _sqlite_backup(db_path, pre_retention)
     fake = FakeRclone()
     stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
     _apply(db_path, stage, config, producer, fake)
     displaced_post_retention = tmp_path / "candidate-post-retention.db"
-    os.replace(db_path, displaced_post_retention)
-    os.replace(pre_retention, db_path)
+    _replace_database_from_backup(db_path, pre_retention, displaced_post_retention)
 
     with pytest.raises(ColdArchiveError, match="path identity changed"):
         cold.record_candidate_cutover(
@@ -2964,6 +2996,91 @@ def test_cutover_reopens_candidate_and_rejects_post_receipt_namespace_swap(
     assert not (stage / "rollback" / "CANDIDATE-CUTOVER.json").exists()
     assert _readonly_rows(db_path, "SELECT id FROM sessions") == [("eligible",)]
     assert _readonly_rows(displaced_post_retention, "SELECT id FROM sessions") == []
+
+
+def test_cutover_marker_publication_rebinds_candidate_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    _sqlite_backup(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    original_write = cold._exclusive_write_json
+    swapped = False
+
+    def publish_marker_then_swap(path: Path, payload: dict[str, Any]) -> Path:
+        nonlocal swapped
+        result = original_write(path, payload)
+        if path.name == "CANDIDATE-CUTOVER.json" and not swapped:
+            swapped = True
+            _replace_database_from_backup(
+                db_path, pre_retention, displaced_post_retention
+            )
+        return result
+
+    monkeypatch.setattr(cold, "_exclusive_write_json", publish_marker_then_swap)
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        cold.record_candidate_cutover(
+            stage,
+            candidate_health_confirmed=True,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=NOW + DAY,
+        )
+
+    assert swapped is True
+    assert (stage / "COLD-ARCHIVE-APPLY-PREPARED.json").exists()
+    assert (stage / "COLD-ARCHIVE-RETENTION-RECEIPT.json").exists()
+    assert not (stage / "rollback" / "CANDIDATE-CUTOVER.json").exists()
+
+
+def test_prune_revalidates_candidate_instead_of_trusting_cutover_marker(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    pre_retention = tmp_path / "candidate-pre-retention.db"
+    _sqlite_backup(db_path, pre_retention)
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    marker_sha = _sha(stage / "rollback" / "CANDIDATE-CUTOVER.json")
+    displaced_post_retention = tmp_path / "candidate-post-retention.db"
+    _replace_database_from_backup(db_path, pre_retention, displaced_post_retention)
+
+    with pytest.raises(ColdArchiveError, match="path identity changed"):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        )
+
+    assert (stage / "rollback" / "rollback-source-bundle.tar.gz").exists()
+    assert (stage / "rollback" / "source-bundle").exists()
+    assert not (stage / "rollback" / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
 
 
 def test_every_installed_fts_root_is_rebuilt_and_reverified_after_commit(
