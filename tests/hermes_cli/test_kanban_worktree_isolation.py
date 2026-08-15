@@ -84,6 +84,7 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
                 {"title": "spec it", "assignee": "alice", "parents": []},
                 {"title": "implement it", "assignee": "bob", "parents": [0]},
             ],
+            idempotency_key=f"worktree-isolation:{root}",
             author="decomposer",
         )
         assert child_ids is not None and len(child_ids) == 2
