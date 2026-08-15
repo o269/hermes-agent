@@ -311,7 +311,11 @@ def detect_audio_environment() -> dict:
     # and points PULSE_SERVER / PIPEWIRE_REMOTE at it, audio works fine
     # (issue #21203).  Only block when no forwarding is configured.
     from hermes_constants import is_container
-    if is_container():
+    # An explicitly detected Termux runtime is authoritative.  Host/container
+    # auto-detection can reflect the test runner or Android substrate rather
+    # than the selected capture backend; letting it win adds a hard container
+    # warning even when the Termux:API microphone path is proven available.
+    if is_container() and not _is_termux_environment():
         if has_forwarded_audio:
             notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
         else:
