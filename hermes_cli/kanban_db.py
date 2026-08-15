@@ -9403,6 +9403,17 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Hard ceiling on NEW worker spawns in a single dispatcher tick. This is a
+# burst fence, not a concurrency cap: ``max_spawn`` bounds how many workers
+# may be running at once, but a busy board with a fast-draining queue could
+# still spawn dozens of workers in one tick and exhaust a provider's quota
+# in minutes — the recurring incident this guards. Both real dispatch entry
+# points (CLI ``kanban dispatch``, gateway dispatcher watcher) default to
+# this value when ``kanban.max_spawn_per_tick`` is unset; set the config
+# key to ``0`` to disable. Library callers of ``dispatch_once`` keep
+# ``None`` (unbounded) as their default for back-compat.
+DEFAULT_MAX_SPAWN_PER_TICK = 4
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -12150,6 +12161,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_spawn_per_tick: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -12184,6 +12196,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawn_per_tick=max_spawn_per_tick,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -12200,6 +12213,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawn_per_tick=max_spawn_per_tick,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -12220,6 +12234,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_spawn_per_tick: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -12244,6 +12259,16 @@ def _dispatch_once_locked(
     intent ("limit concurrent kanban tasks"). With a per-tick interpretation
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
+
+    ``max_spawn_per_tick`` is the complement: a hard ceiling on NEW spawns
+    within this one tick, shared by the ready and review loops (``spawned``
+    counts both). ``max_spawn`` can leave burst headroom when workers drain
+    fast — e.g. 4 running slots with instant-failing workers still allows
+    unbounded respawns per tick — which is exactly how a provider quota got
+    exhausted in minutes. Tasks held by this budget stay ``ready`` (or
+    ``review``) and are picked up on the next tick; nothing is failed or
+    blocked. ``None`` disables the fence (library back-compat); the CLI and
+    gateway entry points default it to ``DEFAULT_MAX_SPAWN_PER_TICK``.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -12338,6 +12363,13 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # Per-tick burst fence (see docstring). Normalized once: non-int or
+    # non-positive disables it here — the 0=disable convention is resolved
+    # by the entry points, which also apply DEFAULT_MAX_SPAWN_PER_TICK when
+    # the config key is unset.
+    _spawn_budget = max_spawn_per_tick if (
+        isinstance(max_spawn_per_tick, int) and max_spawn_per_tick > 0
+    ) else None
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -12378,6 +12410,23 @@ def _dispatch_once_locked(
                 detail={
                     "limit": max_spawn,
                     "current": running_count + spawned,
+                },
+                dry_run=dry_run,
+            )
+            continue
+        if _spawn_budget is not None and spawned >= _spawn_budget:
+            # Burst fence: this tick's spawn budget is spent. The task stays
+            # ready (claim untouched) and will be reconsidered next tick —
+            # a held disposition, not a failure.
+            _record_ready_disposition(
+                conn,
+                result,
+                row["id"],
+                "held",
+                reason="max_spawn_per_tick",
+                detail={
+                    "limit": _spawn_budget,
+                    "spawned_this_tick": spawned,
                 },
                 dry_run=dry_run,
             )
@@ -12790,6 +12839,11 @@ def _dispatch_once_locked(
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if _spawn_budget is not None and spawned >= _spawn_budget:
+            # Same per-tick burst fence as the ready loop: review spawns
+            # draw from the same tick budget (they are worker processes
+            # against the same provider quota).
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])

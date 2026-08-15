@@ -1138,6 +1138,34 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # kanban.max_spawn_per_tick — hard per-tick burst fence. Unlike
+        # max_spawn (a live-concurrency cap), this bounds NEW spawns within
+        # one tick, so a fast-draining queue cannot respawn unboundedly and
+        # burn a provider's quota in minutes. Unset →
+        # DEFAULT_MAX_SPAWN_PER_TICK (on by default); 0/negative disables
+        # explicitly; unparsable fails safe to the default.
+        raw_burst = kanban_cfg.get("max_spawn_per_tick", None)
+        if raw_burst is None:
+            max_spawn_per_tick = _kb.DEFAULT_MAX_SPAWN_PER_TICK
+        else:
+            try:
+                _burst = int(raw_burst)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_spawn_per_tick=%r; "
+                    "using default %d",
+                    raw_burst,
+                    _kb.DEFAULT_MAX_SPAWN_PER_TICK,
+                )
+                _burst = _kb.DEFAULT_MAX_SPAWN_PER_TICK
+            max_spawn_per_tick = _burst if _burst >= 1 else None
+        if max_spawn_per_tick is None:
+            logger.info("kanban dispatcher: max_spawn_per_tick disabled via config")
+        else:
+            logger.info(
+                "kanban dispatcher: max_spawn_per_tick=%d", max_spawn_per_tick
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1231,6 +1259,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    max_spawn_per_tick=max_spawn_per_tick,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
