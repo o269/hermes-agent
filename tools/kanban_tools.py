@@ -1263,6 +1263,7 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    reasoning_effort = args.get("reasoning_effort")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1308,6 +1309,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                reasoning_effort=reasoning_effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -2031,6 +2033,24 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                ],
+                "description": (
+                    "Per-task worker thinking depth. Omit to inherit the "
+                    "assignee profile's agent.reasoning_effort; 'none' "
+                    "explicitly disables thinking."
                 ),
             },
             "goal_mode": {

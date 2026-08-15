@@ -242,6 +242,31 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Authority-lane assignment policy
+
+Set `kanban.authority_profiles` to a comma-separated list such as `fable` to
+reserve those profiles for non-spawnable authority, live-action, and operator-
+custody cards. Executor-shaped work may wait on an authority profile only while
+dependency-held or under an explicit parking contract; it cannot become
+`ready`, `review`, or `running` there. Leave the setting empty (the default) to
+preserve legacy assignment behavior.
+
+Every supported assignment-writing surface converges on the same
+`hermes_cli.kanban_db` policy boundary:
+
+| Surface | Canonical assignment mutation |
+|---|---|
+| `hermes kanban create` / `assign` | `kanban_db.create_task` / `assign_task` |
+| `kanban_create` worker tool | `kanban_db.create_task` |
+| Dashboard create / single / bulk reassignment | `kanban_db.create_task` / `assign_task` |
+| `boardd` create / assign RPC | `kanban_db.create_task` / `assign_task` |
+| Internal reclaim/rebind | `kanban_db.reassign_task` |
+
+The one deliberate bypass is direct SQL used by privileged migration/repair
+code. Canonical connections still install the same assignment guard as SQLite
+`INSERT`/`UPDATE` triggers, so an unregistered writer fails closed. Do not treat
+raw SQL as a supported application assignment API.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

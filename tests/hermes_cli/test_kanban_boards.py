@@ -256,6 +256,7 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
+        (fresh_home / "profiles" / "teknium").mkdir(parents=True)
 
         task = kb.Task(
             id="t_abc",
@@ -341,6 +342,5 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
 
 

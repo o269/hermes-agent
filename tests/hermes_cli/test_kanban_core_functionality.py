@@ -1117,6 +1117,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    (kanban_home / "profiles" / "some-profile").mkdir(parents=True)
 
     conn = kb.connect()
     try:
@@ -1807,5 +1808,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
