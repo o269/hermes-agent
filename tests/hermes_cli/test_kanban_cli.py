@@ -52,10 +52,17 @@ def test_run_slash_complete_close_on_apply_writes_atomic_receipt(kanban_home):
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
         comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
     assert task is not None and task.status == "done"
-    assert comments[-1].body == (
+    assert [comment.body for comment in comments] == [
         "APPLIED / CLOSED: installed exact head abc123; marker present"
-    )
+    ]
+    applied_closed = [event for event in events if event.kind == "applied_closed"]
+    assert len(applied_closed) == 1
+    assert applied_closed[0].payload == {
+        "actor": "fable",
+        "evidence": "installed exact head abc123; marker present",
+    }
 
 
 def test_run_slash_complete_close_on_apply_requires_both_bindings(kanban_home):
@@ -300,5 +307,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

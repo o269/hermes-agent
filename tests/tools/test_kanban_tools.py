@@ -149,9 +149,15 @@ def test_complete_close_on_apply_tool_path(worker_env):
         comments = kb.list_comments(conn, worker_env)
         events = kb.list_events(conn, worker_env)
         assert task is not None and task.status == "done"
-        assert comments[-1].body == (
+        assert [comment.body for comment in comments] == [
             "APPLIED / CLOSED: exact head abc123; live marker present"
-        )
+        ]
+        applied_closed = [event for event in events if event.kind == "applied_closed"]
+        assert len(applied_closed) == 1
+        assert applied_closed[0].payload == {
+            "actor": "fable",
+            "evidence": "exact head abc123; live marker present",
+        }
         completed = next(event for event in events if event.kind == "completed")
         assert completed.payload is not None
         assert completed.payload["apply_receipt"]["actor"] == "fable"

@@ -6248,6 +6248,12 @@ def complete_task(
                     "source": "close_on_apply",
                 },
             )
+            _append_event(
+                conn,
+                task_id,
+                "applied_closed",
+                normalized_apply_receipt,
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
