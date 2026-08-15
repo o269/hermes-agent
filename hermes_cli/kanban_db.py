@@ -156,6 +156,9 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+# Hard recurrence fence: one decomposition can never mint an unbounded child
+# burst even when a model or caller returns an oversized graph.
+MAX_DECOMPOSITION_CHILDREN = 15
 
 
 class ContinuationAuthorizationError(RuntimeError):
@@ -8401,6 +8404,67 @@ _DECOMPOSITION_HOLD_RE = re.compile(
 )
 
 
+def decomposition_result_for_key(
+    conn: sqlite3.Connection,
+    task_id: str,
+    idempotency_key: str,
+) -> Optional[list[str]]:
+    """Return the first decomposition result for ``key``, or ``None``.
+
+    A present empty list is meaningful: it is the successful no-fanout result.
+    This lookup makes graph retries deterministic before another write.
+    """
+    key = str(idempotency_key or "").strip()
+    if not key:
+        return None
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposed' ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("idempotency_key") != key:
+            continue
+        child_ids = payload.get("child_ids")
+        if isinstance(child_ids, list) and all(
+            isinstance(child_id, str) for child_id in child_ids
+        ):
+            return list(child_ids)
+    return None
+
+
+def _live_parent_chain(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[tuple[str, str]]:
+    """Return every live or missing ancestor in ``task_id``'s parent chain."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE ancestors(id) AS (
+            SELECT parent_id FROM task_links WHERE child_id = ?
+            UNION
+            SELECT links.parent_id
+            FROM task_links AS links
+            JOIN ancestors ON links.child_id = ancestors.id
+        )
+        SELECT ancestors.id, tasks.status
+        FROM ancestors
+        LEFT JOIN tasks ON tasks.id = ancestors.id
+        WHERE tasks.id IS NULL OR tasks.status NOT IN ('done', 'archived')
+        ORDER BY ancestors.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [
+        (str(row["id"]), str(row["status"] or "missing"))
+        for row in rows
+    ]
+
+
 def decomposition_hold_reason(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8422,6 +8486,15 @@ def decomposition_hold_reason(
         (task_id,),
     ).fetchone():
         return "task was already decomposed"
+
+    live_parents = _live_parent_chain(conn, task_id)
+    if live_parents:
+        rendered = ", ".join(
+            f"{parent_id}({status})" for parent_id, status in live_parents[:5]
+        )
+        if len(live_parents) > 5:
+            rendered += f", +{len(live_parents) - 5} more"
+        return f"live parent chain detected: {rendered}"
 
     active_prs = _active_pr_custody(
         conn,
@@ -8461,12 +8534,20 @@ def list_decomposition_eligible_triage_ids(
     params.extend((bounded_limit, cutoff))
     rows = conn.execute(
         f"""
-        WITH candidates AS (
+        WITH RECURSIVE candidates AS (
             SELECT t.id, t.title, t.body, t.priority, t.created_at
             FROM tasks AS t
             WHERE t.status = 'triage'{tenant_clause}
             ORDER BY t.priority DESC, t.created_at ASC
             LIMIT ?
+        ), ancestor_chain(root_id, ancestor_id) AS (
+            SELECT c.id, links.parent_id
+            FROM candidates AS c
+            JOIN task_links AS links ON links.child_id = c.id
+            UNION
+            SELECT chain.root_id, links.parent_id
+            FROM ancestor_chain AS chain
+            JOIN task_links AS links ON links.child_id = chain.ancestor_id
         )
         SELECT c.id, c.title, c.body,
                EXISTS (
@@ -8478,7 +8559,17 @@ def list_decomposition_eligible_triage_ids(
                    WHERE own.task_id = c.id
                      AND own.last_seen_at >= ?
                      AND own.declared = 1
-               ) AS has_active_pr
+               ) AS has_active_pr,
+               EXISTS (
+                   SELECT 1
+                   FROM ancestor_chain AS chain
+                   LEFT JOIN tasks AS ancestor ON ancestor.id = chain.ancestor_id
+                   WHERE chain.root_id = c.id
+                     AND (
+                         ancestor.id IS NULL
+                         OR ancestor.status NOT IN ('done', 'archived')
+                     )
+               ) AS has_live_parent_chain
         FROM candidates AS c
         ORDER BY c.priority DESC, c.created_at ASC
         """,
@@ -8489,6 +8580,7 @@ def list_decomposition_eligible_triage_ids(
         for row in rows
         if not bool(row["was_decomposed"])
         and not bool(row["has_active_pr"])
+        and not bool(row["has_live_parent_chain"])
         and _DECOMPOSITION_HOLD_RE.search(row["title"] or "") is None
         and _DECOMPOSITION_HOLD_RE.search(row["body"] or "") is None
     ]
@@ -8500,6 +8592,7 @@ def decompose_triage_task(
     *,
     root_assignee: Optional[str],
     children: list[dict],
+    idempotency_key: str,
     author: Optional[str] = None,
     auto_promote: bool = True,
 ) -> Optional[list[str]]:
@@ -8525,12 +8618,34 @@ def decompose_triage_task(
       - The root task is not in ``triage``
       - A cycle would result (caller built a bad graph)
 
+    ``idempotency_key`` is mandatory, is recorded on the root event, and
+    namespaces every child key as ``<key>:<root-id>:<index>``. Retrying the
+    same key returns the first child-id list without writing replacement work.
+
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
+    idempotency_key = str(idempotency_key or "").strip()
+    if not idempotency_key:
+        raise ValueError("decomposition idempotency key is required")
+    repeated = decomposition_result_for_key(conn, task_id, idempotency_key)
+    if repeated is not None:
+        return repeated
     if not children:
         return None
+    if len(children) > MAX_DECOMPOSITION_CHILDREN:
+        _log.warning(
+            "kanban decomposition blocked task_id=%s reason=fanout_cap "
+            "requested_children=%d max_children=%d",
+            task_id,
+            len(children),
+            MAX_DECOMPOSITION_CHILDREN,
+        )
+        raise ValueError(
+            f"decomposition fan-out {len(children)} exceeds hard cap "
+            f"{MAX_DECOMPOSITION_CHILDREN}"
+        )
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -8586,6 +8701,9 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        repeated = decomposition_result_for_key(conn, task_id, idempotency_key)
+        if repeated is not None:
+            return repeated
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -8594,6 +8712,14 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        hold_reason = decomposition_hold_reason(conn, task_id)
+        if hold_reason is not None:
+            _log.warning(
+                "kanban decomposition blocked task_id=%s reason=%s",
+                task_id,
+                hold_reason,
+            )
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -8646,8 +8772,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, idempotency_key) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -8658,6 +8784,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    f"{idempotency_key}:{task_id}:{idx}",
                 ),
             )
             _append_event(
@@ -8719,6 +8846,7 @@ def decompose_triage_task(
             {
                 "child_ids": child_ids,
                 "root_assignee": root_assignee,
+                "idempotency_key": idempotency_key,
             },
         )
 

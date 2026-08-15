@@ -1383,7 +1383,9 @@ class GatewayKanbanWatchersMixin:
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                                tid,
+                                idempotency_key=f"auto-decompose:{tid}",
+                                author="auto-decomposer",
                             )
                         except Exception:
                             logger.exception(

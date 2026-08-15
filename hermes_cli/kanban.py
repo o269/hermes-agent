@@ -952,6 +952,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "(default: $HERMES_PROFILE or 'decomposer')",
     )
     p_decompose.add_argument(
+        "--idempotency-key",
+        required=True,
+        help="Stable key for this decomposition. Reusing it is a no-op. With "
+             "--all, the task id is appended to this value.",
+    )
+    p_decompose.add_argument(
         "--json",
         action="store_true",
         help="Emit one JSON object per task on stdout",
@@ -2625,7 +2631,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                                 continue
                             try:
                                 _outcome = _decomp.decompose_task(
-                                    _tid, author="cli-dispatcher",
+                                    _tid,
+                                    idempotency_key=f"auto-decompose:{_tid}",
+                                    author="cli-dispatcher",
                                 )
                             except Exception as exc:
                                 _decomp_logger.warning(
@@ -3135,6 +3143,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     all_flag = bool(getattr(args, "all_triage", False))
     tenant = getattr(args, "tenant", None)
     author = getattr(args, "author", None) or _profile_author()
+    idempotency_key = str(getattr(args, "idempotency_key", "") or "").strip()
     want_json = bool(getattr(args, "json", False))
 
     if args.task_id and all_flag:
@@ -3168,7 +3177,12 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        task_key = f"{idempotency_key}:{tid}" if all_flag else idempotency_key
+        outcome = decomp.decompose_task(
+            tid,
+            idempotency_key=task_key,
+            author=author,
+        )
         if outcome.ok:
             ok_count += 1
         if want_json:
