@@ -470,12 +470,52 @@ def test_boardd_native_set_status_fails_closed(tmp_path: Path):
                 mutation=True,
                 op_id="test-raw-set-status-rejected",
             )
-
         assert client.query(
             "SELECT status, claim_lock FROM tasks WHERE id = ?",
             [task["id"]],
         ) == [{"status": "ready", "claim_lock": None}]
 
+
+@pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
+def test_canonical_broker_completion_uses_durable_cleanup_reservation(
+    tmp_path: Path,
+):
+    """The broker commit finishes before the client performs rename/delete."""
+    with running_boardd(tmp_path, import_schema=True) as (_, db_path, socket_path):
+        result = _run_kanban_db_script(
+            db_path,
+            socket_path,
+            """
+import json
+from hermes_cli import kanban_db as kb
+with kb.connect() as conn:
+    assert type(conn).__name__ == "BrokerConnection"
+    task_id = kb.create_task(conn, title="broker cleanup", initial_status="blocked")
+    root = kb.kanban_home() / "kanban" / "boards" / "fleet" / "workspaces"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "proof.txt").write_text("proof", encoding="utf-8")
+    kb.set_workspace_path(conn, task_id, workspace)
+    completed = kb.complete_task(conn, task_id, result="done")
+    reservation = conn.execute(
+        "SELECT state, attempts, completed_at FROM workspace_cleanup_reservations "
+        "WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    print(json.dumps({
+        "completed": completed,
+        "reservation": dict(reservation),
+        "workspace_exists": workspace.exists(),
+        "txn_open": conn._txn is not None,
+    }))
+""",
+        )
+
+    assert result["completed"] is True
+    assert result["reservation"]["state"] == "completed"
+    assert result["reservation"]["attempts"] >= 2
+    assert result["reservation"]["completed_at"] is not None
+    assert result["workspace_exists"] is False
+    assert result["txn_open"] is False
 
 @pytest.mark.live_system_guard_bypass  # terminates only running_boardd's tmp child
 def test_native_create_idempotency_selects_newest_active_duplicate(tmp_path: Path):
