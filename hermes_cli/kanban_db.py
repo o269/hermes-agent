@@ -6672,6 +6672,19 @@ def _cleanup_quarantine_path(task_id: str, token: str, source: Path) -> Path:
     return source.parent / f".hermes-cleanup-{token}"
 
 
+def _cleanup_removal_path(quarantine: Path) -> Path:
+    """Return the crash-recoverable final-isolation name for a quarantine."""
+    return quarantine.parent / f"{quarantine.name}.removing"
+
+
+def _cleanup_lstat(path: Path) -> Optional[os.stat_result]:
+    """Return lstat for every named object, including dangling symlinks."""
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
 class WorkspaceCleanupIdentityError(RuntimeError):
     """A pathname no longer resolves to the inode authorized for cleanup."""
 
@@ -6812,10 +6825,10 @@ def _remove_cleanup_entries_bounded(
     directory_fd: int,
     remaining: list[int],
     *,
-    depth_remaining: int,
+    depth: int,
 ) -> bool:
     """Unlink at most ``remaining[0]`` dentries under an authorized root."""
-    if depth_remaining <= 0:
+    if depth > _WORKSPACE_CLEANUP_MAX_DEPTH:
         raise WorkspaceCleanupIdentityError(
             "cleanup tree exceeds bounded recursion depth"
         )
@@ -6832,7 +6845,7 @@ def _remove_cleanup_entries_bounded(
                     child_empty = _remove_cleanup_entries_bounded(
                         child_fd,
                         remaining,
-                        depth_remaining=depth_remaining - 1,
+                        depth=depth + 1,
                     )
                 finally:
                     os.close(child_fd)
@@ -6868,13 +6881,24 @@ def _secure_remove_cleanup_quarantine(
     modifying the shared inode's bytes. Each call removes a fixed maximum; a
     non-empty quarantine remains durably ``renamed`` for the next GC pass.
     """
-    parent_fd, directory_fd, opened = _open_cleanup_dir(path)
+    removal = _cleanup_removal_path(path)
+    quarantine_info = _cleanup_lstat(path)
+    removal_info = _cleanup_lstat(removal)
+    if quarantine_info is not None and removal_info is not None:
+        raise WorkspaceCleanupIdentityError(
+            "quarantine and final-isolation names both exist"
+        )
+    if quarantine_info is None and removal_info is None:
+        return True
+    active_path = path if quarantine_info is not None else removal
+
+    parent_fd, directory_fd, opened = _open_cleanup_dir(active_path)
     try:
         if opened.st_dev != expected_dev or opened.st_ino != expected_ino:
             raise WorkspaceCleanupIdentityError(
                 "quarantine inode does not match cleanup reservation"
             )
-        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        named = os.stat(active_path.name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(opened, named):
             raise WorkspaceCleanupIdentityError(
                 "quarantine pathname changed before anchored deletion"
@@ -6883,17 +6907,72 @@ def _secure_remove_cleanup_quarantine(
         root_empty = _remove_cleanup_entries_bounded(
             directory_fd,
             remaining,
-            depth_remaining=_WORKSPACE_CLEANUP_MAX_DEPTH,
+            depth=0,
         )
-        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        named = os.stat(active_path.name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(opened, named):
             raise WorkspaceCleanupIdentityError(
                 "quarantine pathname changed during anchored deletion"
             )
         if not root_empty or remaining[0] <= 0:
             return False
-        os.rmdir(path.name, dir_fd=parent_fd)
+
+        if active_path == path:
+            _rename_cleanup_noreplace(
+                path.name,
+                removal.name,
+                source_dir_fd=parent_fd,
+                target_dir_fd=parent_fd,
+            )
+            isolated = os.stat(
+                removal.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(opened, isolated):
+                # Restore the raced replacement to its original quarantine
+                # name when possible; neither inode is authorized for delete.
+                try:
+                    os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    _rename_cleanup_noreplace(
+                        removal.name,
+                        path.name,
+                        source_dir_fd=parent_fd,
+                        target_dir_fd=parent_fd,
+                    )
+                raise WorkspaceCleanupIdentityError(
+                    "quarantine identity changed at final isolation boundary"
+                )
+
+        # There is no portable inode-conditional rmdir API. The randomized,
+        # verified final-isolation name narrows the remaining pathname window;
+        # fstat on the already-open authorized directory is the post-use proof.
+        # If that inode survives for any reason, fail closed and never report
+        # completion, even if a raced empty replacement was removed instead.
+        try:
+            os.rmdir(removal.name, dir_fd=parent_fd)
+        except OSError as exc:
+            survived = os.fstat(directory_fd)
+            if (
+                survived.st_dev == opened.st_dev
+                and survived.st_ino == opened.st_ino
+                and survived.st_nlink != 0
+            ):
+                raise WorkspaceCleanupIdentityError(
+                    "authorized cleanup inode survived failed final rmdir"
+                ) from exc
+            raise
         remaining[0] -= 1
+        removed = os.fstat(directory_fd)
+        if removed.st_dev != opened.st_dev or removed.st_ino != opened.st_ino:
+            raise WorkspaceCleanupIdentityError(
+                "authorized cleanup inode changed after final rmdir"
+            )
+        if removed.st_nlink != 0:
+            raise WorkspaceCleanupIdentityError(
+                "authorized cleanup inode survived final rmdir"
+            )
         return True
     finally:
         os.close(directory_fd)
@@ -6959,6 +7038,7 @@ def _process_workspace_cleanup_reservation(
     state = str(row["state"])
     source = Path(str(row["workspace_path"])).expanduser()
     quarantine = _cleanup_quarantine_path(task_id, token, source)
+    removal = _cleanup_removal_path(quarantine)
 
     if state == "pending":
         task = conn.execute(
@@ -7069,8 +7149,9 @@ def _process_workspace_cleanup_reservation(
             source_is_managed = (
                 source.is_absolute() and _is_managed_scratch_path(source)
             )
-            source_is_symlink = source.is_symlink()
-            quarantine_is_symlink = quarantine.is_symlink()
+            source_info = _cleanup_lstat(source)
+            quarantine_info = _cleanup_lstat(quarantine)
+            removal_info = _cleanup_lstat(removal)
         except (OSError, ValueError) as exc:
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "pending", state="refused",
@@ -7089,14 +7170,14 @@ def _process_workspace_cleanup_reservation(
                 task_id, source,
             )
             return False
-        if source_is_symlink:
+        if source_info is not None and stat.S_ISLNK(source_info.st_mode):
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "pending", state="refused",
                 last_error="refused: source workspace is a symlink",
                 completed=True,
             )
             return False
-        if quarantine_is_symlink:
+        if quarantine_info is not None and stat.S_ISLNK(quarantine_info.st_mode):
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "pending", state="refused",
                 last_error="refused: quarantine target is a symlink",
@@ -7105,13 +7186,13 @@ def _process_workspace_cleanup_reservation(
             return False
 
         try:
-            source_exists = source.exists()
-            quarantine_exists = quarantine.exists()
-            if source_exists and quarantine_exists:
+            if source_info is not None and (
+                quarantine_info is not None or removal_info is not None
+            ):
                 raise WorkspaceCleanupIdentityError(
-                    "source and quarantine both exist before rename"
+                    "source and cleanup quarantine both exist before rename"
                 )
-            if source_exists:
+            if source_info is not None:
                 parent_fd, source_fd, opened = _open_cleanup_dir(source)
                 try:
                     if (
@@ -7162,7 +7243,7 @@ def _process_workspace_cleanup_reservation(
                 finally:
                     os.close(source_fd)
                     os.close(parent_fd)
-            elif quarantine_exists:
+            elif quarantine_info is not None:
                 if row["source_dev"] is None or row["source_ino"] is None:
                     raise WorkspaceCleanupIdentityError(
                         "quarantine exists without a bound source inode"
@@ -7179,6 +7260,10 @@ def _process_workspace_cleanup_reservation(
                 finally:
                     os.close(quarantine_fd)
                     os.close(parent_fd)
+            elif removal_info is not None:
+                raise WorkspaceCleanupIdentityError(
+                    "final-isolation name exists while reservation is pending"
+                )
             else:
                 _update_workspace_cleanup_reservation(
                     conn, task_id, token, "pending", state="completed",
@@ -7237,14 +7322,9 @@ def _process_workspace_cleanup_reservation(
             )
             return False
         try:
-            if recorded.exists():
-                if recorded.is_symlink() or not recorded.is_dir():
-                    _update_workspace_cleanup_reservation(
-                        conn, task_id, token, "renamed", state="refused",
-                        last_error="refused: quarantine is not a plain directory",
-                        completed=True,
-                    )
-                    return False
+            recorded_info = _cleanup_lstat(recorded)
+            removal_info = _cleanup_lstat(_cleanup_removal_path(recorded))
+            if recorded_info is not None or removal_info is not None:
                 removed = _secure_remove_cleanup_quarantine(
                     recorded,
                     expected_dev=int(row["source_dev"]),

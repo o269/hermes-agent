@@ -657,6 +657,211 @@ def test_large_cleanup_reclaims_all_entries_without_tombstones(
     assert os.stat(outside_hard_link).st_nlink == 1
 
 
+def test_renamed_dangling_symlink_is_refused_not_treated_as_absent(
+    kanban_home: Path,
+) -> None:
+    """lstat makes a dangling quarantine name visible to the state machine."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dangling quarantine")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+
+        # Reconstruct a renamed generation, then replace its authorized name
+        # with a dangling symlink. Path.exists() would incorrectly call this
+        # absent and let the reservation complete.
+        workspace.mkdir()
+        (workspace / "owned.txt").write_text("owned", encoding="utf-8")
+        identity = workspace.stat()
+        workspace.rename(quarantine)
+        authorized_aside = quarantine.with_name(f"{quarantine.name}.authorized")
+        quarantine.rename(authorized_aside)
+        quarantine.symlink_to(quarantine.parent / "missing-target")
+        conn.execute(
+            "UPDATE workspace_cleanup_reservations SET state='renamed', "
+            "renamed_path=?, source_dev=?, source_ino=?, completed_at=NULL "
+            "WHERE task_id=?",
+            (
+                str(quarantine),
+                int(identity.st_dev),
+                int(identity.st_ino),
+                task_id,
+            ),
+        )
+        conn.commit()
+
+        assert kb.recover_workspace_cleanups(conn) == []
+        after = conn.execute(
+            "SELECT state, last_error FROM workspace_cleanup_reservations "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+
+    assert after["state"] == "refused"
+    assert "not a plain directory" in after["last_error"]
+    assert quarantine.is_symlink()
+    assert (authorized_aside / "owned.txt").read_text(encoding="utf-8") == "owned"
+
+
+def test_final_isolation_boundary_restores_marker_replacement(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement moved at final isolation is restored before refusal."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="final isolation swap")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        real_rename = kb._rename_cleanup_noreplace
+        swapped = False
+        authorized_aside_name: str | None = None
+
+        def swap_before_final_isolation(
+            src,
+            dst,
+            *,
+            source_dir_fd,
+            target_dir_fd,
+        ):
+            nonlocal swapped, authorized_aside_name
+            if str(dst).endswith(".removing") and not swapped:
+                swapped = True
+                authorized_aside_name = f"{src}.authorized-aside"
+                real_rename(
+                    src,
+                    authorized_aside_name,
+                    source_dir_fd=source_dir_fd,
+                    target_dir_fd=target_dir_fd,
+                )
+                os.mkdir(src, dir_fd=source_dir_fd)
+                replacement_fd = os.open(
+                    src,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                    dir_fd=source_dir_fd,
+                )
+                try:
+                    marker_fd = os.open(
+                        "replacement-marker.txt",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=replacement_fd,
+                    )
+                    os.close(marker_fd)
+                finally:
+                    os.close(replacement_fd)
+            return real_rename(
+                src,
+                dst,
+                source_dir_fd=source_dir_fd,
+                target_dir_fd=target_dir_fd,
+            )
+
+        monkeypatch.setattr(
+            kb,
+            "_rename_cleanup_noreplace",
+            swap_before_final_isolation,
+        )
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token, state, last_error "
+            "FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+        authorized_aside = quarantine.with_name(str(authorized_aside_name))
+
+    assert swapped is True
+    assert reservation["state"] == "refused"
+    assert "final isolation boundary" in reservation["last_error"]
+    assert (quarantine / "replacement-marker.txt").exists()
+    assert authorized_aside.is_dir()
+    assert not kb._cleanup_removal_path(quarantine).exists()
+
+
+def test_final_rmdir_boundary_refuses_swapped_empty_directory(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-use fstat catches an empty replacement deleted by final rmdir."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="final rmdir swap")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        real_rmdir = os.rmdir
+        real_rename = kb._rename_cleanup_noreplace
+        swapped = False
+        authorized_aside_name: str | None = None
+
+        def swap_at_final_rmdir(name, *, dir_fd=None):
+            nonlocal swapped, authorized_aside_name
+            if str(name).endswith(".removing") and not swapped:
+                swapped = True
+                authorized_aside_name = f"{name}.authorized-aside"
+                real_rename(
+                    name,
+                    authorized_aside_name,
+                    source_dir_fd=dir_fd,
+                    target_dir_fd=dir_fd,
+                )
+                os.mkdir(name, dir_fd=dir_fd)
+            return real_rmdir(name, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "rmdir", swap_at_final_rmdir)
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token, state, last_error "
+            "FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+        removal = kb._cleanup_removal_path(quarantine)
+        authorized_aside = removal.with_name(str(authorized_aside_name))
+
+    assert swapped is True
+    assert reservation["state"] == "refused"
+    assert "authorized cleanup inode survived" in reservation["last_error"]
+    assert not removal.exists()
+    assert authorized_aside.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("depth", "expected_state"),
+    ((128, "completed"), (129, "refused")),
+)
+def test_cleanup_depth_bound_is_exact(
+    kanban_home: Path,
+    depth: int,
+    expected_state: str,
+) -> None:
+    """Exactly 128 nested directories pass; the 129th fails honestly."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"cleanup depth {depth}")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        deepest = workspace
+        for _index in range(depth):
+            deepest = deepest / "d"
+            deepest.mkdir()
+        (deepest / "depth-marker.txt").write_text("marker", encoding="utf-8")
+
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token, state, last_error "
+            "FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+
+    assert reservation["state"] == expected_state
+    if depth == 128:
+        assert not quarantine.exists()
+    else:
+        assert "exceeds bounded recursion depth" in reservation["last_error"]
+        assert quarantine.is_dir()
+        assert (quarantine / Path(*(["d"] * depth)) / "depth-marker.txt").exists()
+
+
 def test_cleanup_refuses_intermediate_symlink_and_normal_path_still_cleans(
     kanban_home: Path,
 ) -> None:
@@ -839,6 +1044,6 @@ def test_filesystem_rename_occurs_outside_write_transaction(
         monkeypatch.setattr(kb, "_rename_cleanup_noreplace", checked_rename)
         assert kb.complete_task(conn, task_id, result="done") is True
 
-    assert len(observed) == 1
+    assert len(observed) == 2
     assert all(in_transaction is False for in_transaction in observed)
     assert not workspace.exists()
