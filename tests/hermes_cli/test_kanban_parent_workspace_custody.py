@@ -414,6 +414,47 @@ def test_pending_reservation_freezes_path_and_reopen_mutations(
     assert workspace.exists()
 
 
+def test_bounded_recovery_rotates_deferred_rows_without_starvation(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live oldest reservation cannot monopolize a bounded recovery page."""
+    live = {848481, 848482}
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) in live)
+    with kb.connect() as conn:
+        task_ids: list[str] = []
+        workspaces: list[Path] = []
+        for idx, pid in enumerate((848481, 848482), start=1):
+            task_id = kb.create_task(
+                conn, title=f"rotation {idx}", assignee="worker",
+            )
+            workspace = _managed_workspace(conn, kanban_home, task_id)
+            assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+            kb._set_worker_pid(conn, task_id, pid)
+            assert kb.complete_task(conn, task_id, result="done") is True
+            task_ids.append(task_id)
+            workspaces.append(workspace)
+        conn.execute(
+            "UPDATE workspace_cleanup_reservations SET reserved_at = 1, "
+            "last_attempt_at = NULL WHERE task_id = ?",
+            (task_ids[0],),
+        )
+        conn.execute(
+            "UPDATE workspace_cleanup_reservations SET reserved_at = 2, "
+            "last_attempt_at = NULL WHERE task_id = ?",
+            (task_ids[1],),
+        )
+        conn.commit()
+
+        live.remove(848482)
+        assert kb.recover_workspace_cleanups(conn, limit=1) == []
+        assert workspaces[0].exists()
+        assert kb.recover_workspace_cleanups(conn, limit=1) == [task_ids[1]]
+
+    assert workspaces[0].exists()
+    assert not workspaces[1].exists()
+
+
 def test_filesystem_rename_occurs_outside_write_transaction(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,

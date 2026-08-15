@@ -1426,6 +1426,7 @@ CREATE TABLE IF NOT EXISTS workspace_cleanup_reservations (
     reserved_at         INTEGER NOT NULL,
     renamed_path        TEXT,
     attempts            INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     INTEGER,
     last_error          TEXT,
     completed_at        INTEGER
 );
@@ -1466,6 +1467,7 @@ BEGIN
         reserved_at = excluded.reserved_at,
         renamed_path = NULL,
         attempts = 0,
+        last_attempt_at = NULL,
         last_error = NULL,
         completed_at = NULL
     WHERE workspace_cleanup_reservations.state IN ('completed', 'refused');
@@ -1565,7 +1567,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-CREATE INDEX IF NOT EXISTS idx_workspace_cleanup_state ON workspace_cleanup_reservations(state, reserved_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_cleanup_state ON workspace_cleanup_reservations(state, last_attempt_at, reserved_at);
 """
 
 
@@ -6592,8 +6594,12 @@ def _update_workspace_cleanup_reservation(
     completed: bool = False,
 ) -> bool:
     """CAS one cleanup reservation through its durable state machine."""
-    assignments = ["attempts = attempts + 1", "last_error = ?"]
-    params: list[Any] = [(last_error or "")[:500] or None]
+    assignments = [
+        "attempts = attempts + 1",
+        "last_attempt_at = ?",
+        "last_error = ?",
+    ]
+    params: list[Any] = [int(time.time()), (last_error or "")[:500] or None]
     if state is not None:
         assignments.append("state = ?")
         params.append(state)
@@ -6854,7 +6860,8 @@ def recover_workspace_cleanups(
     """Retry bounded pending cleanup reservations; return completed task ids."""
     rows = conn.execute(
         "SELECT task_id FROM workspace_cleanup_reservations "
-        "WHERE state IN ('pending', 'renamed') ORDER BY reserved_at, task_id LIMIT ?",
+        "WHERE state IN ('pending', 'renamed') "
+        "ORDER BY COALESCE(last_attempt_at, reserved_at), reserved_at, task_id LIMIT ?",
         (max(1, int(limit)),),
     ).fetchall()
     completed: list[str] = []
