@@ -69,6 +69,51 @@ def _table_struct(conn: sqlite3.Connection, table: str):
     return cols, idx
 
 
+def _assert_cleanup_trigger_must_fire(conn: sqlite3.Connection, marker: str) -> None:
+    """Prove post-migration triggers reserve the marker scratch path."""
+    task_id = f"cleanup-trigger-{marker}"
+    workspace_path = f"/tmp/hermes-cleanup-marker-{marker}"
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, status, workspace_kind, workspace_path, created_at) "
+        "VALUES (?, 'cleanup marker', 'todo', 'scratch', ?, 1000)",
+        (task_id, workspace_path),
+    )
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    reservation = conn.execute(
+        "SELECT workspace_path, state FROM workspace_cleanup_reservations "
+        "WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert reservation is not None
+    assert (reservation["workspace_path"], reservation["state"]) == (
+        workspace_path,
+        "pending",
+    )
+
+
+def test_current_schema_installs_cleanup_triggers_after_migrations(tmp_path, monkeypatch):
+    """A fresh board gets all cleanup triggers and their terminal marker fires."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+
+    with kb.connect(db_path) as conn:
+        names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND name LIKE 'trg_tasks_%workspace_cleanup%'"
+            )
+        }
+        assert names == {
+            "trg_tasks_reserve_workspace_cleanup_update",
+            "trg_tasks_reserve_workspace_cleanup_insert",
+            "trg_tasks_freeze_workspace_cleanup_target",
+            "trg_tasks_freeze_workspace_cleanup_lifecycle",
+            "trg_tasks_require_workspace_cleanup_before_delete",
+        }
+        _assert_cleanup_trigger_must_fire(conn, "current-schema")
+
+
 
 
 def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkeypatch):
@@ -104,6 +149,7 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('task-1', 'completed', 3000)")
         new_id = conn.execute("SELECT id FROM task_events ORDER BY id DESC LIMIT 1").fetchone()["id"]
         assert isinstance(new_id, int) and new_id >= 1
+        _assert_cleanup_trigger_must_fire(conn, "legacy-rebuild")
 
 
 
@@ -120,6 +166,7 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+        _assert_cleanup_trigger_must_fire(conn, "idempotent-reopen")
 
 
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
@@ -134,3 +181,4 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+        _assert_cleanup_trigger_must_fire(conn, "unseen-events")
