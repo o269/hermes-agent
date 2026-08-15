@@ -6799,123 +6799,74 @@ def _bind_workspace_cleanup_identity(
     return cur.rowcount == 1
 
 
-def _quarantine_cleanup_entry(
+_WORKSPACE_CLEANUP_BATCH_LIMIT = 256
+_WORKSPACE_CLEANUP_MAX_DEPTH = 128
+
+
+def _cleanup_dir_is_empty(directory_fd: int) -> bool:
+    with os.scandir(directory_fd) as entries:
+        return next(entries, None) is None
+
+
+def _remove_cleanup_entries_bounded(
     directory_fd: int,
-    name: str,
-    expected: os.stat_result,
-) -> tuple[str, os.stat_result]:
-    """Move one entry to an unpredictable name and prove which inode moved."""
-    for _attempt in range(16):
-        tombstone = f".hermes-entry-{secrets.token_hex(16)}"
-        try:
-            _rename_cleanup_noreplace(
-                name,
-                tombstone,
-                source_dir_fd=directory_fd,
-                target_dir_fd=directory_fd,
-            )
-        except FileExistsError:
-            continue
-        moved = os.stat(tombstone, dir_fd=directory_fd, follow_symlinks=False)
-        if _same_inode(expected, moved):
-            return tombstone, moved
-
-        # A same-name replacement won the race before rename. Restore that
-        # replacement iff its original slot is still free, and refuse before
-        # mutating either it or the originally observed inode.
-        try:
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            _rename_cleanup_noreplace(
-                tombstone,
-                name,
-                source_dir_fd=directory_fd,
-                target_dir_fd=directory_fd,
-            )
+    remaining: list[int],
+    *,
+    depth_remaining: int,
+) -> bool:
+    """Unlink at most ``remaining[0]`` dentries under an authorized root."""
+    if depth_remaining <= 0:
         raise WorkspaceCleanupIdentityError(
-            f"descendant identity changed before quarantine: {name}"
+            "cleanup tree exceeds bounded recursion depth"
         )
-    raise WorkspaceCleanupIdentityError(
-        f"could not reserve a descendant quarantine name: {name}"
-    )
-
-
-def _scrub_cleanup_dir_fd(directory_fd: int) -> None:
-    """Scrub bound descendants while retaining safe, empty tombstones.
-
-    POSIX exposes no conditional unlink/rmdir-by-inode operation. Every entry
-    is therefore first atomically renamed with RENAME_NOREPLACE and its inode
-    checked. Regular-file contents are truncated through the bound fd;
-    directories recurse through bound fds. Names are deliberately retained so
-    there is no final compare-then-unlink/rmdir race that could delete a
-    replacement inserted by another process.
-    """
     flags = _cleanup_dir_open_flags()
-    for name in os.listdir(directory_fd):
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        tombstone, moved = _quarantine_cleanup_entry(directory_fd, name, before)
-        if stat.S_ISDIR(moved.st_mode):
-            child_fd = os.open(tombstone, flags, dir_fd=directory_fd)
-            try:
-                opened = os.fstat(child_fd)
-                if not _same_inode(moved, opened):
-                    raise WorkspaceCleanupIdentityError(
-                        f"child directory identity changed before open: {tombstone}"
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if remaining[0] <= 0:
+                return False
+            name = entry.name
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+                try:
+                    child_empty = _remove_cleanup_entries_bounded(
+                        child_fd,
+                        remaining,
+                        depth_remaining=depth_remaining - 1,
                     )
-                _scrub_cleanup_dir_fd(child_fd)
-                current = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False,
-                )
-                if not _same_inode(opened, current):
-                    raise WorkspaceCleanupIdentityError(
-                        f"child directory identity changed after scrub: {tombstone}"
-                    )
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(moved.st_mode):
-            if moved.st_nlink != 1:
-                raise WorkspaceCleanupIdentityError(
-                    f"child file has external hard-link custody: {tombstone}"
-                )
-            file_fd = os.open(
-                tombstone,
-                os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_fd,
-            )
-            try:
-                opened = os.fstat(file_fd)
-                if not _same_inode(moved, opened):
-                    raise WorkspaceCleanupIdentityError(
-                        f"child file identity changed before scrub: {tombstone}"
-                    )
-                if opened.st_nlink != 1:
-                    raise WorkspaceCleanupIdentityError(
-                        f"child file gained external hard-link custody: {tombstone}"
-                    )
-                os.ftruncate(file_fd, 0)
-                current = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False,
-                )
-                if not _same_inode(opened, current):
-                    raise WorkspaceCleanupIdentityError(
-                        f"child file identity changed after scrub: {tombstone}"
-                    )
-            finally:
-                os.close(file_fd)
+                finally:
+                    os.close(child_fd)
+                if not child_empty:
+                    if remaining[0] <= 0:
+                        return False
+                    continue
+                if remaining[0] <= 0:
+                    return False
+                os.rmdir(name, dir_fd=directory_fd)
+                remaining[0] -= 1
+            else:
+                # Unlink only the dentry. In particular, never truncate a
+                # regular file: a hard link outside this authorized root must
+                # retain its exact bytes.
+                os.unlink(name, dir_fd=directory_fd)
+                remaining[0] -= 1
+    return _cleanup_dir_is_empty(directory_fd)
 
 
-def _secure_empty_cleanup_quarantine(
+def _secure_remove_cleanup_quarantine(
     path: Path,
     *,
     expected_dev: int,
     expected_ino: int,
-) -> None:
-    """Scrub only the inode named by the reservation, retaining tombstones.
+) -> bool:
+    """Remove the verified quarantined root without following symlinks.
 
-    The empty quarantine directory is deliberately retained. POSIX has no
-    portable conditional-rmdir-by-open-fd primitive; removing it by pathname
-    after verification would recreate the same final-component TOCTOU this
-    fence exists to eliminate.
+    The single atomic source-to-quarantine rename is the custody boundary.
+    Descendant names are no longer cross-custody authority: every dentry below
+    that root belongs to the already-authorized scratch tree. Cleanup is
+    fd-relative, never follows symlinks, and unlinks hard-link dentries without
+    modifying the shared inode's bytes. Each call removes a fixed maximum; a
+    non-empty quarantine remains durably ``renamed`` for the next GC pass.
     """
     parent_fd, directory_fd, opened = _open_cleanup_dir(path)
     try:
@@ -6923,12 +6874,27 @@ def _secure_empty_cleanup_quarantine(
             raise WorkspaceCleanupIdentityError(
                 "quarantine inode does not match cleanup reservation"
             )
-        _scrub_cleanup_dir_fd(directory_fd)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_inode(opened, named):
+            raise WorkspaceCleanupIdentityError(
+                "quarantine pathname changed before anchored deletion"
+            )
+        remaining = [_WORKSPACE_CLEANUP_BATCH_LIMIT]
+        root_empty = _remove_cleanup_entries_bounded(
+            directory_fd,
+            remaining,
+            depth_remaining=_WORKSPACE_CLEANUP_MAX_DEPTH,
+        )
         named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(opened, named):
             raise WorkspaceCleanupIdentityError(
                 "quarantine pathname changed during anchored deletion"
             )
+        if not root_empty or remaining[0] <= 0:
+            return False
+        os.rmdir(path.name, dir_fd=parent_fd)
+        remaining[0] -= 1
+        return True
     finally:
         os.close(directory_fd)
         os.close(parent_fd)
@@ -7279,11 +7245,20 @@ def _process_workspace_cleanup_reservation(
                         completed=True,
                     )
                     return False
-                _secure_empty_cleanup_quarantine(
+                removed = _secure_remove_cleanup_quarantine(
                     recorded,
                     expected_dev=int(row["source_dev"]),
                     expected_ino=int(row["source_ino"]),
                 )
+                if not removed:
+                    _update_workspace_cleanup_reservation(
+                        conn, task_id, token, "renamed",
+                        last_error=(
+                            "deferred: bounded cleanup batch completed; "
+                            "quarantine remains"
+                        ),
+                    )
+                    return False
         except WorkspaceCleanupIdentityError as exc:
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "renamed", state="refused",

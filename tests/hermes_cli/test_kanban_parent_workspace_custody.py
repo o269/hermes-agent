@@ -334,11 +334,7 @@ def test_cleanup_recovers_crash_after_rename_and_never_retries_success(
 
         monkeypatch.setattr(kb, "_update_workspace_cleanup_reservation", original_update)
         assert kb.recover_workspace_cleanups(conn) == [task_id]
-        assert quarantine.is_dir()
-        tombstones = list(quarantine.iterdir())
-        assert len(tombstones) == 1
-        assert tombstones[0].name.startswith(".hermes-entry-")
-        assert tombstones[0].read_bytes() == b""
+        assert not quarantine.exists()
 
         # Recreating the old pathname after success must never authorize a
         # second delete: recovery consults only pending/renamed generations.
@@ -559,109 +555,39 @@ def test_cleanup_refuses_same_path_inode_swap_without_deleting_replacement(
     assert (original_aside / "custody.txt").read_text(encoding="utf-8") == "owned"
 
 
-@pytest.mark.parametrize("entry_kind", ("file", "symlink"))
-def test_cleanup_refuses_descendant_swap_and_preserves_replacement(
+def test_cleanup_boundary_preserves_new_source_and_racing_external_hard_link(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
-    entry_kind: str,
 ) -> None:
-    """Per-entry quarantine detects file/symlink replacement before mutation."""
+    """The post-rename cleanup boundary touches only quarantine dentries."""
+    outside = kanban_home / "outside-hard-link.txt"
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title=f"descendant {entry_kind} swap")
+        task_id = kb.create_task(conn, title="cleanup boundary race")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        entry = workspace / "custody.txt"
-        if entry_kind == "symlink":
-            entry.unlink()
-            entry.symlink_to("original-target")
-        real_rename = kb._rename_cleanup_noreplace
-        swapped = False
+        real_remove = kb._secure_remove_cleanup_quarantine
+        boundary_calls = 0
 
-        def swap_descendant_before_quarantine(
-            src,
-            dst,
+        def inject_at_cleanup_boundary(
+            quarantine: Path,
             *,
-            source_dir_fd,
-            target_dir_fd,
-        ):
-            nonlocal swapped
-            if src == entry.name and not swapped:
-                swapped = True
-                real_rename(
-                    src,
-                    f"{src}.original-aside",
-                    source_dir_fd=source_dir_fd,
-                    target_dir_fd=target_dir_fd,
-                )
-                if entry_kind == "file":
-                    replacement_fd = os.open(
-                        src,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o600,
-                        dir_fd=source_dir_fd,
-                    )
-                    try:
-                        os.write(replacement_fd, b"replacement-marker")
-                    finally:
-                        os.close(replacement_fd)
-                else:
-                    os.symlink(
-                        "replacement-target",
-                        src,
-                        dir_fd=source_dir_fd,
-                    )
-            return real_rename(
-                src,
-                dst,
-                source_dir_fd=source_dir_fd,
-                target_dir_fd=target_dir_fd,
+            expected_dev: int,
+            expected_ino: int,
+        ) -> bool:
+            nonlocal boundary_calls
+            boundary_calls += 1
+            os.link(quarantine / "custody.txt", outside)
+            workspace.mkdir()
+            (workspace / "new-owner.txt").write_text("new", encoding="utf-8")
+            return real_remove(
+                quarantine,
+                expected_dev=expected_dev,
+                expected_ino=expected_ino,
             )
 
         monkeypatch.setattr(
             kb,
-            "_rename_cleanup_noreplace",
-            swap_descendant_before_quarantine,
-        )
-        assert kb.complete_task(conn, task_id, result="done") is True
-        reservation = conn.execute(
-            "SELECT token, state, last_error "
-            "FROM workspace_cleanup_reservations WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
-        replacement = quarantine / entry.name
-        original_aside = quarantine / f"{entry.name}.original-aside"
-
-    assert swapped is True
-    assert reservation["state"] == "refused"
-    assert "descendant identity changed" in reservation["last_error"]
-    if entry_kind == "file":
-        assert replacement.read_bytes() == b"replacement-marker"
-        assert original_aside.read_text(encoding="utf-8") == "owned"
-    else:
-        assert replacement.is_symlink()
-        assert os.readlink(replacement) == "replacement-target"
-        assert original_aside.is_symlink()
-        assert os.readlink(original_aside) == "original-target"
-
-
-def test_cleanup_retains_directory_tombstones_instead_of_racy_rmdir(
-    kanban_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Directory cleanup has no final compare-to-rmdir pathname gap."""
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="directory tombstone")
-        workspace = _managed_workspace(conn, kanban_home, task_id)
-        nested = workspace / "nested"
-        nested.mkdir()
-        (nested / "secret.txt").write_text("secret", encoding="utf-8")
-
-        monkeypatch.setattr(
-            os,
-            "rmdir",
-            lambda *_args, **_kwargs: pytest.fail(
-                "cleanup must not rmdir by pathname"
-            ),
+            "_secure_remove_cleanup_quarantine",
+            inject_at_cleanup_boundary,
         )
         assert kb.complete_task(conn, task_id, result="done") is True
         reservation = conn.execute(
@@ -671,36 +597,64 @@ def test_cleanup_retains_directory_tombstones_instead_of_racy_rmdir(
         ).fetchone()
         quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
 
+    assert boundary_calls == 1
     assert reservation["state"] == "completed"
-    assert not workspace.exists()
-    assert quarantine.is_dir()
-    retained_directories = [path for path in quarantine.rglob("*") if path.is_dir()]
-    retained_files = [path for path in quarantine.rglob("*") if path.is_file()]
-    assert retained_directories
-    assert retained_files
-    assert all(path.read_bytes() == b"" for path in retained_files)
+    assert (workspace / "new-owner.txt").read_text(encoding="utf-8") == "new"
+    assert outside.read_text(encoding="utf-8") == "owned"
+    assert os.stat(outside).st_nlink == 1
+    assert not quarantine.exists()
 
 
-def test_cleanup_refuses_to_truncate_a_file_with_an_external_hard_link(
+def test_large_cleanup_reclaims_all_entries_without_tombstones(
     kanban_home: Path,
 ) -> None:
-    """Scrubbing a workspace inode cannot corrupt a hard-linked outside file."""
-    outside = kanban_home / "outside-owner.txt"
+    """A large tree reaches completed only after every quarantine dentry is gone."""
+    outside_target = kanban_home / "outside-target.txt"
+    outside_target.write_text("outside", encoding="utf-8")
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="hard-link custody")
+        task_id = kb.create_task(conn, title="large cleanup")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        os.link(workspace / "custody.txt", outside)
+        created_files = 1  # _managed_workspace's custody.txt
+        for directory_index in range(20):
+            directory = workspace / f"dir-{directory_index:02d}"
+            directory.mkdir()
+            for file_index in range(50):
+                (directory / f"file-{file_index:02d}.bin").write_bytes(b"x" * 64)
+                created_files += 1
+            (directory / "outside-link").symlink_to(outside_target)
+        outside_hard_link = kanban_home / "outside-large-hard-link.bin"
+        os.link(workspace / "dir-00" / "file-00.bin", outside_hard_link)
+        assert created_files == 1001
 
         assert kb.complete_task(conn, task_id, result="done") is True
         reservation = conn.execute(
-            "SELECT state, last_error FROM workspace_cleanup_reservations "
+            "SELECT token, state, last_error FROM workspace_cleanup_reservations "
             "WHERE task_id=?",
             (task_id,),
         ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+        assert reservation["state"] == "renamed"
+        assert "bounded cleanup batch" in reservation["last_error"]
+        assert quarantine.is_dir()
 
-    assert reservation["state"] == "refused"
-    assert "external hard-link custody" in reservation["last_error"]
-    assert outside.read_text(encoding="utf-8") == "owned"
+        recovery_passes = 0
+        while reservation["state"] == "renamed" and recovery_passes < 10:
+            kb.recover_workspace_cleanups(conn)
+            recovery_passes += 1
+            reservation = conn.execute(
+                "SELECT token, state, last_error "
+                "FROM workspace_cleanup_reservations WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+
+    assert reservation["state"] == "completed"
+    assert recovery_passes >= 4
+    assert not workspace.exists()
+    assert not quarantine.exists()
+    assert list(workspace.parent.glob(".hermes-cleanup-*")) == []
+    assert outside_target.read_text(encoding="utf-8") == "outside"
+    assert outside_hard_link.read_bytes() == b"x" * 64
+    assert os.stat(outside_hard_link).st_nlink == 1
 
 
 def test_cleanup_refuses_intermediate_symlink_and_normal_path_still_cleans(
@@ -885,6 +839,6 @@ def test_filesystem_rename_occurs_outside_write_transaction(
         monkeypatch.setattr(kb, "_rename_cleanup_noreplace", checked_rename)
         assert kb.complete_task(conn, task_id, result="done") is True
 
-    assert len(observed) == 2
+    assert len(observed) == 1
     assert all(in_transaction is False for in_transaction in observed)
     assert not workspace.exists()
