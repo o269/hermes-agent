@@ -2309,6 +2309,10 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Live concurrency ceiling for dispatch (max workers in status=running).
+        # Invalid values fail closed to 16. Override via config, CLI --max,
+        # or HERMES_KANBAN_MAX_SPAWN.
+        "max_spawn": 16,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

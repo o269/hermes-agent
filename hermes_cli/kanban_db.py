@@ -8251,6 +8251,86 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Live concurrency ceiling for dispatch_once / _dispatch_once_locked.
+# Unset/invalid values fail closed to this default (never "unlimited").
+DEFAULT_MAX_SPAWN = 16
+_MAX_SPAWN_ENV_KEYS: tuple[str, ...] = ("HERMES_KANBAN_MAX_SPAWN",)
+
+
+@dataclass(frozen=True)
+class MaxSpawnResolution:
+    """Result of :func:`resolve_max_spawn_ceiling`."""
+
+    value: int
+    source: str  # explicit | env | default | fail_closed
+    raw: Optional[str] = None
+    env_key: Optional[str] = None
+    invalid: bool = False
+
+
+def _parse_positive_max_spawn(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            return None
+        ival = int(raw)
+        return ival if ival >= 1 else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        ival = int(text, 10)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def resolve_max_spawn_ceiling(
+    explicit: Any = None,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> MaxSpawnResolution:
+    """Resolve the live ``max_spawn`` concurrency ceiling.
+
+    Precedence: explicit argument, then ``HERMES_KANBAN_MAX_SPAWN``, then
+    :data:`DEFAULT_MAX_SPAWN` (16). Invalid non-empty values fail closed
+    to 16 and set ``invalid=True``.
+    """
+    env_map: Mapping[str, str] = os.environ if env is None else env
+    if explicit is not None:
+        parsed = _parse_positive_max_spawn(explicit)
+        if parsed is not None:
+            return MaxSpawnResolution(value=parsed, source="explicit", raw=str(explicit))
+        return MaxSpawnResolution(
+            value=DEFAULT_MAX_SPAWN,
+            source="fail_closed",
+            raw=str(explicit),
+            invalid=True,
+        )
+    for key in _MAX_SPAWN_ENV_KEYS:
+        raw = env_map.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        parsed = _parse_positive_max_spawn(text)
+        if parsed is not None:
+            return MaxSpawnResolution(value=parsed, source="env", raw=text, env_key=key)
+        return MaxSpawnResolution(
+            value=DEFAULT_MAX_SPAWN,
+            source="fail_closed",
+            raw=text,
+            env_key=key,
+            invalid=True,
+        )
+    return MaxSpawnResolution(value=DEFAULT_MAX_SPAWN, source="default")
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -8437,6 +8517,8 @@ class DispatchResult:
     """Structured operator diagnostics, one per guarded Ready card."""
     dispositions: list[DispatchDisposition] = field(default_factory=list)
     """Exactly one terminal disposition for each Ready row snapped this tick."""
+    max_spawn_ceiling: Optional[int] = None
+    """Effective live concurrency ceiling applied this tick (always >= 1)."""
 
     def add_respawn_guard(
         self,
@@ -11027,6 +11109,15 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    _max_spawn_res = resolve_max_spawn_ceiling(max_spawn)
+    max_spawn = _max_spawn_res.value
+    result.max_spawn_ceiling = max_spawn
+    if _max_spawn_res.invalid:
+        _log.warning(
+            "kanban dispatcher: invalid max_spawn=%r; fail-closed to %d",
+            _max_spawn_res.raw,
+            DEFAULT_MAX_SPAWN,
+        )
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
