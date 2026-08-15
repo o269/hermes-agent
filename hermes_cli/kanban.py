@@ -744,6 +744,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_zombie_triage = sub.add_parser(
+        "zombie-triage",
+        help="Fold/archive all open cards from retired creator aliases",
+    )
+    p_zombie_triage.add_argument(
+        "manifest",
+        help=(
+            "JSON file mapping each open retired-alias task id to "
+            "{\"action\": \"fold|archive\", \"reason\": \"...\"}"
+        ),
+    )
+    p_zombie_triage.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate exact-set coverage and print the plan without mutation",
+    )
+    p_zombie_triage.add_argument("--json", action="store_true")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1120,6 +1138,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "zombie-triage": _cmd_zombie_triage,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1185,6 +1204,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "zombie-triage",
     "dispatch",
     "daemon",
     "repair",
@@ -2498,6 +2518,33 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_zombie_triage(args: argparse.Namespace) -> int:
+    path = Path(args.manifest).expanduser()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read zombie-triage manifest {path}: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(raw, dict):
+        print("zombie-triage manifest must be a JSON object", file=sys.stderr)
+        return 1
+    with kb.connect_closing() as conn:
+        result = kb.triage_retired_creator_cards(
+            conn,
+            dispositions=raw,
+            dry_run=bool(args.dry_run),
+        )
+    if args.json:
+        print(json.dumps({"dry_run": bool(args.dry_run), **result}, indent=2))
+    else:
+        prefix = "Would triage" if args.dry_run else "Triaged"
+        print(
+            f"{prefix} retired creator cards: "
+            f"folded={len(result['folded'])}, archived={len(result['archived'])}"
+        )
+    return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

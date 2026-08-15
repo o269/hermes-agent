@@ -157,6 +157,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+RETIRED_KANBAN_CREATOR_ALIASES = frozenset({
+    "fable-drain-steward",
+    "fable-fleet-drain-steward",
+})
 # Hard recurrence fence: one decomposition can never mint an unbounded child
 # burst even when a model or caller returns an oversized graph.
 MAX_DECOMPOSITION_CHILDREN = 15
@@ -3715,6 +3719,37 @@ def _normalize_task_title(title: str) -> str:
     return " ".join(normalized.split()).casefold()
 
 
+_CONCERN_KEY_RE = re.compile(
+    r"(?im)^\s*concern_key\s*:\s*(?P<key>[^\r\n]+?)\s*$"
+)
+
+
+def _extract_concern_key(body: Optional[str]) -> Optional[str]:
+    """Return the normalized explicit concern identity from a task body."""
+    match = _CONCERN_KEY_RE.search(str(body or ""))
+    if not match:
+        return None
+    key = " ".join(
+        unicodedata.normalize("NFKC", match.group("key")).split()
+    ).casefold()
+    return key or None
+
+
+def _find_open_concern_key_duplicate(
+    conn: sqlite3.Connection,
+    concern_key: str,
+) -> Optional[str]:
+    """Return the oldest open card declaring ``concern_key``."""
+    rows = conn.execute(
+        "SELECT id, body FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        if _extract_concern_key(row["body"]) == concern_key:
+            return str(row["id"])
+    return None
+
+
 # Workspace kinds whose ``workspace_path`` is stable enough to carry identity.
 #
 # ``workspace_path`` is DISPATCHER-MUTABLE for every other kind. At claim time
@@ -3861,6 +3896,7 @@ def _record_create_dedup(
     scope: tuple[str, tuple[str, ...], tuple[str, ...]],
     attempted_by: Optional[str],
     idempotency_key_supplied: bool,
+    concern_key: Optional[str] = None,
 ) -> None:
     """Durably expose every suppressed create re-mint on the existing card."""
     tenant_scope, parent_scope, location_scope = scope
@@ -3876,6 +3912,8 @@ def _record_create_dedup(
         "attempted_by": attempted_by,
         "idempotency_key_supplied": idempotency_key_supplied,
     }
+    if concern_key is not None:
+        payload["concern_key"] = concern_key
     _append_event(conn, existing_task_id, "create_deduplicated", payload)
     _log.warning(
         "kanban create re-mint suppressed existing_task_id=%s reason=%s "
@@ -3973,6 +4011,12 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    parents = tuple(parents)
+    created_by = str(created_by).strip() if created_by is not None else None
+    if created_by and created_by.casefold() in RETIRED_KANBAN_CREATOR_ALIASES:
+        raise ValueError(
+            f"retired Kanban creator alias {created_by!r} cannot create new cards"
+        )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -4200,6 +4244,36 @@ def create_task(
                             idempotency_key_supplied=True,
                         )
                         return existing_id
+
+                concern_key = _extract_concern_key(body)
+                if concern_key is not None:
+                    concern_id = _find_open_concern_key_duplicate(
+                        conn,
+                        concern_key,
+                    )
+                    if concern_id is not None:
+                        conn.execute(
+                            "UPDATE tasks SET title = ?, body = ? WHERE id = ?",
+                            (title.strip(), body, concern_id),
+                        )
+                        scope = _normalize_task_scope(
+                            tenant=tenant,
+                            parents=parents,
+                            project_id=project_id,
+                            workspace_kind=workspace_kind,
+                            workspace_path=workspace_path,
+                        )
+                        _record_create_dedup(
+                            conn,
+                            existing_task_id=concern_id,
+                            reason="concern_key",
+                            title=title,
+                            scope=scope,
+                            attempted_by=created_by,
+                            idempotency_key_supplied=bool(idempotency_key),
+                            concern_key=concern_key,
+                        )
+                        return concern_id
 
                 duplicate_id = None
                 if allow_open_duplicate:
@@ -8919,6 +8993,135 @@ def decompose_triage_task(
     if auto_promote:
         recompute_ready(conn)
     return child_ids
+
+
+def triage_retired_creator_cards(
+    conn: sqlite3.Connection,
+    *,
+    dispositions: Mapping[str, Mapping[str, str]],
+    dry_run: bool = False,
+) -> dict[str, list[str]]:
+    """Fold or archive every open card created by a retired control alias.
+
+    The manifest must exactly cover the current open alias set. This makes the
+    one-time drain deterministic: a partial or stale manifest fails before any
+    row changes, and every accepted disposition leaves a visible comment and
+    event. ``fold`` preserves the card and canonicalizes ``created_by`` to
+    ``fable``; ``archive`` terminally removes the stale card from dispatch.
+    """
+    normalized: dict[str, tuple[str, str]] = {}
+    for raw_task_id, raw_disposition in dispositions.items():
+        task_id = str(raw_task_id).strip()
+        if not task_id or not isinstance(raw_disposition, Mapping):
+            raise ValueError("each zombie-triage disposition requires a task id and object")
+        action = str(raw_disposition.get("action") or "").strip().casefold()
+        reason = str(raw_disposition.get("reason") or "").strip()
+        if action not in {"fold", "archive"}:
+            raise ValueError(
+                f"zombie-triage action for {task_id} must be 'fold' or 'archive'"
+            )
+        if not reason:
+            raise ValueError(f"zombie-triage reason for {task_id} is required")
+        normalized[task_id] = (action, reason)
+
+    aliases = tuple(sorted(RETIRED_KANBAN_CREATOR_ALIASES))
+    placeholders = ",".join("?" for _ in aliases)
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        f"WHERE lower(created_by) IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived') "
+        "ORDER BY created_at ASC, id ASC",
+        aliases,
+    ).fetchall()
+    expected = [str(row["id"]) for row in rows]
+    expected_set = set(expected)
+    supplied_set = set(normalized)
+    if supplied_set != expected_set:
+        missing = sorted(expected_set - supplied_set)
+        extra = sorted(supplied_set - expected_set)
+        raise ValueError(
+            "zombie-triage dispositions must exactly cover open retired-alias cards; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    result: dict[str, list[str]] = {"folded": [], "archived": []}
+    for task_id in expected:
+        action, _ = normalized[task_id]
+        result["folded" if action == "fold" else "archived"].append(task_id)
+    if dry_run:
+        return result
+
+    now = int(time.time())
+    with write_txn(conn):
+        # Recheck under BEGIN IMMEDIATE so a concurrent mutation cannot make the
+        # preflight manifest partial after validation.
+        live_rows = conn.execute(
+            "SELECT id FROM tasks "
+            f"WHERE lower(created_by) IN ({placeholders}) "
+            "AND status NOT IN ('done', 'archived') "
+            "ORDER BY created_at ASC, id ASC",
+            aliases,
+        ).fetchall()
+        live_ids = [str(row["id"]) for row in live_rows]
+        if live_ids != expected:
+            raise RuntimeError(
+                "open retired-alias card set changed during zombie triage; retry with a fresh manifest"
+            )
+
+        for task_id in expected:
+            action, reason = normalized[task_id]
+            label = "FOLDED" if action == "fold" else "ARCHIVED"
+            comment = f"ZOMBIE TRIAGE / {label}: {reason}"
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'kanban-zombie-triage', ?, ?)",
+                (task_id, comment, now),
+            )
+            if action == "fold":
+                conn.execute(
+                    "UPDATE tasks SET created_by = 'fable' WHERE id = ?",
+                    (task_id,),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "retired_creator_folded",
+                    {"canonical_creator": "fable", "reason": reason},
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                    (task_id,),
+                )
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="reclaimed",
+                    status="reclaimed",
+                    summary="retired creator card archived by zombie triage",
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "archived",
+                    {"reason": reason, "source": "retired_creator_triage"},
+                    run_id=run_id,
+                )
+
+        remaining = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            f"WHERE lower(created_by) IN ({placeholders}) "
+            "AND status NOT IN ('done', 'archived')",
+            aliases,
+        ).fetchone()[0])
+        if remaining:
+            raise RuntimeError(
+                f"zombie triage invariant failed: {remaining} retired-alias card(s) remain open"
+            )
+
+    recompute_ready(conn)
+    return result
 
 
 _ARCHIVE_IDENTITY_FIELDS = ("title", "body", "created_by", "idempotency_key")
