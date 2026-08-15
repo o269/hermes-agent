@@ -73,6 +73,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -866,8 +867,20 @@ def _identity_matches(expected: EntryIdentity, observed: os.stat_result) -> bool
     return expected == EntryIdentity.from_stat(observed)
 
 
-def delete_verified(decision: Decision, root: Path) -> None:
-    """Delete only the selection-time directory identity, anchored to *root*."""
+def delete_verified(
+    decision: Decision,
+    root: Path,
+    *,
+    before_namespace_move: Callable[[], None] | None = None,
+) -> None:
+    """Delete only the selection-time directory identity, anchored to *root*.
+
+    Open and verify the candidate first, then move it to an unpredictable name
+    under the already-open parent. The moved name must still identify the open
+    inode before deletion. A same-name replacement in the open-to-rename gap is
+    restored and kept, while a new public-name entry created after quarantine
+    is outside the deletion namespace.
+    """
     if not decision.selected or decision.identity is None:
         raise ValueError("refusing to delete an unselected or unidentified entry")
     if decision.path.parent.resolve(strict=True) != root.resolve(strict=True):
@@ -881,14 +894,44 @@ def delete_verified(decision: Decision, root: Path) -> None:
     open_flags |= getattr(os, "O_DIRECTORY", 0)
     open_flags |= getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(root, open_flags)
+    candidate_fd = -1
+    quarantine_name = f".fleet-reaper-{decision.identity.inode}-{secrets.token_hex(16)}"
     try:
-        observed = os.stat(decision.path.name, dir_fd=root_fd, follow_symlinks=False)
+        try:
+            candidate_fd = os.open(decision.path.name, open_flags, dir_fd=root_fd)
+        except OSError as exc:
+            raise RuntimeError("candidate is no longer a directory") from exc
+        observed = os.fstat(candidate_fd)
         if not stat.S_ISDIR(observed.st_mode):
             raise RuntimeError("candidate is no longer a directory")
         if not _identity_matches(decision.identity, observed):
             raise RuntimeError("candidate identity changed after selection")
-        shutil.rmtree(decision.path.name, dir_fd=root_fd)
+        if before_namespace_move is not None:
+            before_namespace_move()
+
+        os.rename(
+            decision.path.name,
+            quarantine_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        moved = os.stat(quarantine_name, dir_fd=root_fd, follow_symlinks=False)
+        if not _identity_matches(decision.identity, moved):
+            try:
+                os.stat(decision.path.name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.rename(
+                    quarantine_name,
+                    decision.path.name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+            raise RuntimeError("candidate identity changed before quarantine")
+
+        shutil.rmtree(quarantine_name, dir_fd=root_fd)
     finally:
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
         os.close(root_fd)
 
 

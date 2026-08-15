@@ -1052,6 +1052,27 @@ def test_verified_delete_rejects_directory_inode_swap(tmp_path, now):
     assert (root / "original").is_dir()
 
 
+def test_verified_delete_rejects_exact_open_to_namespace_move_swap(tmp_path, now):
+    """MUST FIRE: replacing the public name after verified open deletes nothing."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    candidate = make_tree(root, "candidate", age_seconds=9 * DAY, now=now)
+    decision = reaper.evaluate_entry(
+        candidate, now=now, process_paths=frozenset(), owner_uid=reaper.effective_uid()
+    )
+
+    def swap_after_open() -> None:
+        candidate.rename(root / "original-preserved")
+        make_tree(root, "candidate", age_seconds=9 * DAY, now=now)
+
+    with pytest.raises(RuntimeError, match="identity changed before quarantine"):
+        reaper.delete_verified(decision, root, before_namespace_move=swap_after_open)
+
+    assert (root / "original-preserved" / "payload.txt").is_file()
+    assert (root / "candidate" / "payload.txt").is_file()
+    assert list(root.glob(".fleet-reaper-*")) == []
+
+
 def test_repo_root_is_put_on_sys_path_for_the_board_import():
     """Without this the board import fails and the sweep silently no-ops.
 
