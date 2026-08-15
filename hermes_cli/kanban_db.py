@@ -143,12 +143,13 @@ def _is_terminal_custody_row(row: Mapping[str, Any]) -> bool:
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
-# unblocking them only to have the worker re-block for the same reason.
+# unblocking them only to have the worker re-block, even under a different
+# truly-blocked reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
-# the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
+# any truly-blocked reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
 # to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
 # human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``

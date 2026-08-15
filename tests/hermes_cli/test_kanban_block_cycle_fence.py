@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
 
 
 @pytest.fixture
@@ -75,6 +76,12 @@ def _recurrences(conn, tid) -> int:
         "SELECT block_recurrences FROM tasks WHERE id=?", (tid,)
     ).fetchone()
     return int(row["block_recurrences"] or 0)
+
+
+def test_agent_tool_description_matches_cross_kind_fence() -> None:
+    description = KANBAN_BLOCK_SCHEMA["description"]
+    assert "even when the reason or block kind changes" in description
+    assert "re-blocked for the same reason" not in description
 
 
 # ---------------------------------------------------------------------------
