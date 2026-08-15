@@ -2550,11 +2550,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        # kanban.max_spawn_per_tick — hard per-tick burst fence. Unset →
+        # DEFAULT_MAX_SPAWN_PER_TICK (the fence is on by default so the
+        # quota-exhaustion recurrence cannot silently return on installs
+        # that never set the key); 0 or a negative disables it explicitly;
+        # an unparsable value fails safe to the default.
+        raw_burst = _kanban_cfg.get("max_spawn_per_tick")
+        if raw_burst is None:
+            max_spawn_per_tick = kb.DEFAULT_MAX_SPAWN_PER_TICK
+        else:
+            try:
+                _burst = int(raw_burst)
+            except (TypeError, ValueError):
+                _burst = kb.DEFAULT_MAX_SPAWN_PER_TICK
+            max_spawn_per_tick = _burst if _burst >= 1 else None
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        # Config unreadable: keep the burst fence on at its default rather
+        # than dropping it — a config failure must not reopen the burst.
+        max_spawn_per_tick = kb.DEFAULT_MAX_SPAWN_PER_TICK
         _kanban_cfg = {}
 
     # D2 step-2 (2026-08-04, operator GO): bounded auto-decompose tick on the
@@ -2664,6 +2681,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawn_per_tick=max_spawn_per_tick,
         )
     if getattr(args, "json", False):
         print(json.dumps({
