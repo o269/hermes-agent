@@ -2309,6 +2309,12 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Hard ceiling on NEW worker spawns within one dispatcher tick,
+        # shared by ready and review work. This complements the live
+        # concurrency caps above: fast-draining workers cannot consume an
+        # unbounded number of provider calls in one tick. Set to 0 to
+        # disable explicitly.
+        "max_spawn_per_tick": 4,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
