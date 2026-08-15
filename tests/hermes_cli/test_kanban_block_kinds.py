@@ -8,8 +8,10 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
   never enter the human ``blocked`` bucket a cron would keep unblocking.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
-  each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+  each re-block after an unblock (any truly-blocked kind — cross-kind
+  alternation no longer resets the counter) increments
+  ``block_recurrences``, and at ``BLOCK_RECURRENCE_LIMIT`` the task routes
+  to ``triage`` for a human.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.

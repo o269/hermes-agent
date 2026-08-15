@@ -1720,20 +1720,16 @@ def run_doctor(args):
     except Exception:
         running_in_container = False
 
-    if running_in_container:
+    if running_in_container and terminal_env == "local":
         # Inside our container the Docker terminal backend is not
         # configured by default (Docker-in-Docker isn't set up); the
-        # local backend is the intended one. Skip the noisy "docker
-        # not found" warning. If the user has explicitly chosen
-        # TERMINAL_ENV=docker inside the container they likely mounted
-        # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
-            check_info(
-                "Running inside a container — using local terminal backend "
-                "(docker-in-docker is not configured by default)"
-            )
-            # Skip to next section; Docker isn't relevant here.
-            terminal_env = "local"
+        # local backend is the intended one.  Do not overwrite an explicit
+        # remote backend such as vercel_sandbox or daytona merely because
+        # doctor itself happens to run inside a container.
+        check_info(
+            "Running inside a container — using local terminal backend "
+            "(docker-in-docker is not configured by default)"
+        )
     if terminal_env == "docker":
         if _safe_which("docker"):
             # Check if docker daemon is running
@@ -1756,7 +1752,7 @@ def run_doctor(args):
         check_ok("docker", "(optional)")
     elif _is_termux():
         check_info("Docker backend is not available inside Termux (expected on Android)")
-    elif running_in_container:
+    elif running_in_container and terminal_env == "local":
         pass  # already explained above
     else:
         check_warn("docker not found", "(optional)")

@@ -93,7 +93,11 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         p.start()
     try:
         with _patch_aux_client(llm_payload), _patch_extra_body():
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = decomp.decompose_task(
+                tid,
+                idempotency_key=f"test:{tid}",
+                author="me",
+            )
     finally:
         for p in patches:
             p.stop()
@@ -133,7 +137,11 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
             "hermes_cli.kanban_decompose._load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
-            outcome = decomp.decompose_task(tid, author="me")
+            outcome = decomp.decompose_task(
+                tid,
+                idempotency_key=f"test:{tid}",
+                author="me",
+            )
     finally:
         for p in patches:
             p.stop()
@@ -153,7 +161,11 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     for p in patches:
         p.start()
     try:
-        outcome = decomp.decompose_task(tid, author="me")
+        outcome = decomp.decompose_task(
+            tid,
+            idempotency_key=f"test:{tid}",
+            author="me",
+        )
     finally:
         for p in patches:
             p.stop()

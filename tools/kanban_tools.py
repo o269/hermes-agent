@@ -631,10 +631,20 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    applied_by = args.get("applied_by")
+    apply_evidence = args.get("apply_evidence")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
         result = redact_sensitive_text(str(result), force=True)
+    if applied_by:
+        applied_by = redact_sensitive_text(str(applied_by), force=True).strip()
+    if apply_evidence:
+        apply_evidence = redact_sensitive_text(
+            str(apply_evidence), force=True
+        ).strip()
+    if bool(applied_by) != bool(apply_evidence):
+        return tool_error("applied_by and apply_evidence must be supplied together")
     if metadata is not None and isinstance(metadata, dict):
         meta_json = json.dumps(metadata)
         meta_json = redact_sensitive_text(meta_json, force=True)
@@ -751,6 +761,11 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    apply_receipt=(
+                        {"actor": applied_by, "evidence": apply_evidence}
+                        if applied_by
+                        else None
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1263,6 +1278,7 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    reasoning_effort = args.get("reasoning_effort")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1308,6 +1324,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                reasoning_effort=reasoning_effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1700,6 +1717,21 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "applied_by": {
+                "type": "string",
+                "description": (
+                    "Optional close-on-apply actor. Supply together with "
+                    "apply_evidence to atomically write the APPLIED / CLOSED "
+                    "audit comment and terminal transition."
+                ),
+            },
+            "apply_evidence": {
+                "type": "string",
+                "description": (
+                    "Observed install evidence (exact head, live marker, or "
+                    "equivalent falsifiable proof). Requires applied_by."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -1716,8 +1748,8 @@ KANBAN_BLOCK_SCHEMA = {
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "getting unblocked and re-blocked, it is auto-escalated to triage "
+        "even when the reason or block kind changes. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     "parameters": {
@@ -2031,6 +2063,24 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                ],
+                "description": (
+                    "Per-task worker thinking depth. Omit to inherit the "
+                    "assignee profile's agent.reasoning_effort; 'none' "
+                    "explicitly disables thinking."
                 ),
             },
             "goal_mode": {

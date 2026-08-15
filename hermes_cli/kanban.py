@@ -635,6 +635,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--applied-by",
+        default=None,
+        help="Close-on-apply actor; requires --apply-evidence and exactly one task id",
+    )
+    p_complete.add_argument(
+        "--apply-evidence",
+        default=None,
+        help="Observed install evidence recorded in the atomic APPLIED / CLOSED receipt",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -968,6 +978,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Author name recorded on the audit comment "
              "(default: $HERMES_PROFILE or 'decomposer')",
+    )
+    p_decompose.add_argument(
+        "--idempotency-key",
+        required=True,
+        help="Stable key for this decomposition. Reusing it is a no-op. With "
+             "--all, the task id is appended to this value.",
     )
     p_decompose.add_argument(
         "--json",
@@ -1848,7 +1864,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+        ok = kb.assign_task(conn, args.task_id, profile, actor="caller:kanban-cli")
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -1903,6 +1919,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
+            actor="caller:kanban-cli",
         )
     if not ok:
         print(
@@ -2243,6 +2260,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    applied_by = (getattr(args, "applied_by", None) or "").strip()
+    apply_evidence = (getattr(args, "apply_evidence", None) or "").strip()
+    if bool(applied_by) != bool(apply_evidence):
+        print(
+            "kanban: --applied-by and --apply-evidence must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+    if len(ids) > 1 and applied_by:
+        print(
+            "kanban: close-on-apply receipts are per-task; complete exactly one id",
+            file=sys.stderr,
+        )
+        return 2
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
@@ -2316,6 +2347,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                apply_receipt=(
+                    {"actor": applied_by, "evidence": apply_evidence}
+                    if applied_by
+                    else None
+                ),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2590,11 +2626,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        # kanban.max_spawn_per_tick — hard per-tick burst fence. Unset →
+        # DEFAULT_MAX_SPAWN_PER_TICK (the fence is on by default so the
+        # quota-exhaustion recurrence cannot silently return on installs
+        # that never set the key); 0 or a negative disables it explicitly;
+        # an unparsable value fails safe to the default.
+        raw_burst = _kanban_cfg.get("max_spawn_per_tick")
+        if raw_burst is None:
+            max_spawn_per_tick = kb.DEFAULT_MAX_SPAWN_PER_TICK
+        else:
+            try:
+                _burst = int(raw_burst)
+            except (TypeError, ValueError):
+                _burst = kb.DEFAULT_MAX_SPAWN_PER_TICK
+            max_spawn_per_tick = _burst if _burst >= 1 else None
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        # Config unreadable: keep the burst fence on at its default rather
+        # than dropping it — a config failure must not reopen the burst.
+        max_spawn_per_tick = kb.DEFAULT_MAX_SPAWN_PER_TICK
         _kanban_cfg = {}
 
     # D2 step-2 (2026-08-04, operator GO): bounded auto-decompose tick on the
@@ -2671,7 +2724,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                                 continue
                             try:
                                 _outcome = _decomp.decompose_task(
-                                    _tid, author="cli-dispatcher",
+                                    _tid,
+                                    idempotency_key=f"auto-decompose:{_tid}",
+                                    author="cli-dispatcher",
                                 )
                             except Exception as exc:
                                 _decomp_logger.warning(
@@ -2702,6 +2757,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawn_per_tick=max_spawn_per_tick,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2717,6 +2773,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_lane_ineligible": [
+                {"task_id": tid, "assignee": who, "reason": reason}
+                for (tid, who, reason) in res.skipped_lane_ineligible
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2755,6 +2815,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    for tid, who, reason in res.skipped_lane_ineligible:
+        print(f"Skipped (lane ineligible {who}: {reason}): {tid}")
     if res.skipped_per_profile_capped:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
@@ -3175,6 +3237,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     all_flag = bool(getattr(args, "all_triage", False))
     tenant = getattr(args, "tenant", None)
     author = getattr(args, "author", None) or _profile_author()
+    idempotency_key = str(getattr(args, "idempotency_key", "") or "").strip()
     want_json = bool(getattr(args, "json", False))
 
     if args.task_id and all_flag:
@@ -3208,7 +3271,12 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        task_key = f"{idempotency_key}:{tid}" if all_flag else idempotency_key
+        outcome = decomp.decompose_task(
+            tid,
+            idempotency_key=task_key,
+            author=author,
+        )
         if outcome.ok:
             ok_count += 1
         if want_json:
