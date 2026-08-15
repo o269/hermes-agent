@@ -1,0 +1,74 @@
+[Unit]
+Description=Hermes Kanban single-writer broker
+Documentation=https://github.com/o269/hermes-agent/blob/main/docs/operations/boardd-runtime.md
+After=local-fs.target
+ConditionFileIsExecutable=/opt/hermes-boardd/current/venv/bin/python
+ConditionPathIsReadWrite=/var/lib/boardd/fleet
+
+[Service]
+Type=notify
+User=boardd
+Group=boardd
+WorkingDirectory=/var/lib/boardd
+Environment=HERMES_HOME=/var/lib/boardd
+# Authority-lane policy is loaded from /var/lib/boardd/config.yaml. The runtime
+# fails closed when that canonical config cannot be parsed; do not point this
+# service at a profile-managed home.
+Environment=HERMES_KANBAN_BROKER=0
+Environment=HERMES_KANBAN_DB=/var/lib/boardd/fleet/kanban.db
+Environment=BOARDD_SOCK=/run/boardd/boardd.sock
+# Functional write path: create + verify + archive + verify through the broker.
+# The 90s initial offset avoids the 900s backup boundary; boardd also enforces
+# a shared maintenance lock so backup and canary cannot overlap when timing drifts.
+Environment=BOARDD_WRITE_CANARY_MODE=periodic
+Environment=BOARDD_WRITE_CANARY_START_DELAY_S=90
+Environment=BOARDD_WRITE_CANARY_INTERVAL_S=300
+Environment=BOARDD_WRITE_CANARY_TIMEOUT_S=20
+Environment=BOARDD_WRITE_CANARY_ALERT_REPEAT_S=3600
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/test -r /opt/hermes-boardd/current/libexec/boardd.py
+ExecStart=/opt/hermes-boardd/current/venv/bin/python /opt/hermes-boardd/current/libexec/boardd.py --db /var/lib/boardd/fleet/kanban.db --sock /run/boardd/boardd.sock --import-schema --log-level INFO
+Restart=always
+RestartSec=2s
+TimeoutStartSec=30s
+# Allows the default 20s write-canary deadline to drain before socket/DB teardown.
+TimeoutStopSec=45s
+WatchdogSec=30s
+NotifyAccess=main
+RuntimeDirectory=boardd
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=boardd
+StateDirectoryMode=0700
+UMask=0077
+
+# boardd has no need for any home directory. Runtime is immutable under /opt;
+# only the broker DB/state and its runtime socket are writable.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/boardd/fleet /run/boardd
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
