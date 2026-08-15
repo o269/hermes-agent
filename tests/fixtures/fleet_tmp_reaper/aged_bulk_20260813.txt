@@ -40,7 +40,7 @@
 # 46.6 GiB of reclaimable space sat on a 77%-full root.
 #
 # MUST FIRE: tests/scripts/test_fleet_tmp_reaper.py rebuilds every name below as
-# an aged directory and asserts the sweep selects all 297 non-protected ones.
+# an aged directory and asserts the sweep selects all 280 non-protected ones.
 # Reintroducing any name or prefix allowlist into the candidate gate collapses
 # that to ~20 and fails the test loudly.
 #

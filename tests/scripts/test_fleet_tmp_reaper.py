@@ -19,12 +19,15 @@ paired test proving a genuinely-safe tree is still selected.
 """
 
 import json
+import errno
+import io
 import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -771,6 +774,33 @@ def test_permission_error_is_unreadable_but_exit_is_not(tmp_path):
     )
 
 
+def test_marker_non_disappearance_proc_error_must_make_scan_incomplete(
+    tmp_path, monkeypatch
+):
+    """MUST FIRE: EIO is unknown custody; ENOENT is the disappearance ablation."""
+    proc_root = tmp_path / "proc"
+    pid = proc_root / "4242"
+    (pid / "fd").mkdir(parents=True)
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path: Path) -> bytes:
+        if path == pid / "cmdline":
+            raise OSError(errno.EIO, "marker: unreadable live process")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert reaper.process_referenced_paths(proc_root).unreadable_pids == (4242,)
+
+    # Ablation: the same missing proc channels are proof of process exit, not
+    # an unknown holder, so the otherwise identical scan remains complete.
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda path: (_ for _ in ()).throw(FileNotFoundError(errno.ENOENT, "gone")),
+    )
+    assert reaper.process_referenced_paths(proc_root).complete
+
+
 def test_holder_scan_reads_cwd_argv_and_open_descriptors(tmp_path):
     """Synthetic /proc proves every holder channel, including an actual fd."""
     held = tmp_path / "held"
@@ -1016,6 +1046,187 @@ def test_apply_rechecks_git_and_refuses_new_unique_work(tmp_path, now):
     assert target.is_dir()
 
 
+def test_marker_board_probe_rejects_zero_malformed_and_truncated_rows(monkeypatch):
+    """MUST FIRE: the same-object count control rejects false-empty board reads."""
+    from hermes_cli import kb_client
+
+    class FakeClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.sql = ""
+            self.max_rows = 0
+
+        def query(self, sql, _params, *, max_rows):
+            self.sql = sql
+            self.max_rows = max_rows
+            return self.rows
+
+    invalid_rows = [
+        [],
+        [{"id": "", "status": "ready", "workspace_path": None, "_total": 1}],
+        [{"id": "t_deadbeef", "status": "", "workspace_path": None, "_total": 1}],
+        [
+            {
+                "id": "t_deadbeef",
+                "status": "ready",
+                "workspace_path": 42,
+                "_total": 1,
+            }
+        ],
+        [
+            {
+                "id": "t_deadbeef",
+                "status": "ready",
+                "workspace_path": None,
+                "_total": 2,
+            }
+        ],
+    ]
+    for rows in invalid_rows:
+        client = FakeClient(rows)
+        monkeypatch.setattr(kb_client, "get_client", lambda client=client: client)
+        assert reaper.load_board_tasks() is None
+        assert "COUNT(*) OVER()" in client.sql
+        assert client.max_rows >= 500_000
+
+    # Ablation/positive control: one well-formed row whose window count agrees
+    # is accepted, proving the marker does not collapse all reads to unknown.
+    valid = FakeClient([
+        {
+            "id": "t_deadbeef",
+            "status": "ready",
+            "workspace_path": None,
+            "_total": 1,
+        }
+    ])
+    monkeypatch.setattr(kb_client, "get_client", lambda: valid)
+    assert reaper.load_board_tasks() == [reaper.BoardTask("t_deadbeef", "ready", None)]
+
+
+def test_marker_filesystem_boundaries_must_fail_closed(tmp_path, monkeypatch):
+    """MUST FIRE: cross-device and same-device bind-mount markers both keep."""
+    tree = tmp_path / "candidate"
+    tree.mkdir()
+    nested = tree / "nested"
+    nested.mkdir()
+    payload = tree / "payload"
+    payload.write_text("marker", encoding="utf-8")
+    observed_tree = tree.lstat()
+    observed_nested = nested.lstat()
+
+    assert (
+        reaper.tree_boundary_keep_reason(
+            tree,
+            observed_tree.st_dev,
+            mount_identities=frozenset({
+                (observed_nested.st_dev, observed_nested.st_ino)
+            }),
+        )
+        == reaper.KEEP_MOUNT_BOUNDARY
+    )
+
+    original_lstat = Path.lstat
+
+    def cross_device_lstat(path: Path):
+        value = original_lstat(path)
+        if path == nested:
+            return SimpleNamespace(
+                st_dev=value.st_dev + 1,
+                st_ino=value.st_ino,
+                st_mode=value.st_mode,
+                st_nlink=value.st_nlink,
+            )
+        return value
+
+    monkeypatch.setattr(Path, "lstat", cross_device_lstat)
+    assert (
+        reaper.tree_boundary_keep_reason(
+            tree, observed_tree.st_dev, mount_identities=frozenset()
+        )
+        == reaper.KEEP_CROSS_DEVICE
+    )
+    monkeypatch.setattr(Path, "lstat", original_lstat)
+
+    # Ablation: removing both markers makes the same tree traversable.
+    assert (
+        reaper.tree_boundary_keep_reason(
+            tree, observed_tree.st_dev, mount_identities=frozenset()
+        )
+        is None
+    )
+
+
+def test_marker_board_liveness_is_rechecked_after_quarantine(tmp_path, now):
+    """MUST FIRE: a card becoming live after namespace move restores the tree."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    target = make_tree(root, "scratch-t_deadbeef", age_seconds=9 * DAY, now=now)
+    tasks: list[reaper.BoardTask] = []
+
+    def make_live(_quarantined: Path) -> None:
+        tasks.append(reaper.BoardTask("t_deadbeef", "ready"))
+
+    code = reaper.main(
+        ["--root", str(root), "--apply"],
+        tasks_loader=lambda: list(tasks),
+        holder_scanner=lambda: reaper.HolderScan(frozenset(), ()),
+        git_probe=lambda _path: None,
+        after_quarantine=make_live,
+        stdout=io.StringIO(),
+    )
+
+    assert code == 4
+    assert (target / "payload.txt").is_file()
+    assert list(root.glob(".fleet-reaper-*")) == []
+
+
+def test_marker_process_custody_is_rechecked_after_quarantine(tmp_path, now):
+    """MUST FIRE: a holder appearing after namespace move restores the tree."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    target = make_tree(root, "scratch", age_seconds=9 * DAY, now=now)
+    holder = {"path": None}
+
+    def acquire(quarantined: Path) -> None:
+        holder["path"] = quarantined.resolve()
+
+    def scan() -> reaper.HolderScan:
+        paths = frozenset() if holder["path"] is None else frozenset({holder["path"]})
+        return reaper.HolderScan(paths, ())
+
+    code = reaper.main(
+        ["--root", str(root), "--apply"],
+        tasks_loader=lambda: [],
+        holder_scanner=scan,
+        git_probe=lambda _path: None,
+        after_quarantine=acquire,
+        stdout=io.StringIO(),
+    )
+
+    assert code == 4
+    assert (target / "payload.txt").is_file()
+    assert list(root.glob(".fleet-reaper-*")) == []
+
+
+def test_marker_quarantine_revalidation_ablation_deletes_still_dead_tree(tmp_path, now):
+    """Ablation: unchanged board and custody inputs still reach fd deletion."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    target = make_tree(root, "scratch", age_seconds=9 * DAY, now=now)
+
+    code = reaper.main(
+        ["--root", str(root), "--apply"],
+        tasks_loader=lambda: [],
+        holder_scanner=lambda: reaper.HolderScan(frozenset(), ()),
+        git_probe=lambda _path: None,
+        stdout=io.StringIO(),
+    )
+
+    assert code == 0
+    assert not target.exists()
+    assert list(root.glob(".fleet-reaper-*")) == []
+
+
 def test_verified_delete_rejects_symlink_swap_and_preserves_target(tmp_path, now):
     root = tmp_path / "tmp"
     root.mkdir()
@@ -1071,6 +1282,90 @@ def test_verified_delete_rejects_exact_open_to_namespace_move_swap(tmp_path, now
     assert (root / "original-preserved" / "payload.txt").is_file()
     assert (root / "candidate" / "payload.txt").is_file()
     assert list(root.glob(".fleet-reaper-*")) == []
+
+
+def test_marker_post_check_directory_substitution_never_deletes_replacement(
+    tmp_path, now
+):
+    """MUST FIRE: replacing the quarantine name cannot redirect recursion."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    candidate = make_tree(root, "candidate", age_seconds=9 * DAY, now=now)
+    decision = reaper.evaluate_entry(
+        candidate, now=now, process_paths=frozenset(), owner_uid=reaper.effective_uid()
+    )
+    replacement: dict[str, Path] = {}
+
+    def substitute(quarantined: Path) -> None:
+        quarantined.rename(root / "selected-moved")
+        replacement["path"] = make_tree(
+            root, quarantined.name, age_seconds=9 * DAY, now=now
+        )
+        (replacement["path"] / "replacement.marker").write_text(
+            "must survive", encoding="utf-8"
+        )
+
+    reaper.delete_verified(decision, root, before_fd_delete=substitute)
+
+    assert not (root / "selected-moved").exists()
+    assert (replacement["path"] / "replacement.marker").read_text(
+        encoding="utf-8"
+    ) == "must survive"
+
+
+def test_marker_namespace_restore_uses_distinct_name_when_public_name_reappears(
+    tmp_path, now
+):
+    """MUST FIRE: failed revalidation restores custody without overwriting."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    candidate = make_tree(root, "candidate", age_seconds=9 * DAY, now=now)
+    decision = reaper.evaluate_entry(
+        candidate, now=now, process_paths=frozenset(), owner_uid=reaper.effective_uid()
+    )
+
+    def occupy_public_name(_quarantined: Path) -> None:
+        replacement = root / "candidate"
+        replacement.mkdir()
+        (replacement / "replacement.marker").write_text("new", encoding="utf-8")
+
+    def marker_failure(_quarantined: Path, _candidate_fd: int) -> None:
+        raise RuntimeError("marker: final custody unknown")
+
+    with pytest.raises(RuntimeError, match="selected entry restored to"):
+        reaper.delete_verified(
+            decision,
+            root,
+            after_namespace_move=occupy_public_name,
+            post_quarantine_check=marker_failure,
+        )
+
+    assert (root / "candidate" / "replacement.marker").read_text(
+        encoding="utf-8"
+    ) == "new"
+    restored = list(root.glob("candidate.fleet-reaper-restored-*"))
+    assert len(restored) == 1
+    assert (restored[0] / "payload.txt").is_file()
+    assert list(root.glob(".fleet-reaper-*")) == []
+
+    # Ablation: without a public-name collision, restoration returns to the
+    # original name and still leaves no hidden quarantine namespace.
+    restored[0].rename(root / "candidate-ablation")
+    ablation = root / "ablation"
+    ablation.mkdir()
+    (ablation / "payload.txt").write_text("x", encoding="utf-8")
+    ablation_decision = reaper.evaluate_entry(
+        ablation,
+        now=now,
+        process_paths=frozenset(),
+        mtime_probe=lambda _path: now - 9 * DAY,
+        owner_uid=reaper.effective_uid(),
+    )
+    with pytest.raises(RuntimeError, match="restored to ablation"):
+        reaper.delete_verified(
+            ablation_decision, root, post_quarantine_check=marker_failure
+        )
+    assert (root / "ablation" / "payload.txt").is_file()
 
 
 def test_repo_root_is_put_on_sys_path_for_the_board_import():

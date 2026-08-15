@@ -70,11 +70,11 @@ Exit codes: 0 sweep completed, 3 board unavailable (nothing selected),
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -154,6 +154,8 @@ KEEP_LINKED_GIT_WORKTREE = "linked-git-worktree"
 KEEP_GIT_PROBE_FAILED = "git-probe-failed-closed"
 KEEP_HOLDER_SCAN_INCOMPLETE = "holder-scan-incomplete-fail-closed"
 KEEP_FOREIGN_OWNER = "owner-mismatch-fail-closed"
+KEEP_CROSS_DEVICE = "cross-device-entry-fail-closed"
+KEEP_MOUNT_BOUNDARY = "mount-boundary-fail-closed"
 
 SELECT_AGED = "aged-and-unreferenced"
 
@@ -296,6 +298,16 @@ def _is_permission_error(exc: OSError) -> bool:
     return isinstance(exc, PermissionError)
 
 
+def _process_read_is_unknown(exc: OSError) -> bool:
+    """True unless *exc* proves the process/path disappeared.
+
+    ``ENOENT`` and ``ESRCH`` are the only negative controls that establish a
+    process exited during the scan.  ``EIO``, ``ENOTDIR`` and every other
+    failure leave its holders unknown and therefore make the scan incomplete.
+    """
+    return exc.errno not in {errno.ENOENT, errno.ESRCH}
+
+
 def _record_process_path(out: set[Path], raw: str | os.PathLike[str]) -> None:
     """Add a canonical absolute process reference when one can be established."""
     value = os.fspath(raw)
@@ -330,17 +342,17 @@ def process_referenced_paths(proc_root: Path = Path("/proc")) -> HolderScan:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
-        denied = False
+        incomplete = False
 
         try:
             _record_process_path(out, os.readlink(entry / "cwd"))
         except OSError as exc:
-            denied = denied or _is_permission_error(exc)
+            incomplete = incomplete or _process_read_is_unknown(exc)
 
         try:
             raw = (entry / "cmdline").read_bytes()
         except OSError as exc:
-            denied = denied or _is_permission_error(exc)
+            incomplete = incomplete or _process_read_is_unknown(exc)
             raw = b""
         for raw_arg in raw.split(b"\0"):
             try:
@@ -357,17 +369,17 @@ def process_referenced_paths(proc_root: Path = Path("/proc")) -> HolderScan:
         try:
             fds = list(fd_dir.iterdir())
         except OSError as exc:
-            denied = denied or _is_permission_error(exc)
+            incomplete = incomplete or _process_read_is_unknown(exc)
             fds = []
         for fd in fds:
             try:
                 target = os.readlink(fd)
             except OSError as exc:
-                denied = denied or _is_permission_error(exc)
+                incomplete = incomplete or _process_read_is_unknown(exc)
                 continue
             _record_process_path(out, target)
 
-        if denied:
+        if incomplete:
             unreadable.add(pid)
 
     return HolderScan(frozenset(out), tuple(sorted(unreadable)))
@@ -612,6 +624,103 @@ def tree_owned_by(path: Path, uid: int) -> bool | None:
     return True
 
 
+def _decode_mountinfo_path(value: str) -> str:
+    """Decode the octal escapes used for mountinfo path fields."""
+    return (
+        value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _mount_identities(
+    mountinfo: Path = Path("/proc/self/mountinfo"),
+    *,
+    scope: Path | None = None,
+) -> frozenset[tuple[int, int]] | None:
+    """Return ``(st_dev, st_ino)`` for mount roots at or below *scope*.
+
+    Device equality alone does not detect a same-filesystem bind mount.  The
+    mounted root identity does, so every destructive traversal checks both.
+    An unreadable relevant mount is an unknown boundary and fails closed.
+    Unrelated mounts are deliberately not statted: this host has privileged
+    debug mounts that the fleet user cannot inspect, but they say nothing about
+    whether a candidate under ``/tmp`` crosses a mount boundary.
+    """
+    try:
+        lines = mountinfo.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    resolved_scope = _resolve(scope) if scope is not None else None
+    if scope is not None and resolved_scope is None:
+        return None
+    identities: set[tuple[int, int]] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6:
+            return None
+        mount_path = Path(_decode_mountinfo_path(fields[4]))
+        if resolved_scope is not None and not (
+            mount_path == resolved_scope or resolved_scope in mount_path.parents
+        ):
+            continue
+        try:
+            observed = mount_path.stat()
+        except OSError:
+            # Mounts may disappear concurrently. Unknown is safer than treating
+            # the vanished row as proof no boundary exists.
+            return None
+        identities.add((observed.st_dev, observed.st_ino))
+    return frozenset(identities)
+
+
+def tree_boundary_keep_reason(
+    path: Path,
+    expected_device: int,
+    *,
+    mount_identities: frozenset[tuple[int, int]] | None = None,
+) -> str | None:
+    """Return a fail-closed filesystem-boundary reason for *path*.
+
+    The traversal never follows symlinks.  Every real entry must remain on the
+    candidate filesystem, no directory may be a mount root (including bind
+    mounts on the same device).
+    """
+    mounts = (
+        _mount_identities(scope=path) if mount_identities is None else mount_identities
+    )
+    if mounts is None:
+        return KEEP_MOUNT_BOUNDARY
+
+    def inspect(observed: os.stat_result) -> str | None:
+        if observed.st_dev != expected_device:
+            return KEEP_CROSS_DEVICE
+        if (observed.st_dev, observed.st_ino) in mounts:
+            return KEEP_MOUNT_BOUNDARY
+        return None
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    try:
+        reason = inspect(path.lstat())
+        if reason is not None:
+            return reason
+        for current, directories, files in os.walk(
+            path, topdown=True, followlinks=False, onerror=fail
+        ):
+            current_path = Path(current)
+            for name in (*directories, *files):
+                reason = inspect((current_path / name).lstat())
+                if reason is not None:
+                    return reason
+    except OSError:
+        return KEEP_UNREADABLE
+    return None
+
+
 # ── age probe ───────────────────────────────────────────────────────────────
 
 
@@ -661,6 +770,7 @@ def newest_mtime(
 def evaluate_entry(
     entry: Path,
     *,
+    reference_entry: Path | None = None,
     now: float,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     live_workspaces: frozenset[Path] = frozenset(),
@@ -670,6 +780,7 @@ def evaluate_entry(
     git_probe: Callable[[Path], str | None] = git_tree_keep_reason,
     owner_uid: int | None = None,
     ownership_probe: Callable[[Path, int], bool | None] = tree_owned_by,
+    boundary_probe: Callable[[Path, int], str | None] = tree_boundary_keep_reason,
 ) -> Decision:
     """Decide a single top-level entry.
 
@@ -677,6 +788,7 @@ def evaluate_entry(
     absence of a live reference plus the absence of unpushed work; names only
     ever produce *keeps*.
     """
+    logical_entry = reference_entry or entry
     try:
         entry_stat = entry.lstat()
     except OSError:
@@ -685,7 +797,7 @@ def evaluate_entry(
         return Decision(entry, False, KEEP_SYMLINK)
     if not stat.S_ISDIR(entry_stat.st_mode):
         return Decision(entry, False, KEEP_NOT_A_DIRECTORY)
-    if PROTECTED_NAME_RE.match(entry.name):
+    if PROTECTED_NAME_RE.match(logical_entry.name):
         return Decision(entry, False, KEEP_PROTECTED)
 
     owner_uid = effective_uid() if owner_uid is None else owner_uid
@@ -696,15 +808,20 @@ def evaluate_entry(
         if not owned:
             return Decision(entry, False, KEEP_FOREIGN_OWNER)
 
+    boundary_reason = boundary_probe(entry, entry_stat.st_dev)
+    if boundary_reason is not None:
+        return Decision(entry, False, boundary_reason)
+
     resolved = _resolve(entry)
-    if resolved is None:
+    logical_resolved = _resolve(logical_entry)
+    if resolved is None or logical_resolved is None:
         return Decision(entry, False, KEEP_UNREADABLE)
 
     for workspace in live_workspaces:
-        if _paths_overlap(resolved, workspace):
+        if _paths_overlap(logical_resolved, workspace):
             return Decision(entry, False, KEEP_LIVE_WORKSPACE)
 
-    if board_liveness.name_is_held(entry.name, live_ids, board_ok=True):
+    if board_liveness.name_is_held(logical_entry.name, live_ids, board_ok=True):
         return Decision(entry, False, KEEP_LIVE_TASK_ID)
 
     newest = mtime_probe(entry)
@@ -715,7 +832,9 @@ def evaluate_entry(
         return Decision(entry, False, KEEP_TOO_NEW, age_seconds=age)
 
     for referenced in process_paths:
-        if _contains_or_equals(resolved, referenced):
+        if _contains_or_equals(resolved, referenced) or _contains_or_equals(
+            logical_resolved, referenced
+        ):
             return Decision(entry, False, KEEP_LIVE_PROCESS, age_seconds=age)
 
     # Last, because it is the only gate that forks a subprocess: by here the
@@ -746,6 +865,7 @@ def sweep(
     git_probe: Callable[[Path], str | None] = git_tree_keep_reason,
     owner_uid: int | None = None,
     ownership_probe: Callable[[Path, int], bool | None] = tree_owned_by,
+    boundary_probe: Callable[[Path, int], str | None] = tree_boundary_keep_reason,
     escalate_holder_scan: bool = True,
 ) -> SweepResult:
     """Evaluate every direct child of *root*.
@@ -795,6 +915,23 @@ def sweep(
     workspaces = live_workspace_paths(tasks)
     ids = live_task_ids(tasks)
 
+    # Mount enumeration is a point-in-time safety input, not static policy.
+    # Load it once per sweep so a 300-entry candidate set does not restat the
+    # entire mount table 300 times. A later apply revalidation loads it again.
+    effective_boundary_probe = boundary_probe
+    if boundary_probe is tree_boundary_keep_reason:
+        mount_identities = _mount_identities(scope=root)
+        if mount_identities is None:
+            result.decisions = [
+                Decision(e, False, KEEP_MOUNT_BOUNDARY) for e in entries
+            ]
+            return result
+
+        def effective_boundary_probe(path: Path, device: int) -> str | None:
+            return tree_boundary_keep_reason(
+                path, device, mount_identities=mount_identities
+            )
+
     result.decisions = [
         evaluate_entry(
             entry,
@@ -807,6 +944,7 @@ def sweep(
             git_probe=git_probe,
             owner_uid=owner_uid,
             ownership_probe=ownership_probe,
+            boundary_probe=effective_boundary_probe,
         )
         for entry in entries
     ]
@@ -846,18 +984,49 @@ def load_board_tasks() -> list[BoardTask] | None:
         from hermes_cli import kb_client  # noqa: PLC0415 — optional at import time
 
         rows = kb_client.get_client().query(
-            "SELECT id, status, workspace_path FROM tasks", [], max_rows=500000
+            "SELECT id, status, workspace_path, COUNT(*) OVER() AS _total FROM tasks",
+            [],
+            max_rows=500000,
         )
     except Exception:
         return None
-    return [
-        BoardTask(
-            task_id=str(row["id"] or ""),
-            status=str(row["status"] or ""),
-            workspace_path=row["workspace_path"],
+    # A destructive consumer must not interpret a zero-row response, a broker
+    # pointed at the wrong board, or max_rows truncation as "there is no live
+    # work". The window count is a positive control from the same query/object.
+    if not rows:
+        return None
+    try:
+        totals = {int(row["_total"]) for row in rows}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if totals != {len(rows)}:
+        return None
+
+    tasks: list[BoardTask] = []
+    for row in rows:
+        try:
+            task_id = str(row["id"] or "").strip()
+            status_value = str(row["status"] or "").strip()
+            workspace_value = row["workspace_path"]
+        except (KeyError, TypeError):
+            return None
+        body = board_liveness.hex_of_task_id(task_id)
+        if (
+            len(body) < 4
+            or any(char not in "0123456789abcdef" for char in body.lower())
+            or not status_value
+            or workspace_value is not None
+            and not isinstance(workspace_value, str)
+        ):
+            return None
+        tasks.append(
+            BoardTask(
+                task_id=task_id,
+                status=status_value,
+                workspace_path=workspace_value or None,
+            )
         )
-        for row in rows
-    ]
+    return tasks
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -867,11 +1036,121 @@ def _identity_matches(expected: EntryIdentity, observed: os.stat_result) -> bool
     return expected == EntryIdentity.from_stat(observed)
 
 
+def _restore_quarantined_name(
+    root_fd: int,
+    quarantined_name: str,
+    original_name: str,
+) -> str:
+    """Restore a quarantined entry without overwriting a new public name."""
+    try:
+        os.stat(original_name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        destination = original_name
+    else:
+        destination = f"{original_name}.fleet-reaper-restored-{secrets.token_hex(16)}"
+    os.rename(
+        quarantined_name,
+        destination,
+        src_dir_fd=root_fd,
+        dst_dir_fd=root_fd,
+    )
+    return destination
+
+
+def _find_identity_name(root_fd: int, expected: EntryIdentity) -> str | None:
+    """Find the direct child still naming *expected* under an open root."""
+    for name in os.listdir(root_fd):
+        try:
+            observed = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if _identity_matches(expected, observed):
+            return name
+    return None
+
+
+def _validate_delete_stat(
+    observed: os.stat_result,
+    *,
+    expected_device: int,
+    expected_uid: int,
+    mount_identities: frozenset[tuple[int, int]],
+) -> None:
+    if observed.st_uid != expected_uid:
+        raise RuntimeError(KEEP_FOREIGN_OWNER)
+    if observed.st_dev != expected_device:
+        raise RuntimeError(KEEP_CROSS_DEVICE)
+    if (observed.st_dev, observed.st_ino) in mount_identities:
+        raise RuntimeError(KEEP_MOUNT_BOUNDARY)
+
+
+def _delete_tree_contents_fd(
+    directory_fd: int,
+    *,
+    expected_device: int,
+    expected_uid: int,
+    mount_identities: frozenset[tuple[int, int]],
+    mutated: list[bool],
+) -> None:
+    """Recursively delete through already-open directory descriptors.
+
+    No recursive step resolves a pathname outside its verified parent fd. A
+    substituted directory name is detected before ``rmdir`` and is never
+    traversed or recursively deleted.
+    """
+    for name in sorted(os.listdir(directory_fd)):
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _validate_delete_stat(
+            observed,
+            expected_device=expected_device,
+            expected_uid=expected_uid,
+            mount_identities=mount_identities,
+        )
+        if stat.S_ISDIR(observed.st_mode):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if not os.path.samestat(observed, opened):
+                    raise RuntimeError("directory identity changed during delete")
+                _validate_delete_stat(
+                    opened,
+                    expected_device=expected_device,
+                    expected_uid=expected_uid,
+                    mount_identities=mount_identities,
+                )
+                _delete_tree_contents_fd(
+                    child_fd,
+                    expected_device=expected_device,
+                    expected_uid=expected_uid,
+                    mount_identities=mount_identities,
+                    mutated=mutated,
+                )
+            finally:
+                os.close(child_fd)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not os.path.samestat(observed, current):
+                raise RuntimeError("directory name changed during delete")
+            os.rmdir(name, dir_fd=directory_fd)
+            mutated[0] = True
+            continue
+
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not os.path.samestat(observed, current):
+            raise RuntimeError("entry name changed during delete")
+        os.unlink(name, dir_fd=directory_fd)
+        mutated[0] = True
+
+
 def delete_verified(
     decision: Decision,
     root: Path,
     *,
     before_namespace_move: Callable[[], None] | None = None,
+    after_namespace_move: Callable[[Path], None] | None = None,
+    post_quarantine_check: Callable[[Path, int], None] | None = None,
+    before_fd_delete: Callable[[Path], None] | None = None,
 ) -> None:
     """Delete only the selection-time directory identity, anchored to *root*.
 
@@ -887,15 +1166,14 @@ def delete_verified(
         raise ValueError("candidate is not a direct child of the configured root")
     if os.sep in decision.path.name or decision.path.name in {"", ".", ".."}:
         raise ValueError("invalid candidate basename")
-    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
-        raise RuntimeError("platform lacks symlink-resistant rmtree")
-
     open_flags = os.O_RDONLY
     open_flags |= getattr(os, "O_DIRECTORY", 0)
     open_flags |= getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(root, open_flags)
     candidate_fd = -1
     quarantine_name = f".fleet-reaper-{decision.identity.inode}-{secrets.token_hex(16)}"
+    quarantined = False
+    mutated = [False]
     try:
         try:
             candidate_fd = os.open(decision.path.name, open_flags, dir_fd=root_fd)
@@ -906,6 +1184,9 @@ def delete_verified(
             raise RuntimeError("candidate is no longer a directory")
         if not _identity_matches(decision.identity, observed):
             raise RuntimeError("candidate identity changed after selection")
+        mounts = _mount_identities(scope=decision.path)
+        if mounts is None:
+            raise RuntimeError(KEEP_MOUNT_BOUNDARY)
         if before_namespace_move is not None:
             before_namespace_move()
 
@@ -917,18 +1198,60 @@ def delete_verified(
         )
         moved = os.stat(quarantine_name, dir_fd=root_fd, follow_symlinks=False)
         if not _identity_matches(decision.identity, moved):
-            try:
-                os.stat(decision.path.name, dir_fd=root_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                os.rename(
-                    quarantine_name,
-                    decision.path.name,
-                    src_dir_fd=root_fd,
-                    dst_dir_fd=root_fd,
-                )
-            raise RuntimeError("candidate identity changed before quarantine")
+            restored = _restore_quarantined_name(
+                root_fd, quarantine_name, decision.path.name
+            )
+            raise RuntimeError(
+                "candidate identity changed before quarantine; "
+                f"moved entry restored to {restored}"
+            )
+        quarantined = True
+        quarantine_path = root / quarantine_name
+        try:
+            if after_namespace_move is not None:
+                after_namespace_move(quarantine_path)
+            if post_quarantine_check is not None:
+                post_quarantine_check(quarantine_path, candidate_fd)
+            if before_fd_delete is not None:
+                before_fd_delete(quarantine_path)
 
-        shutil.rmtree(quarantine_name, dir_fd=root_fd)
+            opened = os.fstat(candidate_fd)
+            _validate_delete_stat(
+                opened,
+                expected_device=decision.identity.device,
+                expected_uid=decision.identity.uid,
+                mount_identities=mounts,
+            )
+            _delete_tree_contents_fd(
+                candidate_fd,
+                expected_device=decision.identity.device,
+                expected_uid=decision.identity.uid,
+                mount_identities=mounts,
+                mutated=mutated,
+            )
+
+            # The selected inode may have been renamed again after quarantine.
+            # Remove only the direct child still naming that exact, now-empty
+            # inode. A replacement at the secret quarantine name is untouched.
+            selected_name = _find_identity_name(root_fd, decision.identity)
+            if selected_name is not None:
+                current = os.stat(selected_name, dir_fd=root_fd, follow_symlinks=False)
+                if not _identity_matches(decision.identity, current):
+                    raise RuntimeError("selected directory name changed at removal")
+                os.rmdir(selected_name, dir_fd=root_fd)
+                mutated[0] = True
+            quarantined = False
+        except Exception as exc:
+            if quarantined and not mutated[0]:
+                selected_name = _find_identity_name(root_fd, decision.identity)
+                if selected_name is not None:
+                    restored = _restore_quarantined_name(
+                        root_fd, selected_name, decision.path.name
+                    )
+                    raise RuntimeError(
+                        f"{exc}; selected entry restored to {restored}"
+                    ) from exc
+            raise
     finally:
         if candidate_fd >= 0:
             os.close(candidate_fd)
@@ -984,12 +1307,15 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     tasks_loader: Callable[[], list[BoardTask] | None] = load_board_tasks,
-    deleter: Callable[[Decision], None] = _default_deleter,
+    deleter: Callable[[Decision], None] | None = None,
     holder_scanner: Callable[[], HolderScan] | None = None,
     mtime_probe: Callable[[Path], float | None] = newest_mtime,
     git_probe: Callable[[Path], str | None] = git_tree_keep_reason,
     owner_uid: int | None = None,
     ownership_probe: Callable[[Path, int], bool | None] = tree_owned_by,
+    boundary_probe: Callable[[Path, int], str | None] = tree_boundary_keep_reason,
+    after_quarantine: Callable[[Path], None] | None = None,
+    before_fd_delete: Callable[[Path], None] | None = None,
     stdout=None,
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -1021,6 +1347,7 @@ def main(
         git_probe=git_probe,
         owner_uid=owner_uid,
         ownership_probe=ownership_probe,
+        boundary_probe=boundary_probe,
     )
 
     deleted: list[str] = []
@@ -1028,36 +1355,90 @@ def main(
     if args.apply:
         for decision in result.candidates:
             try:
-                fresh_tasks = tasks_loader()
-                if fresh_tasks is None:
-                    raise RuntimeError(KEEP_BOARD_UNAVAILABLE)
-                fresh_scan = scan_holders()
-                if not fresh_scan.complete:
-                    raise RuntimeError(KEEP_HOLDER_SCAN_INCOMPLETE)
-                fresh = evaluate_entry(
-                    decision.path,
-                    now=time.time(),
-                    max_age_seconds=int(args.max_age_hours * 3600),
-                    live_workspaces=live_workspace_paths(fresh_tasks),
-                    live_ids=live_task_ids(fresh_tasks),
-                    process_paths=fresh_scan.paths,
-                    mtime_probe=mtime_probe,
-                    git_probe=git_probe,
-                    owner_uid=owner_uid,
-                    ownership_probe=ownership_probe,
-                )
-                if not fresh.selected:
-                    raise RuntimeError(f"apply revalidation kept entry: {fresh.reason}")
-                if fresh.identity != decision.identity:
-                    raise RuntimeError("candidate identity changed after selection")
-                deleter(fresh)
+                if deleter is None:
+                    expected_identity = decision.identity
+                    if expected_identity is None:
+                        raise RuntimeError("selected candidate has no identity")
+
+                    def post_quarantine_check(
+                        quarantine_path: Path, candidate_fd: int
+                    ) -> None:
+                        fresh_tasks = tasks_loader()
+                        if fresh_tasks is None:
+                            raise RuntimeError(KEEP_BOARD_UNAVAILABLE)
+                        fresh_scan = scan_holders()
+                        if not fresh_scan.complete:
+                            raise RuntimeError(KEEP_HOLDER_SCAN_INCOMPLETE)
+                        fresh = evaluate_entry(
+                            quarantine_path,
+                            reference_entry=decision.path,
+                            now=time.time(),
+                            max_age_seconds=int(args.max_age_hours * 3600),
+                            live_workspaces=live_workspace_paths(fresh_tasks),
+                            live_ids=live_task_ids(fresh_tasks),
+                            process_paths=fresh_scan.paths,
+                            mtime_probe=mtime_probe,
+                            git_probe=git_probe,
+                            owner_uid=owner_uid,
+                            ownership_probe=ownership_probe,
+                            boundary_probe=boundary_probe,
+                        )
+                        if not fresh.selected:
+                            raise RuntimeError(
+                                f"apply revalidation kept entry: {fresh.reason}"
+                            )
+                        if fresh.identity != expected_identity or not _identity_matches(
+                            expected_identity, os.fstat(candidate_fd)
+                        ):
+                            raise RuntimeError(
+                                "candidate identity changed after selection"
+                            )
+
+                    delete_verified(
+                        decision,
+                        args.root,
+                        after_namespace_move=after_quarantine,
+                        post_quarantine_check=post_quarantine_check,
+                        before_fd_delete=before_fd_delete,
+                    )
+                else:
+                    # Injected deleters are a unit-test seam. Keep the old
+                    # pre-call revalidation contract for those non-destructive
+                    # callers; the production deleter always uses the stronger
+                    # quarantine-first path above.
+                    fresh_tasks = tasks_loader()
+                    if fresh_tasks is None:
+                        raise RuntimeError(KEEP_BOARD_UNAVAILABLE)
+                    fresh_scan = scan_holders()
+                    if not fresh_scan.complete:
+                        raise RuntimeError(KEEP_HOLDER_SCAN_INCOMPLETE)
+                    fresh = evaluate_entry(
+                        decision.path,
+                        now=time.time(),
+                        max_age_seconds=int(args.max_age_hours * 3600),
+                        live_workspaces=live_workspace_paths(fresh_tasks),
+                        live_ids=live_task_ids(fresh_tasks),
+                        process_paths=fresh_scan.paths,
+                        mtime_probe=mtime_probe,
+                        git_probe=git_probe,
+                        owner_uid=owner_uid,
+                        ownership_probe=ownership_probe,
+                        boundary_probe=boundary_probe,
+                    )
+                    if not fresh.selected:
+                        raise RuntimeError(
+                            f"apply revalidation kept entry: {fresh.reason}"
+                        )
+                    if fresh.identity != decision.identity:
+                        raise RuntimeError("candidate identity changed after selection")
+                    deleter(fresh)
                 deleted.append(str(decision.path))
             except Exception as exc:  # noqa: BLE001 — one failure must not abort the sweep
                 failed.append(f"{decision.path}: {type(exc).__name__}: {exc}")
 
     mode = "apply" if args.apply else "dry-run"
     if args.json:
-        payload = {
+        payload: dict[str, object] = {
             "mode": mode,
             "root": str(result.root),
             "board_available": result.board_available,
