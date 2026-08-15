@@ -9581,6 +9581,7 @@ class DispatchResult:
 _DISPOSITION_EVENT_DETAIL_KEYS = (
     "assignee",
     "auto_blocked",
+    "child_terminated",
     "claim_reason",
     "continuation_authorization_id",
     "continuation_denial",
@@ -9599,6 +9600,7 @@ _DISPOSITION_EVENT_DETAIL_KEYS = (
     "source",
     "source_comment_id",
     "source_status",
+    "termination_attempted",
     "window_seconds",
     "guard_rc",
     "guard_state",
@@ -10844,6 +10846,72 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+def _spawn_claim_is_current(conn: sqlite3.Connection, claimed: Task) -> bool:
+    """Return whether ``claimed`` still owns an unspawned reservation.
+
+    Workspace setup and process launch happen outside SQLite's transaction.
+    Treat the claim lock + run id captured by ``claim_task`` as a fencing token
+    and re-check both immediately before the external spawn side effect.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+        "WHERE t.id = ? AND t.status = 'running' "
+        "AND t.claim_lock IS ? AND t.current_run_id IS ? "
+        "AND t.assignee IS ? AND t.worker_pid IS NULL "
+        "AND r.ended_at IS NULL AND r.worker_pid IS NULL",
+        (
+            claimed.id,
+            claimed.claim_lock,
+            claimed.current_run_id,
+            claimed.assignee,
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def _attach_spawned_worker_pid(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    pid: int,
+) -> bool:
+    """Atomically attach ``pid`` only while the original claim owns the run."""
+    with write_txn(conn):
+        if not _spawn_claim_is_current(conn, claimed):
+            return False
+        task_cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' "
+            "AND claim_lock IS ? AND current_run_id IS ? "
+            "AND assignee IS ? AND worker_pid IS NULL",
+            (
+                int(pid),
+                claimed.id,
+                claimed.claim_lock,
+                claimed.current_run_id,
+                claimed.assignee,
+            ),
+        )
+        run_cur = conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id IS ? AND task_id = ? AND ended_at IS NULL "
+            "AND worker_pid IS NULL",
+            (int(pid), claimed.current_run_id, claimed.id),
+        )
+        if task_cur.rowcount != 1 or run_cur.rowcount != 1:
+            raise RuntimeError(
+                f"claim/run PID attachment invariant failed for task {claimed.id}"
+            )
+        _append_event(
+            conn,
+            claimed.id,
+            "spawned",
+            {"pid": int(pid)},
+            run_id=claimed.current_run_id,
+        )
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -12465,6 +12533,17 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if not _spawn_claim_is_current(conn, claimed):
+            _record_ready_disposition(
+                conn,
+                result,
+                claimed.id,
+                "skipped",
+                reason="claim_lost_before_spawn",
+                detail={"assignee": claimed.assignee or row_assignee},
+                dry_run=False,
+            )
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -12479,8 +12558,38 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            try:
+                claim_retained = (
+                    _attach_spawned_worker_pid(conn, claimed, int(pid))
+                    if pid
+                    else _spawn_claim_is_current(conn, claimed)
+                )
+            except Exception:
+                if pid:
+                    _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                raise
+            if not claim_retained:
+                termination: dict[str, Any] = {}
+                if pid:
+                    termination = _terminate_reclaimed_worker(
+                        int(pid), claimed.claim_lock
+                    )
+                _record_ready_disposition(
+                    conn,
+                    result,
+                    claimed.id,
+                    "skipped",
+                    reason="claim_lost_during_spawn",
+                    detail={
+                        "assignee": claimed.assignee or row_assignee,
+                        "termination_attempted": bool(
+                            termination.get("termination_attempted")
+                        ),
+                        "child_terminated": bool(termination.get("terminated")),
+                    },
+                    dry_run=False,
+                )
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -12585,6 +12694,8 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
+        if not _spawn_claim_is_current(conn, claimed):
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -12596,8 +12707,20 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            try:
+                claim_retained = (
+                    _attach_spawned_worker_pid(conn, claimed, int(pid))
+                    if pid
+                    else _spawn_claim_is_current(conn, claimed)
+                )
+            except Exception:
+                if pid:
+                    _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                raise
+            if not claim_retained:
+                if pid:
+                    _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
