@@ -6461,6 +6461,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+# Statuses at which a task is finished with its workspace. Named so the
+# "is this task done with its scratch dir" question has exactly one answer.
+_TERMINAL_WORKSPACE_CLEANUP_STATUSES = ("done", "archived", "failed", "cancelled")
+
+
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
     """Clean up parent scratch workspaces now that *task_id* completed.
 
@@ -6468,6 +6473,13 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     this function is called after each child completes.  If all children of a
     parent are now done/archived/failed/cancelled, the parent's scratch
     workspace is removed (#33774).
+
+    Fail-closed: a parent that is still working, or whose recorded worker
+    PID is still alive, keeps its directory. The deferral exists for the
+    case where the parent COMPLETED while children still needed handoff
+    artifacts — it must never fire against a live parent (a decomposition
+    parent that is still ``running`` used to lose its scratch dir the
+    moment the last child went terminal).
     """
     try:
         parents = conn.execute(
@@ -6476,10 +6488,28 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT workspace_kind, workspace_path, status, worker_pid "
+                "FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+                continue
+            parent_status = row["status"] if "status" in row.keys() else None
+            if parent_status not in _TERMINAL_WORKSPACE_CLEANUP_STATUSES:
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: parent is %s, not "
+                    "terminal", parent_id, parent_status,
+                )
+                continue
+            # Belt-and-braces: a terminal status can still race a worker
+            # that is mid-teardown. Fail closed while the recorded PID
+            # is still alive. Stale/NULL PIDs do not block cleanup.
+            worker_pid = row["worker_pid"] if "worker_pid" in row.keys() else None
+            if worker_pid is not None and _pid_alive(worker_pid):
+                _log.debug(
+                    "Deferring parent %s scratch cleanup: recorded worker "
+                    "pid %s is still alive", parent_id, worker_pid,
+                )
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
