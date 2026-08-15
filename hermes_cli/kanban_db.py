@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
 import hashlib
 import json
@@ -6679,6 +6680,39 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
+def _rename_cleanup_noreplace(
+    source: str,
+    target: str,
+    *,
+    source_dir_fd: int,
+    target_dir_fd: int,
+) -> None:
+    """Atomically rename a cleanup entry without replacing another name."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise WorkspaceCleanupIdentityError(
+            "platform lacks renameat2 cleanup primitive"
+        ) from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        source_dir_fd,
+        os.fsencode(source),
+        target_dir_fd,
+        os.fsencode(target),
+        1,  # RENAME_NOREPLACE
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source, target)
+
+
 def _cleanup_dir_open_flags() -> int:
     directory = getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -6765,32 +6799,109 @@ def _bind_workspace_cleanup_identity(
     return cur.rowcount == 1
 
 
-def _empty_cleanup_dir_fd(directory_fd: int) -> None:
-    """Delete descendants through directory fds; never follow a symlink."""
+def _quarantine_cleanup_entry(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> tuple[str, os.stat_result]:
+    """Move one entry to an unpredictable name and prove which inode moved."""
+    for _attempt in range(16):
+        tombstone = f".hermes-entry-{secrets.token_hex(16)}"
+        try:
+            _rename_cleanup_noreplace(
+                name,
+                tombstone,
+                source_dir_fd=directory_fd,
+                target_dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        moved = os.stat(tombstone, dir_fd=directory_fd, follow_symlinks=False)
+        if _same_inode(expected, moved):
+            return tombstone, moved
+
+        # A same-name replacement won the race before rename. Restore that
+        # replacement iff its original slot is still free, and refuse before
+        # mutating either it or the originally observed inode.
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _rename_cleanup_noreplace(
+                tombstone,
+                name,
+                source_dir_fd=directory_fd,
+                target_dir_fd=directory_fd,
+            )
+        raise WorkspaceCleanupIdentityError(
+            f"descendant identity changed before quarantine: {name}"
+        )
+    raise WorkspaceCleanupIdentityError(
+        f"could not reserve a descendant quarantine name: {name}"
+    )
+
+
+def _scrub_cleanup_dir_fd(directory_fd: int) -> None:
+    """Scrub bound descendants while retaining safe, empty tombstones.
+
+    POSIX exposes no conditional unlink/rmdir-by-inode operation. Every entry
+    is therefore first atomically renamed with RENAME_NOREPLACE and its inode
+    checked. Regular-file contents are truncated through the bound fd;
+    directories recurse through bound fds. Names are deliberately retained so
+    there is no final compare-then-unlink/rmdir race that could delete a
+    replacement inserted by another process.
+    """
     flags = _cleanup_dir_open_flags()
     for name in os.listdir(directory_fd):
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(before.st_mode):
-            child_fd = os.open(name, flags, dir_fd=directory_fd)
+        tombstone, moved = _quarantine_cleanup_entry(directory_fd, name, before)
+        if stat.S_ISDIR(moved.st_mode):
+            child_fd = os.open(tombstone, flags, dir_fd=directory_fd)
             try:
                 opened = os.fstat(child_fd)
-                if not _same_inode(before, opened):
+                if not _same_inode(moved, opened):
                     raise WorkspaceCleanupIdentityError(
-                        f"child directory identity changed before open: {name}"
+                        f"child directory identity changed before open: {tombstone}"
                     )
-                _empty_cleanup_dir_fd(child_fd)
+                _scrub_cleanup_dir_fd(child_fd)
                 current = os.stat(
-                    name, dir_fd=directory_fd, follow_symlinks=False,
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False,
                 )
                 if not _same_inode(opened, current):
                     raise WorkspaceCleanupIdentityError(
-                        f"child directory identity changed before removal: {name}"
+                        f"child directory identity changed after scrub: {tombstone}"
                     )
             finally:
                 os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            os.unlink(name, dir_fd=directory_fd)
+        elif stat.S_ISREG(moved.st_mode):
+            if moved.st_nlink != 1:
+                raise WorkspaceCleanupIdentityError(
+                    f"child file has external hard-link custody: {tombstone}"
+                )
+            file_fd = os.open(
+                tombstone,
+                os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(file_fd)
+                if not _same_inode(moved, opened):
+                    raise WorkspaceCleanupIdentityError(
+                        f"child file identity changed before scrub: {tombstone}"
+                    )
+                if opened.st_nlink != 1:
+                    raise WorkspaceCleanupIdentityError(
+                        f"child file gained external hard-link custody: {tombstone}"
+                    )
+                os.ftruncate(file_fd, 0)
+                current = os.stat(
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                if not _same_inode(opened, current):
+                    raise WorkspaceCleanupIdentityError(
+                        f"child file identity changed after scrub: {tombstone}"
+                    )
+            finally:
+                os.close(file_fd)
 
 
 def _secure_empty_cleanup_quarantine(
@@ -6799,7 +6910,7 @@ def _secure_empty_cleanup_quarantine(
     expected_dev: int,
     expected_ino: int,
 ) -> None:
-    """Empty only the inode named by the reservation, retaining its tombstone.
+    """Scrub only the inode named by the reservation, retaining tombstones.
 
     The empty quarantine directory is deliberately retained. POSIX has no
     portable conditional-rmdir-by-open-fd primitive; removing it by pathname
@@ -6812,7 +6923,7 @@ def _secure_empty_cleanup_quarantine(
             raise WorkspaceCleanupIdentityError(
                 "quarantine inode does not match cleanup reservation"
             )
-        _empty_cleanup_dir_fd(directory_fd)
+        _scrub_cleanup_dir_fd(directory_fd)
         named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(opened, named):
             raise WorkspaceCleanupIdentityError(
@@ -6821,6 +6932,41 @@ def _secure_empty_cleanup_quarantine(
     finally:
         os.close(directory_fd)
         os.close(parent_fd)
+
+
+def _workspace_cleanup_custody_reason(
+    *,
+    claim_lock: Optional[str],
+    claim_expires: Optional[int],
+    worker_pid: Optional[int],
+    now: int,
+) -> Optional[str]:
+    """Return why one custody record still forbids local cleanup.
+
+    PID liveness is meaningful only when the claim marker proves the worker is
+    host-local. A remote or structurally unknown marker keeps custody until its
+    lease expires even when that PID is absent (or coincidentally dead) here.
+    A host-local dead PID is the deliberate positive control: it releases
+    custody immediately rather than waiting for a stale lease.
+    """
+    lock = str(claim_lock) if claim_lock is not None else None
+    pid = int(worker_pid) if worker_pid is not None else None
+    lease_active_or_unknown = (
+        claim_expires is None or int(claim_expires) > now
+    )
+    host_local = _claim_lock_is_local(lock)
+
+    if pid is not None and host_local:
+        if _pid_alive(pid):
+            return f"host-local worker pid {pid} is alive"
+        return None
+    if pid is not None and not host_local and lease_active_or_unknown:
+        marker = lock or "<missing>"
+        return f"worker pid {pid} has remote/unknown claim marker {marker}"
+    if lock is not None and lease_active_or_unknown:
+        locality = "host-local" if host_local else "remote/unknown"
+        return f"{locality} claim {lock} is unexpired or has unknown expiry"
+    return None
 
 
 def _process_workspace_cleanup_reservation(
@@ -6850,7 +6996,8 @@ def _process_workspace_cleanup_reservation(
 
     if state == "pending":
         task = conn.execute(
-            "SELECT status, workspace_kind, workspace_path, worker_pid "
+            "SELECT status, workspace_kind, workspace_path, worker_pid, "
+            "claim_lock, claim_expires "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6882,51 +7029,58 @@ def _process_workspace_cleanup_reservation(
                 (
                     run for run in open_runs
                     if run["worker_pid"] is not None
+                    and _claim_lock_is_local(run["claim_lock"])
                     and _pid_alive(int(run["worker_pid"]))
                 ),
                 None,
             )
-            detail = (
-                f"open run {live_run['id']} owns live worker pid "
-                f"{live_run['worker_pid']}"
-                if live_run is not None
-                else "one or more task_runs remain open"
+            remote_run = next(
+                (
+                    run for run in open_runs
+                    if not _claim_lock_is_local(run["claim_lock"])
+                ),
+                None,
             )
+            if live_run is not None:
+                detail = (
+                    f"open run {live_run['id']} owns live host-local worker pid "
+                    f"{live_run['worker_pid']}"
+                )
+            elif remote_run is not None:
+                detail = (
+                    f"open run {remote_run['id']} has remote/unknown claim "
+                    f"{remote_run['claim_lock'] or '<missing>'}"
+                )
+            else:
+                detail = "one or more host-local task_runs remain open"
             _update_workspace_cleanup_reservation(
                 conn, task_id, token, "pending",
                 last_error=f"deferred: {detail}",
             )
             return False
-        captured_pid = row["worker_pid"]
-        current_pid = task["worker_pid"]
-        live_pid = next(
-            (
-                int(pid) for pid in (captured_pid, current_pid)
-                if pid is not None and _pid_alive(int(pid))
-            ),
-            None,
+        now = int(time.time())
+        captured_custody = (
+            row["claim_lock"], row["claim_expires"], row["worker_pid"],
         )
-        if live_pid is not None:
-            _update_workspace_cleanup_reservation(
-                conn, task_id, token, "pending",
-                last_error=f"deferred: worker pid {live_pid} is alive",
+        current_custody = (
+            task["claim_lock"], task["claim_expires"], task["worker_pid"],
+        )
+        custody_records = [captured_custody]
+        if current_custody != captured_custody:
+            custody_records.append(current_custody)
+        for claim_lock, claim_expires, worker_pid in custody_records:
+            reason = _workspace_cleanup_custody_reason(
+                claim_lock=claim_lock,
+                claim_expires=claim_expires,
+                worker_pid=worker_pid,
+                now=now,
             )
-            return False
-        if (
-            captured_pid is None
-            and row["claim_lock"] is not None
-            and (
-                row["claim_expires"] is None
-                or int(row["claim_expires"]) > int(time.time())
-            )
-        ):
-            _update_workspace_cleanup_reservation(
-                conn, task_id, token, "pending",
-                last_error=(
-                    f"deferred: captured claim {row['claim_lock']} is unexpired"
-                ),
-            )
-            return False
+            if reason is not None:
+                _update_workspace_cleanup_reservation(
+                    conn, task_id, token, "pending",
+                    last_error=f"deferred: {reason}",
+                )
+                return False
 
         active_child = conn.execute(
             "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
@@ -7008,11 +7162,11 @@ def _process_workspace_cleanup_reservation(
                         conn, task_id, token, opened,
                     ):
                         return False
-                    os.rename(
+                    _rename_cleanup_noreplace(
                         source.name,
                         quarantine.name,
-                        src_dir_fd=parent_fd,
-                        dst_dir_fd=parent_fd,
+                        source_dir_fd=parent_fd,
+                        target_dir_fd=parent_fd,
                     )
                     renamed = os.stat(
                         quarantine.name,
@@ -7030,11 +7184,11 @@ def _process_workspace_cleanup_reservation(
                                 follow_symlinks=False,
                             )
                         except FileNotFoundError:
-                            os.rename(
+                            _rename_cleanup_noreplace(
                                 quarantine.name,
                                 source.name,
-                                src_dir_fd=parent_fd,
-                                dst_dir_fd=parent_fd,
+                                source_dir_fd=parent_fd,
+                                target_dir_fd=parent_fd,
                             )
                         raise WorkspaceCleanupIdentityError(
                             "source pathname changed during anchored rename"

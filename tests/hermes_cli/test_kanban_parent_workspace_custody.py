@@ -129,7 +129,7 @@ def test_completion_captures_live_worker_before_custody_is_cleared(
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) in live)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="live worker", assignee="worker")
-        assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 424242)
         workspace = _managed_workspace(conn, kanban_home, task_id)
 
@@ -165,7 +165,7 @@ def test_direct_terminal_status_captures_custody_before_run_close(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="manual archive", assignee="worker")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        assert kb.set_status(conn, task_id, "running") is True
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 515151)
         before = kb.get_task(conn, task_id)
         assert before is not None and before.current_run_id is not None
@@ -223,6 +223,84 @@ def test_unexpired_claim_without_pid_defers_until_lease_expires(
     assert not workspace.exists()
 
 
+def test_remote_worker_pid_is_not_probed_or_released_before_lease_expiry(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A brokered remote PID has no meaning in this host's process table."""
+    monkeypatch.setattr(
+        kb,
+        "_pid_alive",
+        lambda _pid: pytest.fail("remote worker PID must not be probed locally"),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="remote worker custody")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        remote_claim = "broker-host:remote-worker-host:424242"
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer=remote_claim,
+            ttl_seconds=3600,
+        ) is not None
+        kb._set_worker_pid(conn, task_id, 424242)
+
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT state, claim_lock, last_error "
+            "FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert reservation["state"] == "pending"
+        assert reservation["claim_lock"] == remote_claim
+        assert "remote/unknown claim marker" in reservation["last_error"]
+        assert workspace.exists()
+
+        conn.execute(
+            "UPDATE workspace_cleanup_reservations SET claim_expires=0 "
+            "WHERE task_id=?",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.recover_workspace_cleanups(conn) == [task_id]
+
+    assert not workspace.exists()
+
+
+def test_host_local_dead_worker_releases_unexpired_cleanup_custody(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control: a proven-local dead PID does not wait for its lease."""
+    probed: list[int] = []
+
+    def dead_local_pid(pid: int) -> bool:
+        probed.append(int(pid))
+        return False
+
+    monkeypatch.setattr(kb, "_pid_alive", dead_local_pid)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dead local worker")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer=kb._claimer_id(),
+            ttl_seconds=3600,
+        ) is not None
+        kb._set_worker_pid(conn, task_id, 424243)
+
+        assert kb.complete_task(conn, task_id, result="done") is True
+        state = conn.execute(
+            "SELECT state FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()["state"]
+
+    assert state == "completed"
+    assert probed == [424243]
+    assert not workspace.exists()
+
+
 def test_cleanup_recovers_crash_after_rename_and_never_retries_success(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -257,7 +335,10 @@ def test_cleanup_recovers_crash_after_rename_and_never_retries_success(
         monkeypatch.setattr(kb, "_update_workspace_cleanup_reservation", original_update)
         assert kb.recover_workspace_cleanups(conn) == [task_id]
         assert quarantine.is_dir()
-        assert list(quarantine.iterdir()) == []
+        tombstones = list(quarantine.iterdir())
+        assert len(tombstones) == 1
+        assert tombstones[0].name.startswith(".hermes-entry-")
+        assert tombstones[0].read_bytes() == b""
 
         # Recreating the old pathname after success must never authorize a
         # second delete: recovery consults only pending/renamed generations.
@@ -371,7 +452,7 @@ def test_raw_terminal_transition_defers_to_open_run_custody(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="raw open-run custody")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 424242)
         run_id = kb.get_task(conn, task_id).current_run_id
         assert run_id is not None
@@ -397,7 +478,7 @@ def test_raw_terminal_transition_defers_to_open_run_custody(
             "SELECT last_error FROM workspace_cleanup_reservations WHERE task_id=?",
             (task_id,),
         ).fetchone()["last_error"]
-        assert f"open run {run_id} owns live worker pid 424242" in deferred
+        assert f"open run {run_id} owns live host-local worker pid 424242" in deferred
         assert workspace.exists()
 
         conn.execute(
@@ -421,15 +502,15 @@ def test_cleanup_refuses_same_path_inode_swap_without_deleting_replacement(
         task_id = kb.create_task(conn, title="same-path inode swap")
         workspace = _managed_workspace(conn, kanban_home, task_id)
         original_aside = workspace.parent / f"{workspace.name}.original-aside"
-        real_rename = os.rename
+        real_rename = kb._rename_cleanup_noreplace
         swapped = False
 
         def swap_before_rename(
             src,
             dst,
             *,
-            src_dir_fd=None,
-            dst_dir_fd=None,
+            source_dir_fd,
+            target_dir_fd,
         ):
             nonlocal swapped
             if src == workspace.name and not swapped:
@@ -437,14 +518,14 @@ def test_cleanup_refuses_same_path_inode_swap_without_deleting_replacement(
                 real_rename(
                     src,
                     original_aside.name,
-                    src_dir_fd=src_dir_fd,
-                    dst_dir_fd=dst_dir_fd,
+                    source_dir_fd=source_dir_fd,
+                    target_dir_fd=target_dir_fd,
                 )
-                os.mkdir(src, dir_fd=src_dir_fd)
+                os.mkdir(src, dir_fd=source_dir_fd)
                 replacement_fd = os.open(
                     src,
                     os.O_RDONLY | os.O_DIRECTORY,
-                    dir_fd=src_dir_fd,
+                    dir_fd=source_dir_fd,
                 )
                 try:
                     marker_fd = os.open(
@@ -459,11 +540,11 @@ def test_cleanup_refuses_same_path_inode_swap_without_deleting_replacement(
             return real_rename(
                 src,
                 dst,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                source_dir_fd=source_dir_fd,
+                target_dir_fd=target_dir_fd,
             )
 
-        monkeypatch.setattr(os, "rename", swap_before_rename)
+        monkeypatch.setattr(kb, "_rename_cleanup_noreplace", swap_before_rename)
         assert kb.complete_task(conn, task_id, result="done") is True
         reservation = conn.execute(
             "SELECT state, last_error FROM workspace_cleanup_reservations "
@@ -476,6 +557,150 @@ def test_cleanup_refuses_same_path_inode_swap_without_deleting_replacement(
     assert "pathname changed" in reservation["last_error"]
     assert (workspace / "live-owner.txt").exists()
     assert (original_aside / "custody.txt").read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.parametrize("entry_kind", ("file", "symlink"))
+def test_cleanup_refuses_descendant_swap_and_preserves_replacement(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_kind: str,
+) -> None:
+    """Per-entry quarantine detects file/symlink replacement before mutation."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"descendant {entry_kind} swap")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        entry = workspace / "custody.txt"
+        if entry_kind == "symlink":
+            entry.unlink()
+            entry.symlink_to("original-target")
+        real_rename = kb._rename_cleanup_noreplace
+        swapped = False
+
+        def swap_descendant_before_quarantine(
+            src,
+            dst,
+            *,
+            source_dir_fd,
+            target_dir_fd,
+        ):
+            nonlocal swapped
+            if src == entry.name and not swapped:
+                swapped = True
+                real_rename(
+                    src,
+                    f"{src}.original-aside",
+                    source_dir_fd=source_dir_fd,
+                    target_dir_fd=target_dir_fd,
+                )
+                if entry_kind == "file":
+                    replacement_fd = os.open(
+                        src,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=source_dir_fd,
+                    )
+                    try:
+                        os.write(replacement_fd, b"replacement-marker")
+                    finally:
+                        os.close(replacement_fd)
+                else:
+                    os.symlink(
+                        "replacement-target",
+                        src,
+                        dir_fd=source_dir_fd,
+                    )
+            return real_rename(
+                src,
+                dst,
+                source_dir_fd=source_dir_fd,
+                target_dir_fd=target_dir_fd,
+            )
+
+        monkeypatch.setattr(
+            kb,
+            "_rename_cleanup_noreplace",
+            swap_descendant_before_quarantine,
+        )
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token, state, last_error "
+            "FROM workspace_cleanup_reservations WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+        replacement = quarantine / entry.name
+        original_aside = quarantine / f"{entry.name}.original-aside"
+
+    assert swapped is True
+    assert reservation["state"] == "refused"
+    assert "descendant identity changed" in reservation["last_error"]
+    if entry_kind == "file":
+        assert replacement.read_bytes() == b"replacement-marker"
+        assert original_aside.read_text(encoding="utf-8") == "owned"
+    else:
+        assert replacement.is_symlink()
+        assert os.readlink(replacement) == "replacement-target"
+        assert original_aside.is_symlink()
+        assert os.readlink(original_aside) == "original-target"
+
+
+def test_cleanup_retains_directory_tombstones_instead_of_racy_rmdir(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directory cleanup has no final compare-to-rmdir pathname gap."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="directory tombstone")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        nested = workspace / "nested"
+        nested.mkdir()
+        (nested / "secret.txt").write_text("secret", encoding="utf-8")
+
+        monkeypatch.setattr(
+            os,
+            "rmdir",
+            lambda *_args, **_kwargs: pytest.fail(
+                "cleanup must not rmdir by pathname"
+            ),
+        )
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT token, state FROM workspace_cleanup_reservations "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        quarantine = workspace.parent / f".hermes-cleanup-{reservation['token']}"
+
+    assert reservation["state"] == "completed"
+    assert not workspace.exists()
+    assert quarantine.is_dir()
+    retained_directories = [path for path in quarantine.rglob("*") if path.is_dir()]
+    retained_files = [path for path in quarantine.rglob("*") if path.is_file()]
+    assert retained_directories
+    assert retained_files
+    assert all(path.read_bytes() == b"" for path in retained_files)
+
+
+def test_cleanup_refuses_to_truncate_a_file_with_an_external_hard_link(
+    kanban_home: Path,
+) -> None:
+    """Scrubbing a workspace inode cannot corrupt a hard-linked outside file."""
+    outside = kanban_home / "outside-owner.txt"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="hard-link custody")
+        workspace = _managed_workspace(conn, kanban_home, task_id)
+        os.link(workspace / "custody.txt", outside)
+
+        assert kb.complete_task(conn, task_id, result="done") is True
+        reservation = conn.execute(
+            "SELECT state, last_error FROM workspace_cleanup_reservations "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+
+    assert reservation["state"] == "refused"
+    assert "external hard-link custody" in reservation["last_error"]
+    assert outside.read_text(encoding="utf-8") == "owned"
 
 
 def test_cleanup_refuses_intermediate_symlink_and_normal_path_still_cleans(
@@ -520,7 +745,7 @@ def test_delete_archived_task_returns_false_while_cleanup_is_pending(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="archived delete waits")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 626263)
         assert kb.set_status(conn, task_id, "archived") is True
 
@@ -545,7 +770,7 @@ def test_hard_delete_waits_for_reserved_workspace_cleanup(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="delete waits", assignee="worker")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 626262)
 
         assert kb.delete_task(conn, task_id) is False
@@ -570,7 +795,7 @@ def test_pending_reservation_freezes_path_and_reopen_mutations(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="frozen reservation", assignee="worker")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+        assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
         kb._set_worker_pid(conn, task_id, 737373)
         assert kb.complete_task(conn, task_id, result="done") is True
 
@@ -605,7 +830,7 @@ def test_bounded_recovery_rotates_deferred_rows_without_starvation(
                 conn, title=f"rotation {idx}", assignee="worker",
             )
             workspace = _managed_workspace(conn, kanban_home, task_id)
-            assert kb.claim_task(conn, task_id, claimer="dispatcher") is not None
+            assert kb.claim_task(conn, task_id, claimer=kb._claimer_id()) is not None
             kb._set_worker_pid(conn, task_id, pid)
             assert kb.complete_task(conn, task_id, result="done") is True
             task_ids.append(task_id)
@@ -639,20 +864,27 @@ def test_filesystem_rename_occurs_outside_write_transaction(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="transaction boundary")
         workspace = _managed_workspace(conn, kanban_home, task_id)
-        real_rename = os.rename
+        real_rename = kb._rename_cleanup_noreplace
         observed: list[bool] = []
 
-        def checked_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        def checked_rename(
+            src,
+            dst,
+            *,
+            source_dir_fd,
+            target_dir_fd,
+        ):
             observed.append(conn.in_transaction)
             return real_rename(
                 src,
                 dst,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                source_dir_fd=source_dir_fd,
+                target_dir_fd=target_dir_fd,
             )
 
-        monkeypatch.setattr(os, "rename", checked_rename)
+        monkeypatch.setattr(kb, "_rename_cleanup_noreplace", checked_rename)
         assert kb.complete_task(conn, task_id, result="done") is True
 
-    assert observed == [False]
+    assert len(observed) == 2
+    assert all(in_transaction is False for in_transaction in observed)
     assert not workspace.exists()
