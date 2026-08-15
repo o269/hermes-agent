@@ -473,7 +473,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 
     Regression for the silent-triage gap (PR #62712): kanban_db routes a task
-    to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks for the same cause and
+    to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks, regardless of cause, and
     emits ONLY a `block_loop_detected` event — no `blocked`/`status` event.
     Before `block_loop_detected` joined TERMINAL_KINDS with its own message
     branch, that one transition (the whole point of which is to force human
@@ -506,6 +506,8 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert "TRIAGE" in text
     assert tid in text
     assert "needs credentials" in text
+    assert "blocked 2x across retries" in text
+    assert "same cause" not in text
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:

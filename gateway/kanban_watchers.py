@@ -464,8 +464,8 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         elif kind == "block_loop_detected":
-                            # A task re-blocked for the same cause past the
-                            # recurrence limit and was routed to `triage` for a
+                            # A task re-blocked past the recurrence limit,
+                            # regardless of cause, and was routed to `triage` for a
                             # human decision. This is the ONE transition that
                             # exists to force human attention, yet it emits no
                             # `blocked`/`status` event — so before adding it to
@@ -477,7 +477,7 @@ class GatewayKanbanWatchersMixin:
                                 if ev.payload.get("reason"):
                                     reason = f": {str(ev.payload['reason'])[:160]}"
                                 recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+                            rc = f" (blocked {recurrences}x across retries)" if recurrences else ""
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"

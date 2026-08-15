@@ -1718,8 +1718,8 @@ KANBAN_BLOCK_SCHEMA = {
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "getting unblocked and re-blocked, it is auto-escalated to triage "
+        "even when the reason or block kind changes. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     "parameters": {
