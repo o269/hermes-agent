@@ -220,13 +220,24 @@ Before the exact boundary, or forever without a cutover marker, it deletes nothi
 - local plaintext `rollback/rollback-source-bundle.tar.gz`.
 
 It first fsyncs `SOURCE-BUNDLE-PRUNE-PREPARED.json` with exact member hashes, then
-removes the plaintext members and exclusively creates `SOURCE-BUNDLE-PRUNED.json`.
-Replay recovers from any already-deleted prepared member, so a final-receipt crash is
-idempotent. Replay also revalidates the complete cutover/retention/prepare binding and
-fails closed if either plaintext bundle artifact reappears. It retains encrypted rollback, encrypted restricted/QMD, manifests, QMD,
-producer/retention receipts, and every remote object. Marker/hash tampering, missing
-freshly verified remote custody, non-finite/rolled-back clocks, or missing
-candidate-health confirmation fails closed.
+atomically renames both plaintext authorities into private quarantine while holding
+the candidate write reservation. `SOURCE-BUNDLE-PRUNED.json` is published only while
+that reservation still binds the main database plus every present WAL/SHM/journal
+pathname to the receipt-time namespace. The first reservation is then released and a
+new connection must reopen the actual candidate pathname, acquire a fresh write
+reservation, and reproduce the receipt-bound logical, integrity, foreign-key, FTS,
+survivor, main-path, and complete SQLite namespace proof. Only that fresh proof
+authorizes permanent quarantine deletion. A main/WAL/SHM/journal replacement or
+fresh-open/proof failure restores both plaintext paths byte-for-byte and removes both
+the prepared and pruned authority artifacts.
+
+Replay revalidates the complete cutover/retention/prepare/candidate binding and runs
+the same fresh-open proof before finishing an already receipt-authorized quarantine
+cleanup. It fails closed if either plaintext bundle artifact reappears. It retains
+encrypted rollback, encrypted restricted/QMD, manifests, QMD, producer/retention
+receipts, and every remote object. Marker/hash tampering, missing freshly verified
+remote custody, non-finite/rolled-back clocks, or missing candidate-health
+confirmation fails closed.
 
 ## Rebuild / cutover custody
 

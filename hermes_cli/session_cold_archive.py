@@ -3279,12 +3279,89 @@ def _verify_post_commit_candidate(
     }
 
 
+def _sqlite_namespace_identity(source: Path) -> dict[str, dict[str, Any]]:
+    """Capture every canonical SQLite pathname without following aliases."""
+
+    namespace: dict[str, dict[str, Any]] = {}
+    for suffix in _SIDECAR_SUFFIXES:
+        path = source if not suffix else source.with_name(source.name + suffix)
+        label = "main" if not suffix else suffix.removeprefix("-")
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            namespace[label] = {"present": False}
+            continue
+        except OSError as exc:
+            raise ColdArchiveError(
+                f"could not inspect candidate SQLite namespace path {path}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ColdArchiveError(
+                f"candidate SQLite namespace path is not a regular file: {path}"
+            )
+        _require_current_owner(info, f"candidate SQLite namespace path {path}")
+        if info.st_nlink != 1:
+            raise ColdArchiveError(
+                f"candidate SQLite namespace path has a hardlink alias: {path}"
+            )
+        namespace[label] = {
+            "present": True,
+            "device": info.st_dev,
+            "inode": info.st_ino,
+        }
+    if namespace.get("main", {}).get("present") is not True:
+        raise ColdArchiveError("candidate SQLite main pathname is missing")
+    return namespace
+
+
+def _require_released_prune_namespace(
+    source: Path,
+    retention: dict[str, Any],
+    expected_namespace: dict[str, dict[str, Any]],
+) -> None:
+    """Allow clean sidecar removal, but never a different pathname identity."""
+
+    expected = retention.get("post_commit_candidate")
+    if not isinstance(expected, dict) or expected.get("verified") is not True:
+        raise ColdArchiveError("source-bundle prune lacks candidate binding")
+    namespace = _sqlite_namespace_identity(source)
+    main = namespace["main"]
+    if (
+        str(source) != expected.get("path")
+        or main.get("device") != expected.get("device")
+        or main.get("inode") != expected.get("inode")
+    ):
+        raise ColdArchiveError(
+            "candidate path identity changed before fresh prune verification"
+        )
+    if set(namespace) != set(expected_namespace):
+        raise ColdArchiveError("candidate SQLite namespace receipt is incomplete")
+    for name, current in namespace.items():
+        expected_identity = expected_namespace.get(name)
+        if not isinstance(expected_identity, dict):
+            raise ColdArchiveError("candidate SQLite namespace receipt is invalid")
+        if name == "main":
+            if current != expected_identity:
+                raise ColdArchiveError(
+                    "candidate SQLite main pathname changed after prune receipt"
+                )
+            continue
+        # SQLite may remove a clean WAL/SHM/journal when the prior reservation
+        # closes. A still-present sidecar must be the exact receipt-time inode;
+        # a new sidecar where none existed is never accepted.
+        if current.get("present") is True and current != expected_identity:
+            raise ColdArchiveError(
+                f"candidate SQLite {name} pathname changed after prune receipt"
+            )
+
+
 def _assert_prune_candidate_path_custody(
     conn: sqlite3.Connection,
     source: Path,
     manifest: dict[str, Any],
     retention: dict[str, Any],
-) -> None:
+    expected_namespace: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     """Prove the locked descriptor still owns the receipt-bound pathname."""
 
     if not conn.in_transaction:
@@ -3309,6 +3386,60 @@ def _assert_prune_candidate_path_custody(
         raise ColdArchiveError(
             "candidate path identity changed during source-bundle prune"
         )
+    if _sqlite_namespace_identity(source) != expected_namespace:
+        raise ColdArchiveError(
+            "candidate SQLite namespace changed during source-bundle prune"
+        )
+    logical = _logical_snapshot_sha256(conn)
+    if logical != expected.get("post_logical_sha256"):
+        raise ColdArchiveError(
+            "candidate logical state changed during source-bundle prune"
+        )
+    ids = sorted(str(value) for value in manifest.get("_restricted_selected_ids") or [])
+    if ids and _count_where(
+        conn,
+        f"SELECT COUNT(*) FROM sessions WHERE id IN ({_placeholders(ids)})",
+        ids,
+    ):
+        raise ColdArchiveError(
+            "source-bundle prune candidate still contains selected sessions"
+        )
+    integrity = [
+        str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
+    ]
+    foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if integrity != ["ok"] or foreign_keys:
+        raise ColdArchiveError("source-bundle prune candidate failed integrity checks")
+    fts = _verify_fts_counts(conn, deleted_message_ids=[])
+    survivors = _capture_search_survivor_invariants(conn, [])
+    if survivors != retention.get("survivor_search_invariants"):
+        raise ColdArchiveError(
+            "source-bundle prune candidate survivor/FTS state differs"
+        )
+    proof = {
+        "verified": True,
+        "path": str(source),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "post_logical_sha256": logical,
+        "integrity_check": integrity,
+        "foreign_key_check_rows": len(foreign_keys),
+        "fts_counts": fts,
+        "selected_sessions_remaining": 0,
+        "namespace_reopened_after_commit": True,
+    }
+    if proof != expected:
+        raise ColdArchiveError(
+            "fresh prune candidate proof differs from the retention receipt"
+        )
+    if _sqlite_namespace_identity(source) != expected_namespace:
+        raise ColdArchiveError(
+            "candidate SQLite namespace changed during source-bundle prune proof"
+        )
+    return {
+        "candidate_binding": proof,
+        "sqlite_namespace": expected_namespace,
+    }
 
 
 @contextmanager
@@ -3316,9 +3447,15 @@ def _hold_prune_candidate_custody(
     source: Path,
     manifest: dict[str, Any],
     retention: dict[str, Any],
-) -> Iterator[Callable[[], None]]:
+    *,
+    expected_released_namespace: dict[str, dict[str, Any]] | None = None,
+) -> Iterator[Callable[[], dict[str, Any]]]:
     """Hold one SQLite write reservation and pathname proof through prune."""
 
+    if expected_released_namespace is not None:
+        _require_released_prune_namespace(
+            source, retention, expected_released_namespace
+        )
     conn = _connect_candidate(source)
     try:
         try:
@@ -3328,22 +3465,21 @@ def _hold_prune_candidate_custody(
                 "could not reserve candidate writes for source-bundle prune"
             ) from exc
 
-        def assert_bound() -> None:
-            _assert_prune_candidate_path_custody(conn, source, manifest, retention)
+        expected_namespace = _sqlite_namespace_identity(source)
+
+        def assert_bound() -> dict[str, Any]:
+            return _assert_prune_candidate_path_custody(
+                conn,
+                source,
+                manifest,
+                retention,
+                expected_namespace,
+            )
 
         assert_bound()
-        expected = retention.get("post_commit_candidate")
-        if _logical_snapshot_sha256(conn) != expected.get("post_logical_sha256"):
-            raise ColdArchiveError(
-                "candidate logical state changed before source-bundle prune"
-            )
         try:
             yield assert_bound
             assert_bound()
-            if _logical_snapshot_sha256(conn) != expected.get("post_logical_sha256"):
-                raise ColdArchiveError(
-                    "candidate logical state changed during source-bundle prune"
-                )
         finally:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -4128,7 +4264,7 @@ def _stage_prune_plaintext(
     stage: StageArtifacts,
     prepared: dict[str, Any],
     *,
-    assert_candidate_bound: Callable[[], None],
+    assert_candidate_bound: Callable[[], Any],
 ) -> list[str]:
     """Atomically quarantine both plaintext authorities for reversible prune."""
 
@@ -4321,6 +4457,9 @@ def prune_source_bundle_after_retention(
             != sha256_path(stage.source_bundle_prune_prepared_path)
             or existing_pruned.get("remote_authority")
             != producer.get("remote_authority")
+            or existing_pruned.get("candidate_binding")
+            != retention_state.get("post_commit_candidate")
+            or not isinstance(existing_pruned.get("candidate_sqlite_namespace"), dict)
             or prepared.get("operation") != "hermes-source-bundle-prune-prepared"
             or prepared.get("rollback_bundle_sha256") != bundle_sha
             or prepared.get("cutover_marker_sha256") != approved_cutover_marker_sha256
@@ -4331,6 +4470,37 @@ def prune_source_bundle_after_retention(
         ).exists() or stage.rollback_bundle_path.exists():
             raise ColdArchiveError("plaintext source bundle reappeared after prune")
         _require_private_file(stage.rollback_encrypted_path)
+        try:
+            with _hold_prune_candidate_custody(
+                source,
+                manifest,
+                retention_state,
+                expected_released_namespace=existing_pruned[
+                    "candidate_sqlite_namespace"
+                ],
+            ) as assert_candidate_bound:
+                if assert_candidate_bound().get(
+                    "candidate_binding"
+                ) != existing_pruned.get("candidate_binding"):
+                    raise ColdArchiveError(
+                        "fresh prune replay proof differs from the prune receipt"
+                    )
+        except BaseException as failure:
+            recovery_failures: list[str] = []
+            try:
+                _restore_prune_plaintext(stage, prepared)
+            except BaseException as exc:
+                recovery_failures.append(f"plaintext restore failed: {exc}")
+            try:
+                _remove_prune_authority_artifacts(stage)
+            except BaseException as exc:
+                recovery_failures.append(f"authority cleanup failed: {exc}")
+            if recovery_failures:
+                raise ColdArchiveError(
+                    f"source-bundle prune replay failed ({failure}); "
+                    + "; ".join(recovery_failures)
+                ) from failure
+            raise
         _permanently_delete_staged_plaintext(stage, prepared)
         return {**existing_pruned, "replayed": True}
     prepared_preexisting = stage.source_bundle_prune_prepared_path.exists()
@@ -4350,6 +4520,7 @@ def prune_source_bundle_after_retention(
                 prepared,
                 assert_candidate_bound=assert_candidate_bound,
             )
+            receipt_candidate_proof = assert_candidate_bound()
             receipt = {
                 "operation": "hermes-source-bundle-pruned",
                 "pruned": True,
@@ -4366,9 +4537,25 @@ def prune_source_bundle_after_retention(
                 "remote_objects_deleted": False,
                 "encrypted_rollback_retained": stage.rollback_encrypted_path.exists(),
                 "remote_authority": producer.get("remote_authority"),
+                "candidate_binding": receipt_candidate_proof["candidate_binding"],
+                "candidate_sqlite_namespace": receipt_candidate_proof[
+                    "sqlite_namespace"
+                ],
             }
             _exclusive_write_json(stage.source_bundle_pruned_path, receipt)
             assert_candidate_bound()
+        with _hold_prune_candidate_custody(
+            source,
+            manifest,
+            retention_state,
+            expected_released_namespace=receipt["candidate_sqlite_namespace"],
+        ) as assert_candidate_bound:
+            if assert_candidate_bound().get("candidate_binding") != receipt.get(
+                "candidate_binding"
+            ):
+                raise ColdArchiveError(
+                    "fresh prune candidate proof differs from the prune receipt"
+                )
     except BaseException as failure:
         if prepared is None:
             if not prepared_preexisting and _path_lexists(
