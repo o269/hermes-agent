@@ -3466,6 +3466,13 @@ def _hold_prune_candidate_custody(
             ) from exc
 
         expected_namespace = _sqlite_namespace_identity(source)
+        if (
+            expected_released_namespace is not None
+            and expected_namespace != expected_released_namespace
+        ):
+            raise ColdArchiveError(
+                "candidate SQLite namespace changed before fresh prune verification"
+            )
 
         def assert_bound() -> dict[str, Any]:
             return _assert_prune_candidate_path_custody(

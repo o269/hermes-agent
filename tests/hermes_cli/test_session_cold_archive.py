@@ -3321,6 +3321,103 @@ def test_prune_receipt_wal_shm_replacement_restores_plaintext_and_authority(
     assert not (rollback / ".rollback-source-bundle.tar.gz.prune-quarantine").exists()
 
 
+def test_prune_release_to_reopen_sidecar_swap_restores_plaintext_and_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "candidate.db"
+    db = _build_archive_candidate(db_path)
+    try:
+        _make_session(db, "eligible", days_ago=90, content="must-survive")
+    finally:
+        db.close()
+    fake = FakeRclone()
+    stage, _recipient, config, producer = _producer(tmp_path, db_path, fake)
+    _apply(db_path, stage, config, producer, fake)
+    cutover = NOW + DAY
+    cold.record_candidate_cutover(
+        stage,
+        candidate_health_confirmed=True,
+        rclone_config=config,
+        rclone_runner=fake,
+        now=cutover,
+    )
+    rollback = stage / "rollback"
+    marker_sha = _sha(rollback / "CANDIDATE-CUTOVER.json")
+    bundle = rollback / "rollback-source-bundle.tar.gz"
+    source_bundle = rollback / "source-bundle"
+    bundle_before = (bundle.stat().st_dev, bundle.stat().st_ino, _sha(bundle))
+    source_bundle_before = (
+        source_bundle.stat().st_dev,
+        source_bundle.stat().st_ino,
+    )
+    members_before = {
+        child.name: (child.stat().st_dev, child.stat().st_ino, _sha(child))
+        for child in source_bundle.iterdir()
+    }
+    original_write = cold._exclusive_write_json
+    original_connect = cold._connect_candidate
+    receipt_written = False
+    replaced: list[str] = []
+
+    def publish_pruned(path: Path, payload: dict[str, Any]) -> Path:
+        nonlocal receipt_written
+        result = original_write(path, payload)
+        if path.name == "SOURCE-BUNDLE-PRUNED.json":
+            receipt_written = True
+        return result
+
+    def replace_sidecars_before_fresh_open(path: Path) -> sqlite3.Connection:
+        if receipt_written and not replaced:
+            attacker = sqlite3.connect(str(db_path), isolation_level=None)
+            try:
+                attacker.execute("PRAGMA journal_mode=WAL")
+                attacker.execute("BEGIN IMMEDIATE")
+                attacker.execute("ROLLBACK")
+                sidecar_bytes = {
+                    suffix: db_path.with_name(db_path.name + suffix).read_bytes()
+                    for suffix in ("-wal", "-shm")
+                }
+            finally:
+                attacker.close()
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path.with_name(db_path.name + suffix)
+                replacement = tmp_path / f"release-gap-conflicting{suffix}"
+                replacement.write_bytes(sidecar_bytes[suffix])
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, sidecar)
+                replaced.append(suffix)
+        return original_connect(path)
+
+    monkeypatch.setattr(cold, "_exclusive_write_json", publish_pruned)
+    monkeypatch.setattr(cold, "_connect_candidate", replace_sidecars_before_fresh_open)
+    with pytest.raises(
+        ColdArchiveError,
+        match="SQLite namespace changed before fresh prune verification",
+    ):
+        cold.prune_source_bundle_after_retention(
+            stage,
+            candidate_health_confirmed=True,
+            approved_cutover_marker_sha256=marker_sha,
+            rclone_config=config,
+            rclone_runner=fake,
+            now=cutover + cold.DEFAULT_SOURCE_BUNDLE_RETENTION_SECONDS,
+        )
+
+    assert replaced == ["-wal", "-shm"]
+    assert (bundle.stat().st_dev, bundle.stat().st_ino, _sha(bundle)) == bundle_before
+    assert (source_bundle.stat().st_dev, source_bundle.stat().st_ino) == (
+        source_bundle_before
+    )
+    assert {
+        child.name: (child.stat().st_dev, child.stat().st_ino, _sha(child))
+        for child in source_bundle.iterdir()
+    } == members_before
+    assert not (rollback / "SOURCE-BUNDLE-PRUNE-PREPARED.json").exists()
+    assert not (rollback / "SOURCE-BUNDLE-PRUNED.json").exists()
+    assert not (rollback / ".source-bundle.prune-quarantine").exists()
+    assert not (rollback / ".rollback-source-bundle.tar.gz.prune-quarantine").exists()
+
+
 def test_prune_receipt_noop_namespace_hook_reopens_then_deletes_plaintext(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
