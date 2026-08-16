@@ -12300,6 +12300,173 @@ def main():
         help="JSON report path (defaults to <output>.recovery.json)",
     )
 
+    sessions_cold_archive = sessions_subparsers.add_parser(
+        "cold-archive",
+        help="Stage a lineage-safe offline cold archive manifest/export pass",
+        description=(
+            "Purpose-built state.db cold archival. Refuses the active profile "
+            "database, same-filesystem candidates, and every named-profile inode "
+            "alias. Canonical board liveness is required and rechecked under a "
+            "writer reservation through candidate commit. Producer mode requires "
+            "a new stage and creates encrypted rollback/restricted packets with "
+            "offsite readback. Apply mode loads externally frozen manifest and "
+            "producer-receipt bytes, re-verifies custody, and checks every invariant before "
+            "COMMIT. It never runs VACUUM, optimize, checkpoint, auto-prune, or "
+            "live maintenance actions."
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Offline recovered candidate state.db; active ~/.hermes/state.db is refused",
+    )
+    sessions_cold_archive.add_argument(
+        "--board-db",
+        type=Path,
+        required=True,
+        help=(
+            "The fixed authoritative fleet board at "
+            "/var/lib/boardd/fleet/kanban.db; substitutes and changed "
+            "path/device/inode/projection state fail closed"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--stage-root",
+        type=Path,
+        required=True,
+        help=(
+            "Producer: a nonexistent restricted stage; apply: the existing approved stage"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Only write the Gate-B manifest and restricted ID files; no export/upload/delete",
+    )
+    sessions_cold_archive.add_argument(
+        "--apply-retention",
+        action="store_true",
+        help="Load an existing externally approved stage and retain only its reviewed set",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-manifest",
+        type=Path,
+        help="Externally frozen copy of GATE-B-MANIFEST.json for apply",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-manifest-sha256",
+        help="Exact SHA-256 of the approved manifest file bytes (required for apply)",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt",
+        type=Path,
+        help="Externally frozen copy of COLD-ARCHIVE-PRODUCER-RECEIPT.json",
+    )
+    sessions_cold_archive.add_argument(
+        "--approved-producer-receipt-sha256",
+        help="Exact SHA-256 of the externally approved producer receipt bytes",
+    )
+    sessions_cold_archive.add_argument(
+        "--hot-days",
+        type=float,
+        default=30.0,
+        help=(
+            "Hot searchable window in days (default: 30); hot + archive grace "
+            "must be at least 37"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--archive-grace-days",
+        type=float,
+        default=7.0,
+        help=(
+            "Archived reversible grace window in days (default: 7); hot + archive "
+            "grace must be at least 37"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--no-default-holds",
+        action="store_true",
+        help="Do not apply the built-in customer/ops platform-source permanent holds",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-source",
+        action="append",
+        default=[],
+        help="Additional session source to hold permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-title-regex",
+        action="append",
+        default=[],
+        help="Regex matching titles that must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-cwd-prefix",
+        action="append",
+        default=[],
+        help="CWD prefix whose sessions must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-remote",
+        help="Bounded encrypted-offsite remote root, e.g. gdrive:vps-offload/hermes-state",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-config",
+        type=Path,
+        help=(
+            "Dedicated current-user mode-0600 unaliased rclone config; its "
+            "backend/root and exact config fingerprint bind every later phase"
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--remote-namespace",
+        help="Remote namespace below --rclone-remote (default: manifest hash namespace)",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-recipient-file",
+        type=Path,
+        help="Public age recipient for opaque rollback and restricted/QMD packets",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-exe",
+        default="age",
+        help="age executable name/path (default: age)",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-exe",
+        default="rclone",
+        help="rclone executable name/path (default: rclone)",
+    )
+
+    sessions_cold_cutover = sessions_subparsers.add_parser(
+        "cold-archive-mark-cutover",
+        help="Record the successful candidate cutover clock for 14-day source retention",
+    )
+    sessions_cold_cutover.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_cutover.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate is healthy before starting the 14-day clock",
+    )
+    sessions_cold_cutover.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_cutover.add_argument("--rclone-exe", default="rclone")
+
+    sessions_cold_prune = sessions_subparsers.add_parser(
+        "cold-archive-prune-bundle",
+        help="Prune local plaintext source bundle only after cutover plus 14 days",
+    )
+    sessions_cold_prune.add_argument("--stage-root", type=Path, required=True)
+    sessions_cold_prune.add_argument(
+        "--candidate-health-confirmed",
+        action="store_true",
+        help="Confirm the cutover candidate remains healthy before local plaintext prune",
+    )
+    sessions_cold_prune.add_argument("--approved-cutover-marker-sha256", required=True)
+    sessions_cold_prune.add_argument("--rclone-config", type=Path, required=True)
+    sessions_cold_prune.add_argument("--rclone-exe", default="rclone")
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
