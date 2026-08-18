@@ -3,7 +3,7 @@
 **CARD:** `t_bde08683` (supplement to receipt `docs/receipts/t_bde08683-quiesce-runbook.md`)
 **Shape:** receipt supplement (documentation-only correction; plan only)
 **Captured:** 2026-08-18T07:37Z (00:37 PDT) on `blitz-vps`
-**Status:** PLAN — not executed. No timer, service, unit file, cron job, process, board row, or source file was changed by this supplement. Every operational command quoted below or in the parent runbook remains **OPERATOR_ONLY_NOT_AUTHORIZED** and was not run.
+**Status:** PLAN — not executed. No timer, service, unit file, cron job, process, board row, or operational source file was changed by this supplement. Every operational command quoted below or in the parent runbook remains **OPERATOR_ONLY_NOT_AUTHORIZED** and was not run.
 
 ## 0. Why this supplement exists instead of an edit
 
@@ -13,8 +13,11 @@ The parent runbook is a landed receipt (merged in #79, merge commit
 point-in-time capture records and are immutable by convention, demonstrated by
 positive controls:
 
-- hermes-agent `docs/receipts/`: exactly one receipt, exactly one commit (its
-  landing), zero amendments.
+- hermes-agent `docs/receipts/` at the pre-supplement base (frozen main
+  `2fb79069d1991433d1c8f713ce3c5fc83e6d41c4`): exactly one receipt, exactly
+  one commit (its landing), zero amendments. The reviewed PR tree adds this
+  supplement, so it contains two receipts: the immutable parent (blob
+  unchanged) and this supplement.
 - o269/omnia `docs/receipts/` at main `42fbd63f97fb32f8c356b7ccc7841241dedf4612`:
   23/23 receipts each touched by exactly one commit (landing only); zero
   deletions or renames in history; the one correction on record
@@ -143,7 +146,7 @@ DONE REPORT
 CARD: t_bde08683
 STATUS: receipt supplement (plan only; nothing executed)
 BRANCH: kimi-k3/p11-d45-runbook-refresh
-HEAD: (filled at PR open)
+HEAD: not self-recorded. This file cannot embed the exact PR head SHA, because that SHA is computed over the tree that contains this file; embedding it would self-invalidate. The exact reviewed head commit and tree are frozen externally in Fable's exact-head review and in the lane report published to the fleet bus alongside this change.
 FILES: docs/receipts/t_bde08683-quiesce-runbook-supplement-1.md
 CHECKS: documentation/static only. Frozen main re-read (2fb79069, tree 17d989d3); PR #79 re-read (MERGED, head fa69b4dc); parent blob sha 68bfab8f unchanged; renderer rg probes re-run (render-tiles=0, stamp=1, sessions=4, receipts=2, gates=1, landqueue=4, rescues=2); RENDERERS list re-read (10 entries); lane-health --reap argument + reap loop re-read; crontab lane-health line re-read. No operational command from the runbook executed.
 SCOPE-FENCE: one new documentation file. Parent receipt not edited. No unit, timer, cron, process, board row, ledger, or secret changed.
