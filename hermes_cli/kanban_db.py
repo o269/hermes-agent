@@ -8721,6 +8721,23 @@ def list_decomposition_eligible_triage_ids(
     ]
 
 
+def _enforce_decomposition_fanout_cap(task_id: str, children: list[dict]) -> None:
+    """Reject a decomposition graph that exceeds the hard child cap."""
+    if len(children) <= MAX_DECOMPOSITION_CHILDREN:
+        return
+    _log.warning(
+        "kanban decomposition blocked task_id=%s reason=fanout_cap "
+        "requested_children=%d max_children=%d",
+        task_id,
+        len(children),
+        MAX_DECOMPOSITION_CHILDREN,
+    )
+    raise ValueError(
+        f"decomposition fan-out {len(children)} exceeds hard cap "
+        f"{MAX_DECOMPOSITION_CHILDREN}"
+    )
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8769,18 +8786,7 @@ def decompose_triage_task(
         return repeated
     if not children:
         return None
-    if len(children) > MAX_DECOMPOSITION_CHILDREN:
-        _log.warning(
-            "kanban decomposition blocked task_id=%s reason=fanout_cap "
-            "requested_children=%d max_children=%d",
-            task_id,
-            len(children),
-            MAX_DECOMPOSITION_CHILDREN,
-        )
-        raise ValueError(
-            f"decomposition fan-out {len(children)} exceeds hard cap "
-            f"{MAX_DECOMPOSITION_CHILDREN}"
-        )
+    _enforce_decomposition_fanout_cap(task_id, children)
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
