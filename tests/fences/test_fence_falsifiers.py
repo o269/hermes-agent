@@ -573,6 +573,201 @@ def _mnf_distinct_scopes_emit_no_receipt() -> None:
 
 
 # ---------------------------------------------------------------------------
+# FENCES: kanban.decompose.*  (PR #76)
+# ---------------------------------------------------------------------------
+
+
+def _decompose_graph(
+    conn: sqlite3.Connection,
+    task_id: str,
+    children: list[dict],
+    *,
+    key: str,
+) -> list[str] | None:
+    return kb.decompose_triage_task(
+        conn,
+        task_id,
+        root_assignee="orchestrator",
+        children=children,
+        idempotency_key=key,
+        author="fence-falsifier",
+    )
+
+
+def _ablate_decomposition_fanout_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove only the >15 enforcement; leave the published cap intact."""
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._enforce_decomposition_fanout_cap",
+        lambda _task_id, _children: None,
+    )
+
+
+def _mf_sixteen_child_graph_is_rejected_atomically() -> None:
+    assert kb.MAX_DECOMPOSITION_CHILDREN == 15
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="oversized fence graph", triage=True)
+        children = [
+            {"title": f"oversized child {index}", "assignee": "worker"}
+            for index in range(kb.MAX_DECOMPOSITION_CHILDREN + 1)
+        ]
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        rejected = False
+        rejection = ""
+        try:
+            _decompose_graph(conn, root, children, key="fence:fanout:oversized")
+        except ValueError as exc:
+            rejected = True
+            rejection = str(exc)
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        root_task = kb.get_task(conn, root)
+
+    assert kb.MAX_DECOMPOSITION_CHILDREN == 15, "ablation removed the constant"
+    assert rejected, "a 16-child decomposition bypassed the hard cap"
+    assert "exceeds hard cap 15" in rejection
+    assert after == before, f"rejected graph minted {after - before} task rows"
+    assert root_task is not None and root_task.status == "triage"
+
+
+def _mnf_graph_at_fifteen_child_cap_decomposes() -> None:
+    assert kb.MAX_DECOMPOSITION_CHILDREN == 15
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="at-cap fence graph", triage=True)
+        children = [
+            {"title": f"at-cap child {index}", "assignee": "worker"}
+            for index in range(kb.MAX_DECOMPOSITION_CHILDREN)
+        ]
+        child_ids = _decompose_graph(conn, root, children, key="fence:fanout:at-cap")
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert child_ids is not None
+    assert len(child_ids) == kb.MAX_DECOMPOSITION_CHILDREN
+    assert task_count == kb.MAX_DECOMPOSITION_CHILDREN + 1
+
+
+def _ablate_live_parent_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._live_parent_chain",
+        lambda _conn, _task_id: [],
+    )
+
+
+def _mf_live_ancestor_blocks_decomposition_without_minting() -> None:
+    with kb.connect() as conn:
+        ancestor = kb.create_task(conn, title="live fence ancestor")
+        parent = kb.create_task(
+            conn,
+            title="live fence parent",
+            parents=[ancestor],
+        )
+        root = kb.create_task(
+            conn,
+            title="live-chain guarded root",
+            parents=[parent],
+            triage=True,
+        )
+        eligible = kb.list_decomposition_eligible_triage_ids(conn)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        result = _decompose_graph(
+            conn,
+            root,
+            [{"title": "must not be minted", "assignee": "worker"}],
+            key="fence:live-parent:blocked",
+        )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert root not in eligible, "a root below a live ancestor was listed as eligible"
+    assert result is None, f"a root below a live ancestor decomposed into {result}"
+    assert after == before, f"blocked decomposition minted {after - before} task rows"
+
+
+def _mnf_terminal_ancestor_chain_still_decomposes() -> None:
+    with kb.connect() as conn:
+        ancestor = kb.create_task(conn, title="done fence ancestor")
+        assert kb.complete_task(conn, ancestor)
+        parent = kb.create_task(
+            conn,
+            title="archived fence parent",
+            parents=[ancestor],
+        )
+        assert kb.archive_task(conn, parent)
+        root = kb.create_task(
+            conn,
+            title="terminal-chain eligible root",
+            parents=[parent],
+            triage=True,
+        )
+        assert root in kb.list_decomposition_eligible_triage_ids(conn)
+        child_ids = _decompose_graph(
+            conn,
+            root,
+            [{"title": "legitimate child", "assignee": "worker"}],
+            key="fence:live-parent:terminal-chain",
+        )
+
+    assert child_ids is not None and len(child_ids) == 1
+
+
+def _ablate_decomposition_idempotency(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.decomposition_result_for_key",
+        lambda _conn, _task_id, _key: None,
+    )
+
+
+def _mf_same_decomposition_key_returns_original_ids() -> None:
+    key = "fence:idempotency:stable-retry"
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="retry-deterministic root", triage=True)
+        first = _decompose_graph(
+            conn,
+            root,
+            [
+                {"title": "original child one", "assignee": "worker"},
+                {"title": "original child two", "assignee": "worker"},
+            ],
+            key=key,
+        )
+        assert first is not None
+        count_after_first = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        second = _decompose_graph(
+            conn,
+            root,
+            [{"title": "replacement child", "assignee": "worker"}],
+            key=key,
+        )
+        count_after_retry = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert second == first, (
+        f"same-key retry returned {second!r}, not original child ids {first!r}"
+    )
+    assert count_after_retry == count_after_first
+
+
+def _mnf_different_key_on_eligible_root_decomposes() -> None:
+    with kb.connect() as conn:
+        first_root = kb.create_task(conn, title="first keyed root", triage=True)
+        first = _decompose_graph(
+            conn,
+            first_root,
+            [{"title": "first keyed child", "assignee": "worker"}],
+            key="fence:idempotency:first",
+        )
+        assert first is not None
+
+        eligible_root = kb.create_task(conn, title="different keyed root", triage=True)
+        assert eligible_root in kb.list_decomposition_eligible_triage_ids(conn)
+        second = _decompose_graph(
+            conn,
+            eligible_root,
+            [{"title": "different keyed child", "assignee": "worker"}],
+            key="fence:idempotency:different",
+        )
+
+    assert second is not None and len(second) == 1
+    assert second != first
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -969,6 +1164,79 @@ FENCES: tuple[FenceSpec, ...] = (
         must_not_fire={
             "legitimate_creates_emit_no_receipt": _mnf_legitimate_creates_emit_no_receipt,
             "distinct_scopes_emit_no_receipt": _mnf_distinct_scopes_emit_no_receipt,
+        },
+    ),
+    FenceSpec(
+        fence_id="kanban.decompose.fanout_cap",
+        origin="PR #76",
+        mechanism=(
+            "decompose_triage_task() calls _enforce_decomposition_fanout_cap(), "
+            "which rejects more than MAX_DECOMPOSITION_CHILDREN (15) before "
+            "the write transaction can mint rows."
+        ),
+        ablation=Ablation(
+            describes="the >15 enforcement is removed while the cap constant stays 15",
+            targets=(
+                "hermes_cli.kanban_db._enforce_decomposition_fanout_cap",
+            ),
+            apply=_ablate_decomposition_fanout_cap,
+        ),
+        must_fire={
+            "sixteen_child_graph_is_rejected_atomically": (
+                _mf_sixteen_child_graph_is_rejected_atomically
+            )
+        },
+        must_not_fire={
+            "graph_at_fifteen_child_cap_decomposes": (
+                _mnf_graph_at_fifteen_child_cap_decomposes
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="kanban.decompose.live_parent_chain",
+        origin="PR #76",
+        mechanism=(
+            "_live_parent_chain() feeds decomposition_hold_reason(), while the "
+            "eligible-triage query independently filters has_live_parent_chain; "
+            "both paths keep descendants of live work whole."
+        ),
+        ablation=Ablation(
+            describes="_live_parent_chain() reports no live ancestors",
+            targets=("hermes_cli.kanban_db._live_parent_chain",),
+            apply=_ablate_live_parent_chain,
+        ),
+        must_fire={
+            "live_ancestor_blocks_decomposition_without_minting": (
+                _mf_live_ancestor_blocks_decomposition_without_minting
+            )
+        },
+        must_not_fire={
+            "terminal_ancestor_chain_still_decomposes": (
+                _mnf_terminal_ancestor_chain_still_decomposes
+            )
+        },
+    ),
+    FenceSpec(
+        fence_id="kanban.decompose.idempotency",
+        origin="PR #76",
+        mechanism=(
+            "decomposition_result_for_key() returns the original child-id list "
+            "for a repeated key, preserving deterministic retry results."
+        ),
+        ablation=Ablation(
+            describes="decomposition_result_for_key() always misses prior results",
+            targets=("hermes_cli.kanban_db.decomposition_result_for_key",),
+            apply=_ablate_decomposition_idempotency,
+        ),
+        must_fire={
+            "same_key_returns_original_ids": (
+                _mf_same_decomposition_key_returns_original_ids
+            )
+        },
+        must_not_fire={
+            "different_key_on_eligible_root_decomposes": (
+                _mnf_different_key_on_eligible_root_decomposes
+            )
         },
     ),
     FenceSpec(
