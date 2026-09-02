@@ -1424,61 +1424,92 @@ def _make_acp_agent(provider="copilot-acp", base_url="acp://copilot"):
 
 
 class TestCopilotACPStreamingDecision:
-    """Verify that copilot-acp routes to the non-streaming path.
+    """Verify the ACP streaming decision routes by client capability.
 
-    CopilotACPClient communicates via subprocess stdio and returns a plain
-    SimpleNamespace — not an iterable stream.  The streaming decision logic
-    must detect ACP runtimes and route to _interruptible_api_call instead.
+    Legacy ACP clients return a plain SimpleNamespace — not an iterable
+    stream — and must stay on the non-streaming path.  Streaming-capable
+    ACP clients (``supports_streaming`` truthy) yield one chunk per
+    incremental ``session/update`` notification and take the streaming
+    path.  Mirrors ``_acp_client_supports_streaming`` in
+    ``agent/conversation_loop.py``.
     """
 
     @patch("run_agent.get_tool_definitions", return_value=[])
     @patch("run_agent.check_toolset_requirements", return_value={})
     @patch("agent.copilot_acp_client.CopilotACPClient")
-    def test_provider_name_triggers_non_streaming(
+    def test_legacy_acp_client_triggers_non_streaming(
         self, mock_acp_cls, _mock_check, _mock_tools
     ):
-        """provider='copilot-acp' → non-streaming path."""
+        """provider='copilot-acp' without a streaming-capable client →
+        non-streaming path (the pre-streaming behavior)."""
         mock_acp_cls.return_value = MagicMock()
         agent = _make_acp_agent(provider="copilot-acp", base_url="acp://copilot")
+        # Simulate a legacy client: no supports_streaming advertisement.
+        agent.client = SimpleNamespace()
 
-        with (
-            patch.object(agent, "_interruptible_api_call",
-                         return_value=_valid_acp_response()) as mock_non_stream,
-            patch.object(agent, "_interruptible_streaming_api_call") as mock_stream,
-        ):
-            # Verify the decision logic correctly disables streaming
-            _use_streaming = True
-            if getattr(agent, "_disable_streaming", False):
-                _use_streaming = False
-            elif (
-                agent.provider == "copilot-acp"
-                or str(agent.base_url or "").lower().startswith("acp://copilot")
-                or str(agent.base_url or "").lower().startswith("acp+tcp://")
-            ):
-                _use_streaming = False
+        from agent.conversation_loop import _acp_client_supports_streaming
 
-            assert _use_streaming is False
-            # Call the non-streaming path as the loop would
-            response = mock_non_stream({})
-            mock_stream.assert_not_called()
+        _use_streaming = True
+        if getattr(agent, "_disable_streaming", False):
+            _use_streaming = False
+        elif (
+            agent.provider == "copilot-acp"
+            or str(agent.base_url or "").lower().startswith("acp://copilot")
+            or str(agent.base_url or "").lower().startswith("acp+tcp://")
+        ) and not _acp_client_supports_streaming(agent):
+            _use_streaming = False
+
+        assert _use_streaming is False
+        assert _acp_client_supports_streaming(agent) is False
 
     @patch("run_agent.get_tool_definitions", return_value=[])
     @patch("run_agent.check_toolset_requirements", return_value={})
     @patch("agent.copilot_acp_client.CopilotACPClient")
-    def test_acp_base_url_triggers_non_streaming(
+    def test_streaming_capable_acp_client_streams(
         self, mock_acp_cls, _mock_check, _mock_tools
     ):
-        """base_url='acp://copilot' → non-streaming even without provider name."""
+        """A client advertising ``supports_streaming`` takes the streaming
+        path — incremental session/update chunks keep the UI alive."""
+        mock_acp_cls.return_value = MagicMock()
+        agent = _make_acp_agent(provider="copilot-acp", base_url="acp://copilot")
+        agent.client = SimpleNamespace(supports_streaming=True)
+
+        from agent.conversation_loop import _acp_client_supports_streaming
+
+        _use_streaming = True
+        if getattr(agent, "_disable_streaming", False):
+            _use_streaming = False
+        elif (
+            agent.provider == "copilot-acp"
+            or str(agent.base_url or "").lower().startswith("acp://copilot")
+            or str(agent.base_url or "").lower().startswith("acp+tcp://")
+        ) and not _acp_client_supports_streaming(agent):
+            _use_streaming = False
+
+        assert _use_streaming is True
+        assert _acp_client_supports_streaming(agent) is True
+
+    @patch("run_agent.get_tool_definitions", return_value=[])
+    @patch("run_agent.check_toolset_requirements", return_value={})
+    @patch("agent.copilot_acp_client.CopilotACPClient")
+    def test_acp_base_url_legacy_client_triggers_non_streaming(
+        self, mock_acp_cls, _mock_check, _mock_tools
+    ):
+        """base_url='acp://copilot' with a legacy client → non-streaming
+        even without the provider name."""
         mock_acp_cls.return_value = MagicMock()
         agent = _make_acp_agent(provider="custom", base_url="acp://copilot")
         agent.provider = "custom"
+        agent.client = SimpleNamespace()
+
+        from agent.conversation_loop import _acp_client_supports_streaming
 
         _use_streaming = True
         if (
             agent.provider == "copilot-acp"
             or str(agent.base_url or "").lower().startswith("acp://copilot")
             or str(agent.base_url or "").lower().startswith("acp+tcp://")
-        ):
+        ) and not _acp_client_supports_streaming(agent):
             _use_streaming = False
 
         assert _use_streaming is False

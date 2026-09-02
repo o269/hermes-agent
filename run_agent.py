@@ -5859,9 +5859,31 @@ class AIAgent:
         the owning worker thread's pending ``recv``/``send`` with an EOF or
         ``EPIPE`` so it can unwind and close ``client`` from its own context
         — which is where the FD release belongs.
+
+        Non-httpx clients that manage their own I/O (e.g. an ACP subprocess
+        client) can expose ``abort_active_request()``; when present it is
+        the abort — socket shutdown would be a silent no-op on them and the
+        worker would stay blocked for the subprocess's full timeout.
         """
         if client is None:
             return
+        abort_hook = getattr(client, "abort_active_request", None)
+        if callable(abort_hook):
+            try:
+                abort_hook(reason=reason)
+                logger.info(
+                    "Client-specific abort hook ran (%s) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Client abort hook failed (%s) %s error=%s; falling back to socket shutdown",
+                    reason,
+                    self._client_log_context(),
+                    exc,
+                )
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.

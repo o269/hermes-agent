@@ -231,6 +231,8 @@ hermes chat --provider copilot-acp --model copilot-acp
 # Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
 ```
 
+Streaming is incremental: the ACP subprocess's `session/update` notifications (assistant text and tool-progress) are forwarded to the display as they arrive, so long-running agent work shows live progress instead of appearing all at once when the subprocess finishes. Interrupting the session also interrupts the subprocess.
+
 **Permanent config:**
 ```yaml
 model:

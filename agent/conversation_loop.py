@@ -113,6 +113,33 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _acp_client_supports_streaming(agent: Any) -> bool:
+    """Whether the active ACP client can produce an incremental stream.
+
+    Legacy ACP clients (and any client not yet built) return a plain
+    SimpleNamespace from ``chat.completions.create`` — not an iterable —
+    so the conversation loop must keep them on the non-streaming path.
+    A streaming-capable ACP client advertises it via a truthy
+    ``supports_streaming`` attribute; its ``create(stream=True)`` then
+    yields one chunk per incremental ``session/update`` notification.
+
+    Probed defensively: an agent whose client was never constructed (or
+    was replaced by a test mock — MagicMock auto-creates truthy
+    attributes, and mocks return SimpleNamespace, not stream iterators)
+    simply reports "no capability", restoring the pre-streaming ACP
+    behavior for that session.
+    """
+    try:
+        from unittest.mock import Mock
+
+        client = getattr(agent, "client", None)
+        if client is None or isinstance(client, Mock):
+            return False
+        return bool(getattr(client, "supports_streaming", False))
+    except Exception:
+        return False
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -3360,16 +3387,21 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # An ACP client communicates via subprocess stdio and returns a
-                # plain SimpleNamespace — not an iterable stream.  Keyed on the
-                # `acp://` scheme rather than one vendor, so any ACP client is
-                # excluded.  Mirror the ACP exclusion used for Responses API
-                # upgrade (lines ~1083-1085).
+                # An ACP client communicates via subprocess stdio. Legacy
+                # ACP clients return a plain SimpleNamespace — not an
+                # iterable stream — and must stay on the non-streaming
+                # path. Streaming-capable ACP clients (detected via
+                # ``supports_streaming``) yield one chunk per incremental
+                # ``session/update`` notification, which keeps the UI and
+                # the stale-stream watchdog alive while the subprocess
+                # works. Keyed on the `acp://` scheme rather than one
+                # vendor, so any ACP client is covered. Mirror the ACP
+                # exclusion used for Responses API upgrade (agent_init).
                 elif (
                     agent.provider in {"copilot-acp"}
                     or str(agent.base_url or "").lower().startswith("acp://")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
+                ) and not _acp_client_supports_streaming(agent):
                     _use_streaming = False
                 # MoA streams only when a display/TTS consumer is present to
                 # receive the deltas. MoAChatCompletions.create() honors

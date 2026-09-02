@@ -6,11 +6,16 @@ import io
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import (
+    CopilotACPClient,
+    _scan_acp_stream_text,
+)
 
 
 class _FakeProcess:
@@ -38,8 +43,10 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
                 messages=[{"role": "user", "content": "read README.md"}],
                 stream=True,
             )
-
-        chunks = list(stream)
+            # Consume inside the patch context: streaming is lazy — the
+            # generator drives _run_prompt on first iteration, so deferring
+            # consumption past the with-block would run the REAL subprocess.
+            chunks = list(stream)
         delta = chunks[0].choices[0].delta
         self.assertIsNone(delta.content)
         self.assertEqual(chunks[0].choices[0].finish_reason, "tool_calls")
@@ -54,6 +61,196 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         )
         self.assertEqual(chunks[1].choices, [])
 
+
+class ACPIncrementalStreamingTests(unittest.TestCase):
+    """Real streaming: chunks must arrive DURING the subprocess call.
+
+    The generator drives ``_run_prompt`` on a worker thread and forwards
+    each ``session/update`` notification (via the ``on_update`` hook) as
+    an OpenAI-style delta the moment it arrives — a regression to
+    post-hoc chunking (waiting for the full completion, then slicing it)
+    fails the timing assertions here.
+    """
+
+    def setUp(self) -> None:
+        self.client = CopilotACPClient(acp_cwd="/tmp")
+
+    def _stream(self, run_prompt_fake, **create_kwargs):
+        self.client._run_prompt = run_prompt_fake
+        return self.client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "go"}],
+            stream=True,
+            **create_kwargs,
+        )
+
+    def test_deltas_arrive_before_run_prompt_completes(self):
+        timeline: list[float] = []
+        t0 = time.monotonic()
+
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            for text in ("one ", "two ", "three"):
+                time.sleep(0.05)
+                if on_update:
+                    on_update("agent_message_chunk", text)
+                timeline.append(time.monotonic() - t0)
+            time.sleep(0.3)  # gap AFTER the last notification
+            return "one two three", ""
+
+        gen = self._stream(fake)
+        first_delta_at = None
+        deltas = []
+        for chunk in gen:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is not None and delta.content:
+                if first_delta_at is None:
+                    first_delta_at = time.monotonic() - t0
+                deltas.append(delta.content)
+
+        self.assertEqual(len(deltas), 3)
+        # The first delta must precede the LAST notification by a clear
+        # margin — post-hoc chunking would emit everything only after
+        # fake() returned (>= 0.55s here).
+        assert first_delta_at is not None
+        self.assertLess(first_delta_at, timeline[-1])
+
+    def test_tool_markers_never_stream_as_content(self):
+        marker = (
+            '<tool_call>{"id":"c1","type":"function",'
+            '"function":{"name":"read_file","arguments":"{}"}}</tool_call>'
+        )
+
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            if on_update:
+                on_update("agent_message_chunk", "before ")
+                on_update("agent_message_chunk", marker)
+                on_update("agent_message_chunk", " after")
+            return "before " + marker + " after", ""
+
+        gen = self._stream(fake)
+        streamed = []
+        tool_delta = None
+        finish = None
+        for chunk in gen:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.delta.content:
+                streamed.append(choice.delta.content)
+            if choice.delta.tool_calls:
+                tool_delta = choice.delta.tool_calls[0]
+            if choice.finish_reason:
+                finish = choice.finish_reason
+
+        joined = "".join(streamed)
+        self.assertNotIn("<tool_call>", joined)
+        self.assertNotIn("</tool_call>", joined)
+        self.assertIn("before", joined)
+        self.assertIn("after", joined)
+        self.assertIsNotNone(tool_delta)
+        self.assertEqual(tool_delta.function.name, "read_file")
+        self.assertEqual(finish, "tool_calls")
+
+    def test_thought_chunks_stream_as_reasoning(self):
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            if on_update:
+                on_update("agent_thought_chunk", "[Using tool: Bash]\n")
+            return "done", ""
+
+        gen = self._stream(fake)
+        reasoning = [
+            c.choices[0].delta.reasoning_content
+            for c in gen
+            if c.choices and c.choices[0].delta.reasoning_content
+        ]
+        self.assertEqual(reasoning, ["[Using tool: Bash]\n"])
+
+    def test_early_close_aborts_subprocess(self):
+        aborted = {"v": False}
+        release = threading.Event()
+
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            for i in range(100):
+                if release.wait(timeout=0.05):
+                    break
+                if on_update:
+                    on_update("agent_message_chunk", f"t{i} ")
+            return "done", ""
+
+        def fake_close():
+            aborted["v"] = True
+            release.set()
+
+        self.client._run_prompt = fake
+        self.client.close = fake_close
+        gen = self._stream(fake)
+        seen = 0
+        for _chunk in gen:
+            seen += 1
+            if seen == 2:
+                gen.close()
+                break
+        self.assertTrue(aborted["v"])
+
+    def test_legacy_no_notifications_emits_full_text(self):
+        # A bridge/test double that never calls on_update still yields a
+        # coherent single-shot stream (previous behavior).
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            return "plain final answer", ""
+
+        gen = self._stream(fake)
+        contents = [
+            c.choices[0].delta.content
+            for c in gen
+            if c.choices and c.choices[0].delta.content
+        ]
+        self.assertEqual(contents, ["plain final answer"])
+
+    def test_error_from_run_prompt_propagates(self):
+        def fake(prompt_text, *, timeout_seconds, on_update=None):
+            if on_update:
+                on_update("agent_message_chunk", "partial ")
+            raise RuntimeError("boom")
+
+        gen = self._stream(fake)
+        with self.assertRaises(RuntimeError):
+            list(gen)
+
+
+class ACPStreamTextGateTests(unittest.TestCase):
+    """``_scan_acp_stream_text``: hold incomplete markers, drop complete."""
+
+    def test_plain_text_passes_through(self):
+        emit, carry = _scan_acp_stream_text("", "hello world")
+        self.assertEqual((emit, carry), ("hello world", ""))
+
+    def test_complete_marker_dropped(self):
+        marker = '<tool_call>{"id":"c","type":"function","function":{}}</tool_call>'
+        emit, carry = _scan_acp_stream_text("", "before " + marker + " after")
+        self.assertEqual((emit, carry), ("before  after", ""))
+
+    def test_unclosed_marker_held_back(self):
+        emit, carry = _scan_acp_stream_text("", "text <tool_call>{\"par")
+        self.assertEqual(emit, "text ")
+        self.assertEqual(carry, '<tool_call>{"par')
+
+    def test_marker_completing_in_later_chunk(self):
+        _, carry = _scan_acp_stream_text("", "text <tool_call>{\"par")
+        emit, carry2 = _scan_acp_stream_text(carry, 'tial": 1}</tool_call> tail')
+        self.assertEqual(emit, " tail")
+        self.assertEqual(carry2, "")
+
+    def test_trailing_partial_opener_held(self):
+        emit, carry = _scan_acp_stream_text("", "ending with <tool_c")
+        self.assertEqual(emit, "ending with ")
+        self.assertEqual(carry, "<tool_c")
+
+
+class CopilotACPClientServerMessageTests(unittest.TestCase):
+    """fs/read|write + permission handling on _handle_server_message."""
+
+    def setUp(self) -> None:
+        self.client = CopilotACPClient(acp_cwd="/tmp")
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()

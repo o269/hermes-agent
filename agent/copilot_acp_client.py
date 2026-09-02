@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -22,7 +23,6 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.acp_openai_bridge import (
-    completion_to_stream_chunks as _completion_to_stream_chunks,
     extract_tool_calls_from_text as _extract_tool_calls_from_text,
     render_tool_bridge_sections as _render_tool_bridge_sections,
 )
@@ -32,6 +32,8 @@ from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+
+logger = logging.getLogger(__name__)
 
 # Stderr fingerprint of the deprecated `gh copilot` CLI extension
 # (https://github.blog/changelog/2025-09-25-upcoming-deprecation-of-gh-copilot-cli-extension).
@@ -45,6 +47,42 @@ _DEPRECATION_MARKERS = (
     "has been deprecated",
     "no commands will be executed",
 )
+
+
+def _scan_acp_stream_text(carry: str, text: str) -> tuple[str, str]:
+    """Gate streamed ACP text on complete ``<tool_call>`` markers.
+
+    Returns ``(emit, carry)``: the text safe to stream now, and the tail
+    to hold back because a ``<tool_call>`` marker opened in it but has
+    not closed yet.  Complete markers are DROPPED from the stream — the
+    parsed tool call is delivered by the terminal delta chunk instead,
+    so raw marker JSON never renders as prose and the streamed content
+    matches the marker-stripped text the non-streaming path produces.
+    An unterminated marker at end-of-stream is flushed by the caller as
+    plain text (same as ``extract_tool_calls_from_text`` leaves it in the
+    cleaned text).  A trailing partial opener (mid-emit ``<tool_ca``) is
+    held back so it is not shown before the next chunk completes it.
+    """
+    combined = carry + text
+    opener = "<tool_call>"
+    closer = "</tool_call>"
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = combined.find(opener, pos)
+        if start == -1:
+            break
+        out.append(combined[pos:start])
+        end = combined.find(closer, start)
+        if end == -1:
+            # Unclosed marker: stream what precedes it, hold the marker.
+            return "".join(out), combined[start:]
+        pos = end + len(closer)
+    tail = combined[pos:]
+    for length in range(len(opener) - 1, 2, -1):
+        if tail.endswith(opener[:length]):
+            return "".join(out) + tail[: -length], tail[-length:]
+    return "".join(out) + tail, ""
 
 
 def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
@@ -309,6 +347,10 @@ class CopilotACPClient:
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
+        # Advertises real streaming support (see conversation_loop's
+        # _acp_client_supports_streaming probe): create(stream=True)
+        # yields one chunk per incremental session/update notification.
+        self.supports_streaming = True
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
 
@@ -328,6 +370,19 @@ class CopilotACPClient:
                 proc.kill()
             except Exception:
                 pass
+
+    def abort_active_request(self, *, reason: str = "") -> None:
+        """Cross-thread abort for the in-flight ACP prompt (stranger-safe).
+
+        Called by the agent's interrupt-check / stale-stream watchdog from
+        a non-owning thread when the consumer gave up on the stream. The
+        ACP client has no httpx pool, so the generic socket-shutdown abort
+        is a no-op here; terminating the subprocess is what unblocks the
+        worker thread's reader loop. ``close()`` is already stranger-safe
+        (lock + terminate/kill only, no FD-sensitive cleanup).
+        """
+        logger.debug("ACP abort_active_request (%s)", reason)
+        self.close()
 
     def _create_chat_completion(
         self,
@@ -362,6 +417,19 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
+        if stream:
+            # Real streaming: the generator below yields one chunk per
+            # ``session/update`` notification as the ACP subprocess emits
+            # it, so display/TUI consumers see text and tool progress
+            # WHILE the agent runs — not a post-hoc re-chunking of the
+            # final blob (``_completion_to_stream_chunks``) after the
+            # whole subprocess call has finished.
+            return self._stream_chat_completion(
+                prompt_text=prompt_text,
+                model=model,
+                timeout_seconds=_effective_timeout,
+            )
+
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
@@ -389,11 +457,180 @@ class CopilotACPClient:
             usage=usage,
             model=model or "copilot-acp",
         )
-        if stream:
-            return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _stream_chat_completion(
+        self,
+        *,
+        prompt_text: str,
+        model: str | None,
+        timeout_seconds: float,
+    ):
+        """Real streaming view of one ACP prompt.
+
+        Yields one OpenAI-style delta chunk per ``session/update``
+        notification (``agent_message_chunk`` → content delta,
+        ``agent_thought_chunk`` → reasoning delta) the moment the ACP
+        subprocess emits it, so display/TUI consumers see text and tool
+        progress WHILE the agent runs — not a post-hoc re-chunking of the
+        final blob.  Terminal chunks carry the parsed tool calls and
+        usage, matching the shape ``_call_chat_completions`` in
+        ``agent/chat_completion_helpers.py`` consumes.
+        """
+        return self._iter_acp_stream_chunks(
+            prompt_text=prompt_text,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _iter_acp_stream_chunks(
+        self,
+        *,
+        prompt_text: str,
+        model: str | None,
+        timeout_seconds: float,
+    ):
+        updates: queue.Queue = queue.Queue()
+        result: dict[str, Any] = {"text": None, "reasoning": None, "error": None}
+        done = threading.Event()
+
+        def _on_update(kind: str, text: str) -> None:
+            updates.put((kind, text))
+
+        def _worker() -> None:
+            try:
+                text, reasoning = self._run_prompt(
+                    prompt_text,
+                    timeout_seconds=timeout_seconds,
+                    on_update=_on_update,
+                )
+                result["text"] = text
+                result["reasoning"] = reasoning
+            except BaseException as exc:  # daemon thread: never leak
+                result["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_worker, daemon=True, name="acp-stream-prompt"
+        )
+        worker.start()
+
+        model_name = model or "copilot-acp"
+
+        def _chunk(
+            *,
+            content: str | None = None,
+            reasoning: str | None = None,
+            tool_call_deltas: list[Any] | None = None,
+            finish_reason: str | None = None,
+        ) -> Any:
+            delta = SimpleNamespace(
+                role="assistant",
+                content=content,
+                tool_calls=tool_call_deltas,
+                reasoning_content=reasoning,
+                reasoning=None,
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0, delta=delta, finish_reason=finish_reason
+                    )
+                ],
+                model=model_name,
+                usage=None,
+            )
+
+        streamed_any = False
+        carry = ""
+        try:
+            while True:
+                try:
+                    kind, text = updates.get(timeout=0.2)
+                except queue.Empty:
+                    if done.is_set():
+                        break
+                    continue
+                if kind == "agent_message_chunk":
+                    emit, carry = _scan_acp_stream_text(carry, text)
+                    if emit:
+                        streamed_any = True
+                        yield _chunk(content=emit)
+                elif kind == "agent_thought_chunk":
+                    streamed_any = True
+                    yield _chunk(reasoning=text)
+
+            error = result["error"]
+            if error is not None:
+                raise error
+
+            full_text = str(result["text"] or "")
+            tool_calls, cleaned_text = _extract_tool_calls_from_text(full_text)
+
+            if not streamed_any:
+                # Legacy bridge or test double: no notifications arrived,
+                # so emit the completed response post-hoc (previous
+                # behavior preserved — including marker-stripped content).
+                if tool_calls:
+                    if cleaned_text:
+                        yield _chunk(content=cleaned_text)
+                elif cleaned_text:
+                    yield _chunk(content=cleaned_text)
+
+            if tool_calls:
+                tool_call_deltas = []
+                for index, tool_call in enumerate(tool_calls):
+                    tool_call_deltas.append(
+                        SimpleNamespace(
+                            index=index,
+                            id=getattr(tool_call, "id", None),
+                            type="function",
+                            function=SimpleNamespace(
+                                name=getattr(tool_call.function, "name", None),
+                                arguments=getattr(
+                                    tool_call.function, "arguments", None
+                                ),
+                            ),
+                        )
+                    )
+                yield _chunk(
+                    tool_call_deltas=tool_call_deltas,
+                    finish_reason="tool_calls",
+                )
+            else:
+                # Flush any unterminated marker fragment held by the gate —
+                # extract_tool_calls_from_text leaves incomplete markers in
+                # the cleaned text, so the streamed view must too.
+                if carry:
+                    yield _chunk(content=carry)
+                    carry = ""
+                yield _chunk(finish_reason="stop")
+
+            yield SimpleNamespace(
+                choices=[],
+                model=model_name,
+                usage=SimpleNamespace(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                ),
+            )
+        finally:
+            # Consumer abandoned the stream (interrupt / stale kill /
+            # superseded attempt): tear the subprocess down so the worker
+            # stops instead of running the full ACP timeout orphaned.
+            self.close()
+            worker.join(timeout=2)
+
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        on_update: Any = None,
+    ) -> tuple[str, str]:
         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
         # Without this guard, a CLI like Claude Code v2.x exits with
         # ``error: unknown option '--acp'`` immediately, then the parent
@@ -471,7 +708,14 @@ class CopilotACPClient:
 
         next_id = 0
 
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
+        def _request(
+            method: str,
+            params: dict[str, Any],
+            *,
+            text_parts: list[str] | None = None,
+            reasoning_parts: list[str] | None = None,
+            on_update: Any = None,
+        ) -> Any:
             nonlocal next_id
             next_id += 1
             request_id = next_id
@@ -499,6 +743,7 @@ class CopilotACPClient:
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    on_update=on_update,
                 ):
                     continue
 
@@ -575,6 +820,7 @@ class CopilotACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                on_update=on_update,
             )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
@@ -588,6 +834,7 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        on_update: Any = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -605,6 +852,18 @@ class CopilotACPClient:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+            # Incremental delivery: forward every notification to the
+            # streaming consumer (if any) the moment it arrives, so the
+            # UI shows tokens/tool progress WHILE the subprocess works
+            # instead of after the whole completion returns.
+            if on_update is not None and chunk_text and kind in (
+                "agent_message_chunk",
+                "agent_thought_chunk",
+            ):
+                try:
+                    on_update(kind, chunk_text)
+                except Exception:
+                    pass
             return True
 
         if process.stdin is None:
