@@ -340,6 +340,36 @@ def test_does_not_fire_on_process_referenced_path(tmp_path, now):
     assert result.keeps[0].reason == reaper.KEEP_LIVE_PROCESS
 
 
+def test_process_reference_overlap_is_directional():
+    candidate = Path("/tmp/root/job")
+
+    assert reaper._contains_or_equals(candidate, candidate)
+    assert reaper._contains_or_equals(candidate, candidate / "checkout")
+
+    # A process outside the candidate is not endangered by deleting it. In
+    # particular, common cwd values such as / and /tmp must not pin every
+    # candidate beneath them.
+    for ancestor in (Path("/"), Path("/tmp"), candidate.parent):
+        assert not reaper._contains_or_equals(candidate, ancestor)
+    assert not reaper._contains_or_equals(candidate, Path("/tmp/root/job-other"))
+
+
+def test_ancestor_process_reference_does_not_pin_candidate(tmp_path, now):
+    root = tmp_path / "tmp"
+    root.mkdir()
+    candidate = make_tree(root, "old-workspace", age_seconds=4 * DAY, now=now)
+
+    result = reaper.sweep(
+        root,
+        now=now,
+        tasks=[],
+        process_paths=frozenset({Path("/"), root.resolve()}),
+    )
+
+    assert [decision.path for decision in result.candidates] == [candidate]
+    assert result.keeps == []
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -846,6 +876,26 @@ def test_privileged_scan_parses_the_emitted_payload():
     assert scan is not None
     assert scan.paths == frozenset({Path("/tmp/held")})
     assert scan.complete is True
+
+
+def test_missing_geteuid_keeps_incomplete_holder_sweep_closed(
+    tmp_path, now, monkeypatch
+):
+    root = tmp_path / "tmp"
+    root.mkdir()
+    make_tree(root, "old-workspace", age_seconds=9 * DAY, now=now)
+    incomplete = reaper.HolderScan(frozenset(), (4242,))
+
+    monkeypatch.delattr(reaper.os, "geteuid", raising=False)
+    monkeypatch.setattr(reaper, "process_referenced_paths", lambda: incomplete)
+    monkeypatch.setattr(reaper, "privileged_holder_scan", lambda: None)
+
+    assert reaper.effective_uid() is None
+    result = reaper.sweep(root, now=now, tasks=[], process_paths=None)
+
+    assert result.candidates == []
+    assert result.holder_scan_complete is False
+    assert result.keeps[0].reason == reaper.KEEP_HOLDER_SCAN_INCOMPLETE
 
 
 def test_cli_exits_5_when_holder_scan_incomplete(tmp_path, now):
