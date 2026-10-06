@@ -97,6 +97,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from typing import cast
 
 _log = logging.getLogger("boardd")
@@ -131,7 +132,15 @@ WRITE_CANARY_ALERT_REPEAT_S = float(
     os.environ.get("BOARDD_WRITE_CANARY_ALERT_REPEAT_S", "3600")
 )
 WRITE_CANARY_STALE_LIMIT = 10
+# Legacy v1 reserved namespace. Retained so orphan canary cards minted by
+# earlier releases still validate and reconcile; no new card is minted with it.
 WRITE_CANARY_MARKER = "__hermes_boardd_write_canary_v1__"
+# Per-run unique marker namespace: every canary run mints
+# "__hermes_boardd_write_canary_v2__:<uuid4>:<unix_ts>" as its idempotency key,
+# so reconcile/cleanup can match exactly what THIS boardd created instead of
+# substring-matching the reserved text (an ordinary card that merely quotes
+# the marker in prose — e.g. t_07a873c4 — must never collide or be touched).
+WRITE_CANARY_RUN_MARKER = "__hermes_boardd_write_canary_v2__"
 WRITE_CANARY_TITLE_PREFIX = "[SYSTEM CANARY][DO NOT DISPATCH] boardd write path"
 WRITE_CANARY_CREATED_BY = WRITE_CANARY_MARKER
 WRITE_CANARY_ALERT_FILE = "boardd-HEALTH-ALERT"
@@ -363,20 +372,28 @@ class _BrokerWriteCanaryOps:
         )
 
     def find_active_candidates(self, limit: int) -> list[dict]:
-        key_prefix = f"{WRITE_CANARY_MARKER}:"
+        # Structured-field matching only: exact created_by equality, reserved
+        # idempotency-key prefixes, or the reserved title prefix. Deliberately
+        # NO substring/LIKE scan of title/body for the reserved marker text —
+        # an ordinary card that merely quotes the marker (e.g. t_07a873c4)
+        # must never be discovered as a canary candidate.
+        legacy_key_prefix = f"{WRITE_CANARY_MARKER}:"
+        run_key_prefix = f"{WRITE_CANARY_RUN_MARKER}:"
         rows = self._conn.execute(
             "SELECT id, title, body, status, created_by, idempotency_key, created_at "
             "FROM tasks WHERE status != 'archived' "
             "AND (created_by = ? OR substr(idempotency_key, 1, ?) = ? "
-            "OR substr(title, 1, ?) = ? OR instr(body, ?) > 0) "
+            "OR substr(idempotency_key, 1, ?) = ? "
+            "OR substr(title, 1, ?) = ?) "
             "ORDER BY created_at ASC, id ASC LIMIT ?",
             (
                 WRITE_CANARY_CREATED_BY,
-                len(key_prefix),
-                key_prefix,
+                len(legacy_key_prefix),
+                legacy_key_prefix,
+                len(run_key_prefix),
+                run_key_prefix,
                 len(WRITE_CANARY_TITLE_PREFIX),
                 WRITE_CANARY_TITLE_PREFIX,
-                WRITE_CANARY_MARKER,
                 int(limit),
             ),
         ).fetchall()
@@ -858,40 +875,90 @@ class Broker:
     # ---- functional write-path canary ------------------------------------- #
     @staticmethod
     def _canary_identity(nonce: str | None = None) -> dict:
-        nonce = nonce or f"{_now()}-{secrets.token_hex(8)}"
+        # Unique per-run marker: "__hermes_boardd_write_canary_v2__:<uuid4>:<unix_ts>".
+        # No two runs (and no ordinary card) can hold the same idempotency key,
+        # so reconcile and cleanup can require exact marker equality.
+        nonce = nonce or f"{uuid.uuid4()}:{_now()}"
+        run_marker = f"{WRITE_CANARY_RUN_MARKER}:{nonce}"
         return {
             "nonce": nonce,
-            "title": f"{WRITE_CANARY_TITLE_PREFIX} {nonce}",
+            "title": f"{WRITE_CANARY_TITLE_PREFIX} {run_marker}",
             "body": json.dumps(
                 {
-                    "marker": WRITE_CANARY_MARKER,
+                    "marker": WRITE_CANARY_RUN_MARKER,
                     "nonce": nonce,
                     "purpose": "boardd-write-path-health",
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            "idempotency_key": f"{WRITE_CANARY_MARKER}:{nonce}",
+            "idempotency_key": run_marker,
         }
 
     @staticmethod
+    def _canary_namespace_claim(row: dict) -> tuple[str, str] | None:
+        """(marker, nonce) when the row's idempotency key claims a canary
+        namespace (v2 per-run or legacy v1), else None."""
+        key = row.get("idempotency_key")
+        if not isinstance(key, str):
+            return None
+        for marker in (WRITE_CANARY_RUN_MARKER, WRITE_CANARY_MARKER):
+            prefix = f"{marker}:"
+            if key.startswith(prefix):
+                return marker, key[len(prefix):]
+        return None
+
+    @staticmethod
+    def _claims_canary_namespace(row: dict | None) -> bool:
+        """Structured-field namespace claim — prose mentions do not count.
+
+        A row only participates in canary reconcile/cleanup when it claims the
+        reserved namespace through created_by, its idempotency key, or the
+        reserved title prefix. Ordinary cards that merely quote the reserved
+        marker text in title/body prose (e.g. t_07a873c4) are ignored
+        entirely: never a collision, never archived, never cleaned up.
+        """
+        if not row:
+            return False
+        if row.get("created_by") == WRITE_CANARY_CREATED_BY:
+            return True
+        if Broker._canary_namespace_claim(row) is not None:
+            return True
+        title = row.get("title")
+        return isinstance(title, str) and title.startswith(WRITE_CANARY_TITLE_PREFIX)
+
+    @staticmethod
     def _is_canary_row(row: dict | None, identity: dict | None = None) -> bool:
-        """Require every reserved marker before cleanup can touch a row."""
+        """Require every reserved marker before cleanup can touch a row.
+
+        Accepts the v2 per-run marker set and the legacy v1 marker set, so
+        orphans from earlier releases still reconcile. A row that only
+        mentions the reserved text in prose fails the structured checks.
+        """
         if not row or row.get("created_by") != WRITE_CANARY_CREATED_BY:
             return False
-        key = row.get("idempotency_key")
-        if not isinstance(key, str) or not key.startswith(f"{WRITE_CANARY_MARKER}:"):
+        claim = Broker._canary_namespace_claim(row)
+        if claim is None:
             return False
-        nonce = key.removeprefix(f"{WRITE_CANARY_MARKER}:")
+        marker, nonce = claim
+        if not nonce:
+            return False
+        key = row["idempotency_key"]
+        if marker == WRITE_CANARY_RUN_MARKER:
+            # v2: the idempotency key IS the unique per-run marker, and the
+            # title carries it in full.
+            expected_title = f"{WRITE_CANARY_TITLE_PREFIX} {key}"
+        else:
+            # legacy v1: the title carried only the nonce.
+            expected_title = f"{WRITE_CANARY_TITLE_PREFIX} {nonce}"
         try:
             body = json.loads(row.get("body") or "")
         except (TypeError, ValueError):
             return False
         valid = (
-            bool(nonce)
-            and row.get("title") == f"{WRITE_CANARY_TITLE_PREFIX} {nonce}"
+            row.get("title") == expected_title
             and isinstance(body, dict)
-            and body.get("marker") == WRITE_CANARY_MARKER
+            and body.get("marker") == marker
             and body.get("nonce") == nonce
             and body.get("purpose") == "boardd-write-path-health"
         )
@@ -906,13 +973,14 @@ class Broker:
 
     @staticmethod
     def _canary_identity_from_row(row: dict) -> dict:
-        key = row["idempotency_key"]
+        claim = Broker._canary_namespace_claim(row)
+        nonce = claim[1] if claim is not None else ""
         return {
-            "nonce": key.removeprefix(f"{WRITE_CANARY_MARKER}:"),
+            "nonce": nonce,
             "title": row["title"],
             "body": row["body"],
             "created_by": row["created_by"],
-            "idempotency_key": key,
+            "idempotency_key": row["idempotency_key"],
         }
 
     @staticmethod
@@ -1014,8 +1082,16 @@ class Broker:
         phase = "reconcile-discovery"
         try:
             candidates = ops.find_active_candidates(WRITE_CANARY_STALE_LIMIT + 1)
+            # Only rows that claim the canary namespace through structured
+            # fields participate in reconcile/cleanup. Ordinary cards that
+            # merely quote the reserved marker text are ignored: never a
+            # collision, never archived, never counted against the stale
+            # limit.
+            claimed = [
+                row for row in candidates if self._claims_canary_namespace(row)
+            ]
             collision = next(
-                (row for row in candidates if not self._is_canary_row(row)), None
+                (row for row in claimed if not self._is_canary_row(row)), None
             )
             if collision is not None:
                 raise _CanaryFailure(
@@ -1024,10 +1100,10 @@ class Broker:
                     kind="write-canary-identity-collision",
                     task_id=collision.get("id"),
                 )
-            if len(candidates) > WRITE_CANARY_STALE_LIMIT:
+            if len(claimed) > WRITE_CANARY_STALE_LIMIT:
                 orphan_ids = [
                     str(row["id"])
-                    for row in candidates
+                    for row in claimed
                     if row.get("id")
                 ]
                 raise _CanaryFailure(
@@ -1037,7 +1113,7 @@ class Broker:
                     kind="write-canary-reconcile-limit",
                     orphan_task_ids=orphan_ids,
                 )
-            for row in candidates:
+            for row in claimed:
                 stale_id = row.get("id")
                 stale_identity = self._canary_identity_from_row(row)
                 cleanup_identity = stale_identity

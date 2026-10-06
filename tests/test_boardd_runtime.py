@@ -1275,6 +1275,84 @@ def test_write_canary_refuses_partial_marker_collision(tmp_path: Path, monkeypat
     assert ops.rows["t_real"]["status"] == "blocked"
 
 
+def test_write_canary_ignores_ordinary_card_mentioning_reserved_marker(
+    tmp_path: Path, monkeypatch
+):
+    """Regression for t_07a873c4: an ordinary card whose body/title quotes the
+    reserved marker text as prose must never collide with, or be touched by,
+    the write canary."""
+    broker = _unit_broker(tmp_path)
+    ops = _FakeCanaryOps()
+    ordinary_body = (
+        "Proposal: the reserved namespace "
+        f"{boardd_runtime.WRITE_CANARY_MARKER} must leave the fleet board."
+    )
+    ops.rows["t_ordinary"] = {
+        "id": "t_ordinary",
+        "title": (
+            "[DAM][P0-1][PROPOSAL] Write-canary "
+            f"{boardd_runtime.WRITE_CANARY_MARKER} must leave the fleet board"
+        ),
+        "body": ordinary_body,
+        "status": "blocked",
+        "created_by": "codex1",
+        "idempotency_key": None,
+        "created_at": 1,
+    }
+    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
+
+    result = broker.run_write_canary_once(ops)
+
+    assert result["ok"] is True
+    assert result["reconciled_task_ids"] == []
+    # Only the canary's own card is archived; the ordinary card is untouched.
+    assert ops.archive_calls == [result["task_id"]]
+    ordinary = ops.rows["t_ordinary"]
+    assert ordinary["status"] == "blocked"
+    assert ordinary["title"].startswith("[DAM][P0-1][PROPOSAL]")
+    assert ordinary["body"] == ordinary_body
+    # The new card carries a unique per-run v2 marker.
+    created = ops.rows[result["task_id"]]
+    run_prefix = f"{boardd_runtime.WRITE_CANARY_RUN_MARKER}:"
+    assert created["idempotency_key"].startswith(run_prefix)
+    assert created["title"] == (
+        f"{boardd_runtime.WRITE_CANARY_TITLE_PREFIX} "
+        f"{created['idempotency_key']}"
+    )
+
+
+def test_write_canary_reconciles_legacy_v1_orphan(tmp_path: Path, monkeypatch):
+    """Orphans minted by the legacy v1 marker format still reconcile safely."""
+    broker = _unit_broker(tmp_path)
+    ops = _FakeCanaryOps()
+    legacy_nonce = "1754524800-deadbeefcafebabe"
+    legacy_key = f"{boardd_runtime.WRITE_CANARY_MARKER}:{legacy_nonce}"
+    ops.rows["t_legacy_v1"] = {
+        "id": "t_legacy_v1",
+        "title": f"{boardd_runtime.WRITE_CANARY_TITLE_PREFIX} {legacy_nonce}",
+        "body": json.dumps(
+            {
+                "marker": boardd_runtime.WRITE_CANARY_MARKER,
+                "nonce": legacy_nonce,
+                "purpose": "boardd-write-path-health",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "status": "blocked",
+        "created_by": boardd_runtime.WRITE_CANARY_CREATED_BY,
+        "idempotency_key": legacy_key,
+        "created_at": 1,
+    }
+    monkeypatch.setattr(broker, "_emit_write_canary_event", lambda _event: None)
+
+    result = broker.run_write_canary_once(ops)
+
+    assert result["ok"] is True
+    assert result["reconciled_task_ids"] == ["t_legacy_v1"]
+    assert ops.rows["t_legacy_v1"]["status"] == "archived"
+
+
 def test_write_canary_reconcile_limit_reports_discovered_orphans(
     tmp_path: Path, monkeypatch
 ):
@@ -1425,9 +1503,12 @@ with kb.connect() as conn:
         assert len(rows) == 1
         assert rows[0]["status"] == "archived"
         assert rows[0]["title"].startswith(boardd_runtime.WRITE_CANARY_TITLE_PREFIX)
+        # Unique per-run marker: v2 namespace, and the title carries the full
+        # run marker (the idempotency key) so reconcile matches exactly.
         assert rows[0]["idempotency_key"].startswith(
-            f"{boardd_runtime.WRITE_CANARY_MARKER}:"
+            f"{boardd_runtime.WRITE_CANARY_RUN_MARKER}:"
         )
+        assert rows[0]["title"].endswith(rows[0]["idempotency_key"])
         near_row = client.get_task(near["id"])
         assert near_row["status"] == "blocked"
         assert near_row["body"] == "not a canary"
