@@ -1973,6 +1973,11 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    check_broker_health = getattr(conn, "check_broker_health", None)
+    if check_broker_health is not None:
+        # Verify even when the lock/budget would skip all board reads.
+        check_broker_health()
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -1994,6 +1999,8 @@ def dispatch_once(
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
         result = _locked_tick()
+        if check_broker_health is not None:
+            check_broker_health()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -2005,6 +2012,8 @@ def dispatch_once(
             _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
+    if check_broker_health is not None:
+        check_broker_health()
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
