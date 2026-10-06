@@ -535,9 +535,7 @@ class TestCLI:
     def test_board_flag_rejects_unknown(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         r = _cli(["--board", "ghost", "list"], env_extra=env)
-        # main.py's dispatcher doesn't propagate return codes today, so we
-        # assert the user-visible signal: a stderr error message. Whether
-        # the exit code stays 0 is a separate (pre-existing) issue.
+        assert r.returncode == 1
         assert "does not exist" in r.stderr
 
     def test_board_flag_rejects_empty_board_dir(self, tmp_path):
