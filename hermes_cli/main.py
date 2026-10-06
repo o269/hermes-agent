@@ -15548,12 +15548,17 @@ def main():
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Propagate a subcommand handler's integer return
+    # value so console-script and ``python -m`` launchers exit nonzero when
+    # the handler failed (e.g. ``hermes kanban dispatch`` returning 1).
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, int):
+            return result
+        return None
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
