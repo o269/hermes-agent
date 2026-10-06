@@ -1,6 +1,10 @@
 """Tests for the hermes_cli models module."""
 
+import socket
+import urllib.request
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
@@ -58,6 +62,48 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    # Fixed in-test curated catalog. Must include every id the tests in this
+    # class assert on (notably qwen/qwen3.7-max, which upstream dropped from
+    # the live manifest on Oct 2 2026, making these tests network-dependent).
+    _STUB_CURATED_CATALOG = [
+        ("anthropic/claude-opus-4.6", "recommended"),
+        ("anthropic/claude-opus-4.8", ""),
+        ("qwen/qwen3.7-max", ""),
+        ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_catalog(self, monkeypatch):
+        """Make this class hermetic: stub the remote manifest, hard-block network.
+
+        1. Stubs ``get_curated_openrouter_models`` on the ``hermes_cli.model_catalog``
+           module — that is where ``fetch_openrouter_models`` looks it up (it does a
+           function-level ``from hermes_cli.model_catalog import ...`` at call time).
+        2. Proves no live catalog download can happen: the real manifest fetchers,
+           ``socket.socket`` and ``urllib.request.urlopen`` all raise if touched.
+           Tests that need a fake OpenRouter /v1/models response patch
+           ``hermes_cli.models._urlopen_model_catalog_request`` themselves, so
+           blocking the raw layer does not interfere with them.
+        """
+        import hermes_cli.model_catalog as _catalog_mod
+
+        monkeypatch.setattr(
+            _catalog_mod,
+            "get_curated_openrouter_models",
+            lambda: list(self._STUB_CURATED_CATALOG),
+        )
+
+        def _no_network(*args, **kwargs):
+            raise AssertionError(
+                "network access attempted inside hermetic TestFetchOpenRouterModels"
+            )
+
+        monkeypatch.setattr(_catalog_mod, "_fetch_manifest", _no_network)
+        monkeypatch.setattr(_catalog_mod, "_fetch_manifest_with_fallback", _no_network)
+        monkeypatch.setattr(socket, "socket", _no_network)
+        monkeypatch.setattr(urllib.request, "urlopen", _no_network)
+        yield
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):
