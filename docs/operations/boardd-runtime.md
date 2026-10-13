@@ -95,12 +95,18 @@ handler. A healthy run performs four broker-visible checks:
 3. archive it in a separate transaction; and
 4. read it back and verify the terminal `archived` state.
 
-Canary cards use `created_by=__hermes_boardd_write_canary_v1__`, an idempotency
-key in the same reserved namespace, and matching title/body markers. Cleanup
-requires every marker to agree and uses a case-sensitive literal key prefix.
-Discovery treats any individual reserved creator, key prefix, title prefix, or
-body marker as a namespace claim; a partial-marker row therefore fails loudly
-rather than escaping reconciliation or being mistaken for an owned canary.
+Canary cards retain `created_by=__hermes_boardd_write_canary_v1__`, but each run
+mints a fresh idempotency key
+`__hermes_boardd_write_canary_v2__:<uuid4>:<unix_ts>`. The title carries that full
+run marker; the JSON body carries the v2 marker, the same nonce
+`<uuid4>:<unix_ts>`, and `purpose=boardd-write-path-health`. Cleanup requires the
+complete matching identity. Genuine legacy v1 orphans are still recognized.
+Discovery uses only structured namespace claims: the exact reserved creator,
+a case-sensitive literal v2 or legacy v1 key prefix, or the reserved title
+prefix. Merely quoting either marker in ordinary title/body prose is ignored:
+it cannot collide, count against the stale limit, or authorize cleanup. A row
+claiming the namespace structurally without the complete marker set still fails
+closed as an identity collision.
 The archive UPDATE carries all expected identity fields as an atomic guard; a
 card changed after discovery is never archived. A partial namespace match fails
 loudly as an identity collision and is not reported as an orphan. Canary archive
@@ -188,9 +194,75 @@ unlink, then the process exits 0 without requiring SIGKILL.
 
 ## Rollback
 
+### v2-orphan compatibility before rollback
+
+A pre-v2 runtime discovers the retained v1 creator on a v2 orphan, but cannot
+validate its v2 key/title/body identity. Its canary therefore fails closed with
+`write-canary-identity-collision` until that orphan is archived. Do not disable
+the canary to conceal the failure or rewrite marker fields to resemble v1.
+
+Before switching `current`, save the v2 release's absolute path as `V2_RELEASE`.
+Inspect the reported orphan through the broker, then use that release's v2
+validator and canonical guarded archive operation. This also works after
+rollback while the older broker is reachable: the client still uses the retained
+v2 release, not `/opt/hermes-boardd/current`. The following step touches only the
+explicitly selected full-marker, blocked, unassigned, unclaimed, unlinked
+scratch canary and refuses identity changes atomically:
+
+```bash
+V2_RELEASE=$(readlink -f /opt/hermes-boardd/current) # save BEFORE rollback
+CANARY_TASK_ID=t_REPLACE_WITH_REPORTED_ORPHAN_ID
+sudo -u boardd env \
+  V2_RELEASE="$V2_RELEASE" CANARY_TASK_ID="$CANARY_TASK_ID" \
+  HERMES_HOME=/var/lib/boardd HERMES_KANBAN_DB=/var/lib/boardd/fleet/kanban.db \
+  HERMES_KANBAN_BROKER=1 BOARDD_SOCK=/run/boardd/boardd.sock \
+  PYTHONDONTWRITEBYTECODE=1 \
+  "$V2_RELEASE/venv/bin/python" - <<'PY'
+import importlib.util
+import os
+from hermes_cli import boardd_shim, kanban_db
+from hermes_cli.kb_client import Client
+
+spec = importlib.util.spec_from_file_location(
+    "boardd_v2_cleanup", os.path.join(os.environ["V2_RELEASE"], "libexec/boardd.py")
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+client = Client(sock_path=os.environ["BOARDD_SOCK"], total_timeout_s=20)
+task_id = os.environ["CANARY_TASK_ID"]
+rows = client.query("SELECT * FROM tasks WHERE id=?", [task_id])
+assert len(rows) == 1, "reported canary not found"
+row = rows[0]
+assert module.Broker._is_canary_row(row), "incomplete canary identity; refuse archive"
+assert row["idempotency_key"].startswith("__hermes_boardd_write_canary_v2__:")
+assert row["status"] == "blocked" and row["assignee"] is None
+assert row["workspace_kind"] == "scratch" and not row["workspace_path"]
+assert not any(row.get(k) for k in ("worker_pid", "claim_lock", "current_run_id"))
+identity = {k: row[k] for k in ("title", "body", "created_by", "idempotency_key")}
+conn = boardd_shim.BrokerConnection(client=client)
+try:
+    assert kanban_db.archive_task(
+        conn, task_id, expected_identity=identity, recompute_dependents=False
+    ), "identity changed or card linked; refuse archive"
+    terminal = client.query("SELECT status FROM tasks WHERE id=?", [task_id])
+    assert terminal == [{"status": "archived"}], "archive read-back failed"
+    print("archived", task_id, row["idempotency_key"])
+finally:
+    conn.close()
+PY
+```
+
+Repeat only for individually inspected, reported v2 orphan IDs; never bulk
+archive namespace matches or ordinary prose mentions. If the old broker cannot
+serve this guarded transaction, stop and restore the v2 runtime in an authorized
+maintenance window rather than opening SQLite directly. Verify the archived
+state before rollback, then verify recovery of the old runtime's periodic
+canary. No database snapshot restore is needed for this compatibility issue.
+
 If the new executable cannot become healthy, do not open the DB directly and do
-not restore a database snapshot for this additive migration. Switch the runtime
-symlink back, restore the old socket drop-ins, and restart once:
+not restore a database snapshot for this additive migration. After the orphan
+check and the same no-live-dispatch maintenance gate, switch the runtime symlink
+back, restore the old socket drop-ins, and restart once:
 
 ```bash
 sudo scripts/fleet/rollback-boardd-runtime.sh
