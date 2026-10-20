@@ -195,6 +195,11 @@ class _KanbanDispatcher:
                 conn = _kbc().connect(board=slug)
                 return _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
+            if getattr(exc, "broker_unreachable", False):
+                logger.error("kanban dispatcher: %s board=%s", exc, slug)
+                # The watcher's outer loop logs/retries failures without killing
+                # the gateway. Do not run successful-idle/stuck bookkeeping.
+                raise
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                 logger.error(
@@ -236,7 +241,10 @@ class _KanbanDispatcher:
                     conn = _kbc().connect(board=slug)
                     if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
                         return True
-                except Exception:
+                except Exception as exc:
+                    if getattr(exc, "broker_unreachable", False):
+                        logger.error("kanban dispatcher readiness: %s board=%s", exc, slug)
+                        raise
                     continue
                 finally:
                     if conn is not None:
@@ -270,6 +278,9 @@ class _KanbanDispatcher:
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
+                        if getattr(exc, "broker_unreachable", False):
+                            logger.error("kanban auto-decompose: %s board=%s", exc, slug)
+                            raise
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
                     for tid in triage_ids:

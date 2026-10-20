@@ -684,6 +684,14 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             conn.close()
             raise PermissionError("Kanban descendants require an initialized board; ask its owner to initialize it")
         return conn
+    # The old facade-only rebind does not cover split-module callers. Route at
+    # the actual connection boundary, before any local file/init-lock access.
+    from hermes_cli import boardd_shim
+    if boardd_shim.enabled() and boardd_shim.routes_to_fleet(db_path=path, board=board)[0]:
+        # BrokerConnection implements the sqlite connection surface used by
+        # this module; preserve the public annotation for existing callers.
+        from typing import cast
+        return cast(sqlite3.Connection, boardd_shim.connect(db_path=path, board=board))
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, skip the
