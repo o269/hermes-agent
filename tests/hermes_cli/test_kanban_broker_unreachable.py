@@ -49,6 +49,42 @@ def server(sock_path, *, silent=False, disconnect=False, backend=None):
     stop = threading.Event()
     errors = []
 
+    def handle_peer(peer, db):
+        """One accepted connection: apply the requested failure mode or speak
+        the boardd wire protocol against the optional sqlite backend."""
+        if disconnect:
+            # Close only after the request was sent: deterministic
+            # EOF/ECONNRESET rather than a send-side EPIPE race.
+            with peer.makefile("rb") as reader:
+                reader.readline()
+            return
+        if silent:
+            stop.wait(1)
+            return
+        with peer.makefile("rb") as reader:
+            for raw in reader:
+                req = json.loads(raw)
+                args = req.get("args", {})
+                op = req["op"]
+                try:
+                    if op == "txn_begin":
+                        db.execute("BEGIN IMMEDIATE")
+                        result = {"txn": "temporary-test-transaction"}
+                    elif op in ("txn_commit", "txn_rollback"):
+                        db.execute("COMMIT" if op == "txn_commit" else "ROLLBACK")
+                        result = {}
+                    else:
+                        cur = db.execute(args["sql"], args.get("params", []))
+                        rows = [dict(row) for row in cur.fetchall()]
+                        result = rows if op == "query" else {
+                            "rows": rows, "rowcount": cur.rowcount,
+                            "lastrowid": cur.lastrowid,
+                        }
+                    response = {"ok": True, "result": result}
+                except sqlite3.Error as exc:
+                    response = {"ok": False, "error": str(exc), "etype": type(exc).__name__}
+                peer.sendall((json.dumps(response) + "\n").encode())
+
     def serve():
         db = sqlite3.connect(backend, isolation_level=None) if backend else None
         if db:
@@ -60,38 +96,7 @@ def server(sock_path, *, silent=False, disconnect=False, backend=None):
                 except socket.timeout:
                     continue
                 with peer:
-                    if disconnect:
-                        # Close only after the request was sent: deterministic
-                        # EOF/ECONNRESET rather than a send-side EPIPE race.
-                        with peer.makefile("rb") as reader:
-                            reader.readline()
-                        continue
-                    if silent:
-                        stop.wait(1)
-                        continue
-                    with peer.makefile("rb") as reader:
-                        for raw in reader:
-                            req = json.loads(raw)
-                            args = req.get("args", {})
-                            op = req["op"]
-                            try:
-                                if op == "txn_begin":
-                                    db.execute("BEGIN IMMEDIATE")
-                                    result = {"txn": "temporary-test-transaction"}
-                                elif op in ("txn_commit", "txn_rollback"):
-                                    db.execute("COMMIT" if op == "txn_commit" else "ROLLBACK")
-                                    result = {}
-                                else:
-                                    cur = db.execute(args["sql"], args.get("params", []))
-                                    rows = [dict(row) for row in cur.fetchall()]
-                                    result = rows if op == "query" else {
-                                        "rows": rows, "rowcount": cur.rowcount,
-                                        "lastrowid": cur.lastrowid,
-                                    }
-                                response = {"ok": True, "result": result}
-                            except sqlite3.Error as exc:
-                                response = {"ok": False, "error": str(exc), "etype": type(exc).__name__}
-                            peer.sendall((json.dumps(response) + "\n").encode())
+                    handle_peer(peer, db)
         except (BrokenPipeError, ConnectionResetError):
             pass  # client failure deliberately closes the test connection
         except Exception as exc:

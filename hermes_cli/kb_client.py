@@ -30,25 +30,67 @@ import socket
 import time
 import uuid
 
-DEFAULT_SOCK = os.environ.get(
+_log = logging.getLogger(__name__)
+
+
+def default_sock() -> str:
+    """Socket path resolved at CALL time (never captured at import: one process
+    serving many profiles must see the active scope, and tests must be able to
+    point it at a temp socket after import)."""
     # Dedicated-user design: socket in its own boardd-owned dir (boardd-run,
     # 0710 group boardd), reachable by boardd-group members; the 0700 DB dir is
     # not. Must match boardd.py DEFAULT_SOCK + boardd.service. See RUNBOOK §4.
-    "BOARDD_SOCK",
-    os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                 "kanban", "boardd-run", "boardd.sock"),
-)
+    override = os.environ.get("BOARDD_SOCK")
+    if override:
+        return override
+    # health: allow HX001 -- the boardd socket lives under the shared kanban home (boardd's own run dir), never under a per-profile home: same reasoning as kanban_db.kanban_home()
+    return os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                        "kanban", "boardd-run", "boardd.sock")
 
-# jittered bounded backoff. MUST exceed boardd's HANDLER_TIMEOUT_S so that when
-# the DB thread stalls, the server drops the socket (a retryable transport
-# failure) and the client keeps resending the SAME op_id until it collects the
-# committed result via applied_ops replay — exactly-once even through a stall or
-# a ~2s restart (BLOCKER-2). 90s >> 30s handler timeout.
-_RETRY_DEADLINE_S = float(os.environ.get("KB_CLIENT_RETRY_DEADLINE_S", "90"))
+
+# Module-level default kept for back-compat importers/tests that read the name;
+# call sites resolve at call time via default_sock().
+DEFAULT_SOCK = default_sock()
+
+
+def _env_float(name: str, module_value: float) -> float:
+    """Env override resolved at call time (import-time capture freezes the
+    launch profile's value); a malformed value falls back to the module default.
+    ``module_value`` is the monkeypatchable module attribute."""
+    env = os.environ.get(name)
+    if env is not None:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    return float(module_value)
+
+
+# Tuning knobs. Plain module attributes (no import-time env capture — one
+# process may serve many profiles), monkeypatchable by tests; call sites read
+# them through the _env_float resolvers so an env override lands at call time.
+# The retry deadline MUST exceed boardd's HANDLER_TIMEOUT_S so that when the DB
+# thread stalls, the server drops the socket (a retryable transport failure)
+# and the client keeps resending the SAME op_id until it collects the committed
+# result via applied_ops replay — exactly-once even through a stall or a ~2s
+# restart (BLOCKER-2). 90s >> 30s handler timeout.
+_RETRY_DEADLINE_S = 90.0
+_CONNECT_TIMEOUT_S = 5.0
+_READ_TIMEOUT_S = 60.0
 _BACKOFF_MIN_S = 0.02
 _BACKOFF_MAX_S = 0.75
-_CONNECT_TIMEOUT_S = float(os.environ.get("KB_CLIENT_CONNECT_TIMEOUT_S", "5"))
-_READ_TIMEOUT_S = float(os.environ.get("KB_CLIENT_READ_TIMEOUT_S", "60"))
+
+
+def _retry_deadline_s() -> float:
+    return _env_float("KB_CLIENT_RETRY_DEADLINE_S", _RETRY_DEADLINE_S)
+
+
+def _connect_timeout_s() -> float:
+    return _env_float("KB_CLIENT_CONNECT_TIMEOUT_S", _CONNECT_TIMEOUT_S)
+
+
+def _read_timeout_s() -> float:
+    return _env_float("KB_CLIENT_READ_TIMEOUT_S", _READ_TIMEOUT_S)
 
 
 class BoarddError(RuntimeError):
@@ -77,8 +119,8 @@ class Client:
     or the module-level helpers which use a thread-local client.
     """
 
-    def __init__(self, sock_path: str = DEFAULT_SOCK, worker_id: str | None = None):
-        self.sock_path = sock_path
+    def __init__(self, sock_path: str | None = None, worker_id: str | None = None):
+        self.sock_path = sock_path if sock_path is not None else default_sock()
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
         self._seq = 0
         self._sock: socket.socket | None = None
@@ -89,9 +131,9 @@ class Client:
         self._close()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.settimeout(_CONNECT_TIMEOUT_S)
+            s.settimeout(_connect_timeout_s())
             s.connect(self.sock_path)
-            s.settimeout(_READ_TIMEOUT_S)
+            s.settimeout(_read_timeout_s())
             self._rfile = s.makefile("rb")
             self._sock = s
         except OSError:
@@ -99,16 +141,16 @@ class Client:
             raise
 
     def _close(self) -> None:
-        try:
-            if self._rfile is not None:
+        if self._rfile is not None:
+            try:
                 self._rfile.close()
-        except Exception:
-            pass
-        try:
-            if self._sock is not None:
+            except OSError as exc:
+                _log.debug("rfile close failed: %s", exc, exc_info=True)
+        if self._sock is not None:
+            try:
                 self._sock.close()
-        except Exception:
-            pass
+            except OSError as exc:
+                _log.debug("socket close failed: %s", exc, exc_info=True)
         self._sock = self._rfile = None
 
     def _roundtrip(self, req: dict) -> dict:
@@ -133,7 +175,7 @@ class Client:
             req["op_id"] = op_id or uuid.uuid4().hex
             req["worker_id"] = self.worker_id
             req["seq"] = self._seq
-        deadline = time.monotonic() + _RETRY_DEADLINE_S
+        deadline = time.monotonic() + _retry_deadline_s()
         attempt = 0
         while True:
             attempt += 1

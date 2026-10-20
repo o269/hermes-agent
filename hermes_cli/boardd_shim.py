@@ -30,11 +30,12 @@ import sqlite3
 
 try:  # production: kb_client is installed as a hermes_cli submodule
     from hermes_cli import kb_client
-except Exception:  # test/standalone: kb_client on sys.path
+except ImportError:  # test/standalone: kb_client on sys.path
     import kb_client  # type: ignore
 
 
 def enabled() -> bool:
+    # health: allow HX002 -- fleet routing flag from the boardd runbook (export HERMES_KANBAN_BROKER=1, FLEET-DOCTRINE.md): must gate one-shot CLI processes and systemd units that never load config.yaml
     return os.environ.get("HERMES_KANBAN_BROKER") == "1"
 
 
@@ -93,11 +94,17 @@ def _x(fn, *args, **kwargs):
 # the log against a static enumeration; abort if any site was never proxied).
 # Zero overhead when the env var is unset.
 # --------------------------------------------------------------------------- #
-_COV_PATH = os.environ.get("BOARDD_SHIM_COVERAGE_LOG")
+_COV_LOG = logging.getLogger("boardd_shim.coverage")
+
+
+def _cov_path() -> str | None:
+    """Coverage log path, resolved at call time (never captured at import)."""
+    return os.environ.get("BOARDD_SHIM_COVERAGE_LOG")
 
 
 def _cov(op):
-    if not _COV_PATH:
+    cov_path = _cov_path()
+    if not cov_path:
         return
     import traceback
     site = "?"
@@ -107,10 +114,12 @@ def _cov(op):
         site = f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}"
         break
     try:
-        with open(_COV_PATH, "a") as fh:
+        with open(cov_path, "a", encoding="utf-8") as fh:
             fh.write(f"{op}\t{site}\n")
-    except Exception:
-        pass
+    except OSError as exc:
+        # The coverage log is a maintenance-window diagnostic, never a data
+        # path: a full disk or a removed tmpdir must not fail the proxied op.
+        _COV_LOG.warning("coverage log write failed: %s", exc, exc_info=True)
 
 
 def noop_flen(conn):
@@ -166,7 +175,7 @@ _KDB = None
 _ORIG_CONNECT = None
 _ORIG_CONNECT_CLOSING = None
 
-_route_log = logging.getLogger("boardd_shim")
+logger = logging.getLogger("boardd_shim")
 
 
 def _capture_original(kdb):
@@ -186,7 +195,7 @@ def _resolver():
         return _KDB
     try:
         import hermes_cli.kanban_db as kdb  # production layout
-    except Exception:  # pragma: no cover - test/standalone layout
+    except ImportError:  # pragma: no cover - test/standalone layout
         import kanban_db as kdb  # type: ignore
     return kdb
 
@@ -355,11 +364,14 @@ class BrokerConnection:
     def close(self):
         # a dangling open txn (caller leaked the connection) — roll back.
         if self._txn is not None:
+            tok, self._txn = self._txn, None
             try:
-                _c().txn_rollback(self._txn)
-            except Exception:
-                pass
-            self._txn = None
+                _c().txn_rollback(tok)
+            except (kb_client.BoarddError, OSError) as exc:
+                # Close-path rollback of a leaked transaction: the connection is
+                # being discarded either way, but the failure must not vanish.
+                logger.warning(
+                    "broker rollback of leaked transaction failed: %s", exc, exc_info=True)
 
     def __enter__(self):
         return self
@@ -374,8 +386,11 @@ class BrokerConnection:
             else:
                 try:
                     _x(_c().txn_rollback, tok)
-                except Exception:
-                    pass
+                except (kb_client.BoarddError, OSError) as exc:
+                    # Rollback on the error path of `with conn:` — the original
+                    # exception is already propagating; log this one, never mask it.
+                    logger.warning(
+                        "broker rollback on context exit failed: %s", exc, exc_info=True)
         return False
 
 
@@ -390,7 +405,7 @@ def connect(db_path=None, *, board=None):
     existing callers (positional db_path, keyword board, no-arg) are unchanged."""
     is_fleet, req, fleet = routes_to_fleet(db_path=db_path, board=board)
     if is_fleet:
-        _route_log.info("boardd route=BROKER db=%s (fleet=%s)", req, fleet)
+        logger.info("boardd route=BROKER db=%s (fleet=%s)", req, fleet)
         conn = BrokerConnection()
         conn.check_broker_health()
         return conn
@@ -401,7 +416,7 @@ def connect(db_path=None, *, board=None):
         raise RuntimeError(
             "boardd_shim.connect pass-through: original kanban_db.connect was "
             "not captured (install_rebind / end-block rebind did not run).")
-    _route_log.info("boardd route=PASSTHROUGH db=%s (fleet=%s)", req, fleet)
+    logger.info("boardd route=PASSTHROUGH db=%s (fleet=%s)", req, fleet)
     return orig(db_path=db_path, board=board)
 
 
@@ -417,8 +432,10 @@ def connect_closing(db_path=None, *, board=None):
     finally:
         try:
             conn.close()
-        except Exception:
-            pass
+        except (kb_client.BoarddError, OSError) as exc:
+            # close() itself logs broker failures; a broken __exit__/custom
+            # close raising anything else would mask the block's own result.
+            logger.warning("boardd close failed: %s", exc, exc_info=True)
 
 
 def add_comment(conn, task_id, author, body):
@@ -461,14 +478,15 @@ def claim_task(conn, task_id, *, ttl_seconds=None, claimer=None):
     task = _row_to_task(kdb, _c().get_task(task_id))
     # Fire the lifecycle hook CLIENT-SIDE (off the broker DB thread), preserving
     # the original post-commit side effect (notifications) while keeping the
-    # broker's DB path free of external calls (HARD RULE).
+    # broker's DB path free of external calls (HARD RULE). The real claim_task
+    # swallows hook failures too (an observer can never break a transition).
     try:
         board = getattr(kdb, "get_current_board", lambda: None)()
         kdb._fire_kanban_lifecycle_hook(
             "kanban_task_claimed", task_id, board=board,
             assignee=(task.assignee if task else None), run_id=r.get("run_id"))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("kanban_task_claimed hook failed: %s", exc, exc_info=True)
     return task
 
 
@@ -481,8 +499,10 @@ def _row_to_task(kdb, row):
             import dataclasses
             fields = {f.name for f in dataclasses.fields(T)}
             return T(**{k: v for k, v in row.items() if k in fields})
-        except Exception:
-            pass
+        except Exception as exc:
+            # A row that does not fit the current Task shape must not crash the
+            # claim: fall back to a duck-typed task, but leave a trace.
+            logger.debug("Task dataclass build failed: %s", exc, exc_info=True)
     import types
     return types.SimpleNamespace(**row)
 
